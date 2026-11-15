@@ -14,6 +14,8 @@ pub struct CaptureSessionMeta {
     pub height: u32,
     pub scale_factor: f64,
     pub captured_at: String,
+    pub source_clipboard_id: Option<String>,
+    pub initial_annotations_json: Option<String>,
 }
 
 #[derive(Clone)]
@@ -30,4 +32,5 @@ pub struct AppState {
     pub thumbs_dir: RwLock<PathBuf>,
     pub clipboard_cache_dir: PathBuf,
     pub clipboard_paused: AtomicBool,
+    pub active_clipboard_hash: RwLock<Option<String>>,
 }

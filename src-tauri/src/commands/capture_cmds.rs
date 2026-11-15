@@ -9,7 +9,9 @@ use crate::services::capture::{
     freeze_active_screen, persist_capture_and_thumbnail, persist_raw_rgba_and_thumbnail,
     ScreenCaptureProvider, XcapCaptureProvider,
 };
-use crate::services::clipboard::ingest_rgba_into_clipboard_history;
+use crate::services::clipboard::{
+    ingest_rgba_into_clipboard_history, save_or_update_annotated_clipboard_item,
+};
 use crate::state::{AppState, CaptureSessionMeta};
 
 /// Triggered via `Alt + S` or UI button: freezes active screen in RAM as an uncompressed BMP (< 3ms)
@@ -108,8 +110,10 @@ pub fn trigger_fullscreen_capture(
 }
 
 /// Receives the flattened, cropped & annotated PNG/WebP bytes from the `overlay` window,
-/// hides the overlay immediately for instant UX, copies to clipboard, and persists to SQLite.
+/// hides the overlay immediately for instant UX, copies to clipboard, and persists to SQLite
+/// (including optional `base_image_bytes` and `annotations_json` for cross-session Ctrl+Z / Ctrl+Y).
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 pub fn save_annotated_capture(
     app: AppHandle,
     state: State<'_, AppState>,
@@ -117,24 +121,31 @@ pub fn save_annotated_capture(
     copy_to_clipboard: bool,
     image_format: Option<String>,
     source_app: Option<String>,
+    base_image_bytes: Option<Vec<u8>>,
+    annotations_json: Option<String>,
+    source_clipboard_id: Option<String>,
 ) -> AppResult<CaptureRecord> {
     if let Some(overlay) = app.get_webview_window("overlay") {
         let _ = overlay.set_fullscreen(false);
         let _ = overlay.hide();
     }
 
-    if copy_to_clipboard {
-        if let Ok(decoded) = image::load_from_memory(&image_bytes) {
-            let rgba = decoded.to_rgba8();
+    if let Ok(decoded) = image::load_from_memory(&image_bytes) {
+        let rgba = decoded.to_rgba8();
+        if copy_to_clipboard || source_clipboard_id.is_some() {
             let tauri_img = tauri::image::Image::new(rgba.as_raw(), rgba.width(), rgba.height());
             let _ = app.clipboard().write_image(&tauri_img);
-            let _ = ingest_rgba_into_clipboard_history(
-                &app,
-                rgba.as_raw(),
-                rgba.width(),
-                rgba.height(),
-            );
         }
+        // Always update/insert into Alt+V Visual Clipboard with non-destructive vector history!
+        let _ = save_or_update_annotated_clipboard_item(
+            &app,
+            rgba.as_raw(),
+            rgba.width(),
+            rgba.height(),
+            base_image_bytes.as_deref(),
+            annotations_json.as_deref(),
+            source_clipboard_id.as_deref(),
+        );
     }
 
     let captures_dir = state
@@ -157,6 +168,12 @@ pub fn save_annotated_capture(
     )?;
 
     let now_iso = Utc::now().to_rfc3339();
+    let default_source = if source_clipboard_id.is_some() {
+        "Clipboard Annotation (Alt + V)"
+    } else {
+        "Region Capture"
+    };
+
     let record = CaptureRecord {
         id: Uuid::new_v4().to_string(),
         media_type: "screenshot".to_string(),
@@ -166,16 +183,20 @@ pub fn save_annotated_capture(
         height,
         size_bytes,
         duration_ms: None,
-        source_app: source_app.or_else(|| Some("Region Capture".to_string())),
+        source_app: source_app.or_else(|| Some(default_source.to_string())),
         ocr_text: String::new(),
         is_pinned: false,
         group_name: String::new(),
-        last_copied_at: if copy_to_clipboard {
+        last_copied_at: if copy_to_clipboard || source_clipboard_id.is_some() {
             Some(now_iso.clone())
         } else {
             None
         },
-        tags: vec!["annotated".to_string()],
+        tags: if source_clipboard_id.is_some() {
+            vec!["annotated".to_string(), "clipboard".to_string()]
+        } else {
+            vec!["annotated".to_string()]
+        },
         created_at: now_iso,
     };
 
@@ -187,7 +208,14 @@ pub fn save_annotated_capture(
         insert_capture(&conn, &record)?;
     }
 
-    if let Some(main_win) = app.get_webview_window("main") {
+    if source_clipboard_id.is_some() {
+        // If user launched Annotate from Alt+V, reopen Alt+V so they immediately see their saved edit!
+        if let Some(clip_win) = app.get_webview_window("clipboard") {
+            let _ = clip_win.show();
+            let _ = clip_win.set_focus();
+            let _ = clip_win.emit("clipboard:opened", true);
+        }
+    } else if let Some(main_win) = app.get_webview_window("main") {
         let _ = main_win.show();
         let _ = main_win.set_focus();
     }

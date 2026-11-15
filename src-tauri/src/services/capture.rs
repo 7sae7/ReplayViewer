@@ -73,6 +73,8 @@ pub fn freeze_active_screen(provider: &dyn ScreenCaptureProvider) -> AppResult<F
         height: raw.height,
         scale_factor: raw.scale_factor,
         captured_at: Utc::now().to_rfc3339(),
+        source_clipboard_id: None,
+        initial_annotations_json: None,
     };
 
     Ok(FrozenFrame {
