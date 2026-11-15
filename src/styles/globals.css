@@ -1,0 +1,8 @@
+@import "tailwindcss";
+@plugin "daisyui" {
+  themes: night --default, dark --prefersdark, dim, dracula, synthwave, cyberpunk, sunset, business, nord, light;
+}
+
+body {
+  user-select: none;
+}

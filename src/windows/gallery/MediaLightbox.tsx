@@ -1,0 +1,205 @@
+import React, { useState } from "react";
+import { Copy, FolderOpen, Pin, Plus, Tag, Trash2, X } from "lucide-react";
+import type { CaptureRecord } from "../../types/ipc";
+import { formatBytes } from "../../lib/dpi";
+import {
+  copyCaptureToClipboard,
+  openInFileExplorer,
+  resolveMediaSrc,
+} from "../../lib/tauri-client";
+
+interface MediaLightboxProps {
+  capture: CaptureRecord;
+  onClose: () => void;
+  onTogglePin: (id: string, currentPinned: boolean) => void;
+  onDelete: (id: string) => void;
+  onAddTag: (captureId: string, tag: string) => Promise<void>;
+}
+
+export const MediaLightbox: React.FC<MediaLightboxProps> = ({
+  capture,
+  onClose,
+  onTogglePin,
+  onDelete,
+  onAddTag,
+}) => {
+  const [newTag, setNewTag] = useState("");
+  const [copied, setCopied] = useState(false);
+
+  const handleAddTag = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!newTag.trim()) return;
+    await onAddTag(capture.id, newTag.trim());
+    setNewTag("");
+  };
+
+  const handleCopy = async () => {
+    await copyCaptureToClipboard(capture.filePath);
+    setCopied(true);
+    setTimeout(() => setCopied(false), 1500);
+  };
+
+  const handleOpenExplorer = async () => {
+    await openInFileExplorer(capture.filePath);
+  };
+
+  return (
+    <dialog className="modal modal-open" onClick={onClose}>
+      <div
+        className="modal-box max-w-6xl p-0 bg-base-100 border border-base-300 shadow-2xl overflow-hidden flex flex-col lg:flex-row max-h-[90vh]"
+        onClick={(e) => e.stopPropagation()}
+      >
+        {/* Full-Resolution Image Canvas View */}
+        <div className="flex-1 bg-base-300 flex items-center justify-center p-4 min-h-[380px] overflow-hidden">
+          <img
+            src={resolveMediaSrc(capture.filePath)}
+            alt={capture.sourceApp || "Capture"}
+            className="max-w-full max-h-[78vh] object-contain rounded-lg shadow-lg"
+          />
+        </div>
+
+        {/* Right Details & Actions Sidebar */}
+        <div className="w-full lg:w-84 border-t lg:border-t-0 lg:border-l border-base-300 p-5 flex flex-col justify-between bg-base-200">
+          <div className="space-y-4">
+            <div className="flex items-start justify-between gap-2">
+              <div>
+                <h3 className="text-base font-bold text-base-content">
+                  {capture.sourceApp || "Region Capture"}
+                </h3>
+                <p className="text-xs text-base-content/60 mt-0.5">
+                  {new Date(capture.createdAt).toLocaleString()}
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={onClose}
+                className="btn btn-sm btn-circle btn-ghost"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            {/* Specs Card */}
+            <div className="card card-xs bg-base-100 border border-base-300">
+              <div className="card-body grid grid-cols-2 gap-2 text-xs">
+                <div>
+                  <span className="text-base-content/50 block">Resolution</span>
+                  <span className="font-mono text-base-content font-semibold">
+                    {capture.width} × {capture.height}
+                  </span>
+                </div>
+                <div>
+                  <span className="text-base-content/50 block">File Size</span>
+                  <span className="font-mono text-base-content font-semibold">
+                    {formatBytes(capture.sizeBytes)}
+                  </span>
+                </div>
+                <div className="col-span-2 pt-2 border-t border-base-300">
+                  <div className="flex items-center justify-between mb-1">
+                    <span className="text-base-content/50">Disk Path</span>
+                    <button
+                      type="button"
+                      onClick={handleOpenExplorer}
+                      className="btn btn-xs btn-link p-0 h-auto min-h-0 text-primary no-underline hover:underline gap-1"
+                    >
+                      <FolderOpen className="w-3 h-3" />
+                      Show in Explorer
+                    </button>
+                  </div>
+                  <span className="font-mono text-[11px] text-base-content/70 break-all line-clamp-2">
+                    {capture.filePath}
+                  </span>
+                </div>
+              </div>
+            </div>
+
+            {/* Tags Section (Indexed in FTS5) */}
+            <div>
+              <label className="text-xs font-semibold text-base-content/80 flex items-center gap-1.5 mb-2">
+                <Tag className="w-3.5 h-3.5 text-primary" />
+                Searchable FTS5 Tags
+              </label>
+              <div className="flex flex-wrap gap-1.5 mb-2.5">
+                {capture.tags.map((t) => (
+                  <span
+                    key={t}
+                    className="badge badge-soft badge-primary badge-sm font-medium"
+                  >
+                    #{t}
+                  </span>
+                ))}
+                {capture.tags.length === 0 && (
+                  <span className="text-xs text-base-content/50 italic">
+                    No tags yet
+                  </span>
+                )}
+              </div>
+              <form onSubmit={handleAddTag} className="join w-full">
+                <input
+                  type="text"
+                  placeholder="Add tag (e.g. bug, valorant)..."
+                  value={newTag}
+                  onChange={(e) => setNewTag(e.target.value)}
+                  className="input input-sm input-bordered join-item flex-1 text-xs"
+                />
+                <button
+                  type="submit"
+                  className="btn btn-sm btn-primary join-item gap-1"
+                >
+                  <Plus className="w-3.5 h-3.5" /> Add
+                </button>
+              </form>
+            </div>
+          </div>
+
+          {/* Bottom Actions */}
+          <div className="flex flex-col gap-2 pt-4 border-t border-base-300 mt-4">
+            <button
+              type="button"
+              onClick={handleCopy}
+              className={`btn btn-sm w-full gap-2 ${
+                copied ? "btn-success" : "btn-primary"
+              }`}
+            >
+              <Copy className="w-4 h-4" />
+              {copied ? "Copied to Clipboard!" : "Copy Image to Clipboard"}
+            </button>
+
+            <button
+              type="button"
+              onClick={handleOpenExplorer}
+              className="btn btn-sm btn-neutral w-full gap-2"
+            >
+              <FolderOpen className="w-4 h-4 text-secondary" />
+              Open in File Explorer / Finder
+            </button>
+
+            <div className="grid grid-cols-2 gap-2">
+              <button
+                type="button"
+                onClick={() => onTogglePin(capture.id, capture.isPinned)}
+                className={`btn btn-sm gap-1.5 ${
+                  capture.isPinned ? "btn-warning" : "btn-outline"
+                }`}
+              >
+                <Pin className="w-3.5 h-3.5" />
+                {capture.isPinned ? "Pinned" : "Pin Capture"}
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  onDelete(capture.id);
+                  onClose();
+                }}
+                className="btn btn-sm btn-soft btn-error gap-1.5"
+              >
+                <Trash2 className="w-3.5 h-3.5" />
+                Delete
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </dialog>
+  );
+};
