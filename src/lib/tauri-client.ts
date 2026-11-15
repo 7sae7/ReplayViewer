@@ -576,6 +576,13 @@ export async function updateSettings(
   return { ...mockSettings };
 }
 
+export async function getDefaultCapturesDir(): Promise<string> {
+  if (isTauriRuntime()) {
+    return invoke<string>("get_default_captures_dir");
+  }
+  return "C:\\Users\\shawp\\Desktop\\ReplayViewer\\captures";
+}
+
 // ---------------------------------------------------------------------------
 // Phase 1.5.1: Visual Image Clipboard (Alt + V) Client API
 // ---------------------------------------------------------------------------

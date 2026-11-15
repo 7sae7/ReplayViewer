@@ -25,10 +25,11 @@ dist-ssr
 *.sln
 *.sw?
 
-# Rust / Tauri build artifacts
+# Rust / Tauri build artifacts & portable captures folder
 src-tauri/target
 src-tauri/gen
 src-tauri/WixTools
+captures
 *.db
 *.db-shm
 *.db-wal

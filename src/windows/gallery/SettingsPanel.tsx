@@ -10,11 +10,13 @@ import {
   HardDrive,
   ImagePlus,
   Keyboard,
+  RotateCcw,
   Save,
   ShieldCheck,
 } from "lucide-react";
 import { formatBytes } from "../../lib/dpi";
 import {
+  getDefaultCapturesDir,
   importExternalMedia,
   migrateCapturesToFolder,
   openInFileExplorer,
@@ -164,6 +166,16 @@ export const SettingsPanel: React.FC = () => {
     const picked = await pickFolderDialog(form.capturesDir);
     if (picked) {
       setForm({ ...form, capturesDir: picked });
+    }
+  };
+
+  const handleResetToDefaultCapturesDir = async () => {
+    const defaultDir = await getDefaultCapturesDir();
+    if (defaultDir) {
+      setForm({ ...form, capturesDir: defaultDir });
+      setStatusMessage(
+        `Set Storage Directory to built-in folder "${defaultDir}" — click "Save Changes" to apply.`
+      );
     }
   };
 
@@ -346,6 +358,15 @@ export const SettingsPanel: React.FC = () => {
                       Storage Directory (Working Folder)
                     </span>
                     <div className="flex items-center gap-1">
+                      <button
+                        type="button"
+                        onClick={handleResetToDefaultCapturesDir}
+                        title="Reset to built-in ./captures folder next to the .exe"
+                        className="btn btn-xs btn-ghost text-base-content/70 gap-1"
+                      >
+                        <RotateCcw className="w-3 h-3" />
+                        Reset to Built-In
+                      </button>
                       <button
                         type="button"
                         onClick={handleBrowseCapturesDir}

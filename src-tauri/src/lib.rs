@@ -17,6 +17,32 @@ use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut,
 use crate::commands::{capture_cmds, clipboard_cmds, gallery_cmds, settings_cmds};
 use crate::state::AppState;
 
+/// Resolves the built-in portable `captures` directory right next to the running `.exe`
+/// (`<exe_dir>/captures` and `<exe_dir>/captures/.thumbs`), falling back to `AppData/Local`
+/// only if the `.exe` directory is read-only (e.g., installed inside `C:\Program Files`).
+pub fn resolve_default_captures_dir(app: &tauri::AppHandle) -> (PathBuf, PathBuf) {
+    if let Ok(exe_path) = std::env::current_exe() {
+        if let Some(exe_dir) = exe_path.parent() {
+            let portable_captures = exe_dir.join("captures");
+            let portable_thumbs = portable_captures.join(".thumbs");
+            if std::fs::create_dir_all(&portable_captures).is_ok()
+                && std::fs::create_dir_all(&portable_thumbs).is_ok()
+            {
+                return (portable_captures, portable_thumbs);
+            }
+        }
+    }
+
+    let fallback_base = app
+        .path()
+        .app_local_data_dir()
+        .or_else(|_| app.path().picture_dir().map(|p| p.join("ReplayViewer")))
+        .expect("Failed to resolve fallback media directory");
+    let captures = fallback_base.join("captures");
+    let thumbs = captures.join(".thumbs");
+    (captures, thumbs)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -88,19 +114,15 @@ pub fn run() {
                 .unwrap()
         })
         .setup(|app| {
-            // Default user-visible captures directory in Pictures/ReplayViewer (fallback to AppData/Local)
-            let base_media_dir = app
-                .path()
-                .picture_dir()
-                .map(|p| p.join("ReplayViewer"))
-                .or_else(|_| app.path().app_local_data_dir())
-                .expect("Failed to resolve media directory");
+            // Default portable captures directory right next to the .exe (<exe_dir>/captures)
+            let (default_captures_dir, default_thumbs_dir) =
+                resolve_default_captures_dir(app.handle());
 
             // Store SQLite DB in AppData/Local/com.replayviewer.app (next to EBWebView)
             let local_data_dir = app
                 .path()
                 .app_local_data_dir()
-                .unwrap_or_else(|_| base_media_dir.clone());
+                .unwrap_or_else(|_| default_captures_dir.clone());
             std::fs::create_dir_all(&local_data_dir)?;
             let db_path = local_data_dir.join("replay_viewer_v2.db");
             let conn = db::init_db(&db_path)?;
@@ -121,10 +143,7 @@ pub fn run() {
                 let t_dir = c_dir.join(".thumbs");
                 (c_dir, t_dir)
             } else {
-                (
-                    base_media_dir.join("captures"),
-                    base_media_dir.join("thumbnails"),
-                )
+                (default_captures_dir, default_thumbs_dir)
             };
 
             std::fs::create_dir_all(&captures_dir)?;
@@ -291,6 +310,7 @@ pub fn run() {
             gallery_cmds::add_tag_to_capture,
             settings_cmds::get_settings,
             settings_cmds::update_settings,
+            settings_cmds::get_default_captures_dir,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
