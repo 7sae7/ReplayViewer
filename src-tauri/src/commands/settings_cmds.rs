@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use rusqlite::params;
 use serde::{Deserialize, Serialize};
-use tauri::State;
+use tauri::{AppHandle, State};
 
 use crate::db::clipboard_repo::enforce_fifo_limit;
 use crate::error::{AppError, AppResult};
@@ -142,4 +142,10 @@ pub fn update_settings(
     let _ = enforce_fifo_limit(&conn, payload.clipboard_max_items);
 
     Ok(payload)
+}
+
+#[tauri::command]
+pub fn get_default_captures_dir(app: AppHandle) -> AppResult<String> {
+    let (default_captures, _) = crate::resolve_default_captures_dir(&app);
+    Ok(default_captures.to_string_lossy().to_string())
 }
