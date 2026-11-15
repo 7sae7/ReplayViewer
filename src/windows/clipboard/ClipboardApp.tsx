@@ -518,7 +518,7 @@ export const ClipboardApp: React.FC<ClipboardAppProps> = ({
                 }`}
               >
                 {/* Fix #3: Plain div container instead of <figure> so daisyUI never stretches child badges over the image! */}
-                <div className="relative w-28 h-20 shrink-0 bg-base-300 overflow-hidden border-r border-base-300">
+                <div className="relative w-28 min-h-22 self-stretch shrink-0 bg-base-300 overflow-hidden border-r border-base-300">
                   <img
                     src={resolveMediaSrc(item.thumbPath)}
                     alt={`Clipboard ${item.width}x${item.height}`}
@@ -527,10 +527,11 @@ export const ClipboardApp: React.FC<ClipboardAppProps> = ({
                   />
                 </div>
 
-                {/* Card Metadata & Quick Actions */}
-                <div className="card-body p-2 justify-between min-w-0">
-                  <div className="flex items-center justify-between gap-1 flex-wrap">
-                    <div className="flex items-center gap-1 min-w-0 flex-wrap">
+                {/* Fixed 3-Row Card Metadata & Quick Actions Layout */}
+                <div className="card-body p-2 gap-1 justify-between min-w-0">
+                  {/* Row 1: Left = Number + Image Dimensions | Far Right = Status (Pinned, CURRENTLY COPIED) */}
+                  <div className="flex items-center justify-between gap-1.5 min-w-0">
+                    <div className="flex items-center gap-1.5 shrink-0">
                       {shortcutNum !== null && (
                         <kbd
                           className="kbd kbd-xs font-mono font-bold"
@@ -542,20 +543,6 @@ export const ClipboardApp: React.FC<ClipboardAppProps> = ({
                       <span className="badge badge-xs badge-neutral font-mono">
                         {item.width}×{item.height}
                       </span>
-                      {item.isPinned && (
-                        <span
-                          className="badge badge-warning badge-xs gap-0.5 font-semibold"
-                          title="Pinned to top (exempt from FIFO eviction)"
-                        >
-                          <Pin className="w-2.5 h-2.5 fill-current" /> Pinned
-                        </span>
-                      )}
-                      {/* Fix #5: CURRENTLY COPIED badge */}
-                      {item.isCurrentlyCopied && (
-                        <span className="badge badge-success badge-xs font-bold tracking-tight">
-                          CURRENTLY COPIED
-                        </span>
-                      )}
                       {hasEditableHistory && (
                         <span
                           className="badge badge-info badge-soft badge-xs"
@@ -565,13 +552,33 @@ export const ClipboardApp: React.FC<ClipboardAppProps> = ({
                         </span>
                       )}
                     </div>
-                    <span className="text-[10px] text-base-content/50 shrink-0 font-mono">
-                      {formatBytes(item.sizeBytes)} •{" "}
-                      {formatRelativeTime(item.copiedAt)}
-                    </span>
+
+                    <div className="flex items-center gap-1 ml-auto shrink-0">
+                      {item.isPinned && (
+                        <span
+                          className="badge badge-warning badge-xs gap-0.5 font-semibold"
+                          title="Pinned to top (exempt from FIFO eviction)"
+                        >
+                          <Pin className="w-2.5 h-2.5 fill-current" /> Pinned
+                        </span>
+                      )}
+                      {item.isCurrentlyCopied && (
+                        <span className="badge badge-success badge-xs font-bold tracking-tight">
+                          CURRENTLY COPIED
+                        </span>
+                      )}
+                    </div>
                   </div>
 
-                  <div className="card-actions justify-between items-center mt-1 pt-1 border-t border-base-content/5">
+                  {/* Row 2: Dedicated Fixed Row for File Size (KB/MB) & Relative Time */}
+                  <div className="flex items-center text-[10px] text-base-content/55 font-mono leading-none">
+                    <span>{formatBytes(item.sizeBytes)}</span>
+                    <span className="mx-1.5 opacity-50">•</span>
+                    <span>{formatRelativeTime(item.copiedAt)}</span>
+                  </div>
+
+                  {/* Row 3: Quick Actions */}
+                  <div className="card-actions justify-between items-center pt-1 border-t border-base-content/5">
                     <span className="text-[11px] font-medium text-primary flex items-center gap-1">
                       {isCopied ? (
                         <>

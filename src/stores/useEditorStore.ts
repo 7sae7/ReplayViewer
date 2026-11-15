@@ -1,7 +1,7 @@
 import { create } from "zustand";
 import type { AnnotationShape, AnnotationTool, CropRect } from "../types/ipc";
 
-function transformShapeToNewBounds(
+export function transformShapeToNewBounds(
   shape: AnnotationShape,
   oldRect: CropRect,
   newRect: CropRect
