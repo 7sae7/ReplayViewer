@@ -4,6 +4,7 @@ use rusqlite::params;
 use serde::{Deserialize, Serialize};
 use tauri::State;
 
+use crate::db::clipboard_repo::enforce_fifo_limit;
 use crate::error::{AppError, AppResult};
 use crate::state::AppState;
 
@@ -136,6 +137,9 @@ pub fn update_settings(
             params![k, v],
         )?;
     }
+
+    // Immediately enforce new FIFO limit on unpinned clipboard items if lowered
+    let _ = enforce_fifo_limit(&conn, payload.clipboard_max_items);
 
     Ok(payload)
 }

@@ -36,6 +36,20 @@
         "skipTaskbar": true,
         "visible": false,
         "resizable": false
+      },
+      {
+        "label": "clipboard",
+        "title": "ReplayViewer — Visual Clipboard (Alt + V)",
+        "width": 390,
+        "height": 580,
+        "minWidth": 340,
+        "minHeight": 420,
+        "decorations": false,
+        "alwaysOnTop": true,
+        "skipTaskbar": true,
+        "visible": false,
+        "resizable": true,
+        "center": true
       }
     ],
     "security": {

@@ -10,6 +10,7 @@ use crate::db::captures_repo::{
 };
 use crate::error::{AppError, AppResult};
 use crate::services::capture::ensure_benchmark_sample_image;
+use crate::services::clipboard::ingest_rgba_into_clipboard_history;
 use crate::state::AppState;
 
 #[tauri::command]
@@ -174,6 +175,7 @@ pub fn copy_capture_to_clipboard(
     if let Ok(conn) = state.db.lock() {
         let _ = captures_repo::mark_capture_copied(&conn, &file_path);
     }
+    let _ = ingest_rgba_into_clipboard_history(&app, rgba.as_raw(), rgba.width(), rgba.height());
     Ok(())
 }
 

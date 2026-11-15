@@ -5,7 +5,7 @@ pub mod services;
 pub mod state;
 
 use std::path::PathBuf;
-use std::sync::{Mutex, RwLock};
+use std::sync::{atomic::AtomicBool, Mutex, RwLock};
 use tauri::{
     http::{header, Response, StatusCode},
     menu::{Menu, MenuItem},
@@ -14,7 +14,7 @@ use tauri::{
 };
 use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
 
-use crate::commands::{capture_cmds, gallery_cmds, settings_cmds};
+use crate::commands::{capture_cmds, clipboard_cmds, gallery_cmds, settings_cmds};
 use crate::state::AppState;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -57,14 +57,7 @@ pub fn run() {
                             }
                         }
                     } else if shortcut == &alt_v {
-                        if let Some(main_win) = app.get_webview_window("main") {
-                            let _ = main_win.show();
-                            let _ = main_win.set_focus();
-                            let _ = main_win.emit(
-                                "shortcut:toast",
-                                "Alt + V Visual Image Clipboard is scheduled for Phase 1.5!",
-                            );
-                        }
+                        let _ = clipboard_cmds::toggle_clipboard_drawer(app.clone());
                     } else if shortcut == &alt_c {
                         if let Some(main_win) = app.get_webview_window("main") {
                             let _ = main_win.show();
@@ -141,6 +134,9 @@ pub fn run() {
             std::fs::create_dir_all(&captures_dir)?;
             std::fs::create_dir_all(&thumbs_dir)?;
 
+            let clipboard_cache_dir = local_data_dir.join("clipboard_cache");
+            std::fs::create_dir_all(&clipboard_cache_dir)?;
+
             // Phase 1.0 Guarantee #4: Reconcile any orphaned DB rows on startup
             let _ = db::captures_repo::reconcile_orphaned_captures(&conn);
 
@@ -149,7 +145,12 @@ pub fn run() {
                 latest_capture: RwLock::new(None),
                 captures_dir: RwLock::new(captures_dir),
                 thumbs_dir: RwLock::new(thumbs_dir),
+                clipboard_cache_dir,
+                clipboard_paused: AtomicBool::new(false),
             });
+
+            // Phase 1.5.1: Spawn background OS clipboard image watcher
+            services::clipboard::spawn_clipboard_watcher(app.handle().clone());
 
             // Register Global Shortcuts (Alt+S, Alt+Shift+S, Alt+G, Alt+V, Alt+C)
             let alt_s = Shortcut::new(Some(Modifiers::ALT), Code::KeyS);
@@ -178,6 +179,13 @@ pub fn run() {
                 true,
                 None::<&str>,
             )?;
+            let open_clipboard_i = MenuItem::with_id(
+                app,
+                "open_clipboard",
+                "Visual Clipboard (Alt + V)",
+                true,
+                None::<&str>,
+            )?;
             let open_gallery_i = MenuItem::with_id(
                 app,
                 "open_gallery",
@@ -189,12 +197,18 @@ pub fn run() {
 
             let menu = Menu::with_items(
                 app,
-                &[&capture_region_i, &capture_full_i, &open_gallery_i, &quit_i],
+                &[
+                    &capture_region_i,
+                    &capture_full_i,
+                    &open_clipboard_i,
+                    &open_gallery_i,
+                    &quit_i,
+                ],
             )?;
 
             let _tray = TrayIconBuilder::new()
                 .menu(&menu)
-                .tooltip("ReplayViewer — Ready (Alt+S)")
+                .tooltip("ReplayViewer — Ready (Alt+S | Alt+V)")
                 .on_menu_event(|app, event| match event.id.as_ref() {
                     "capture_region" => {
                         let state: tauri::State<'_, AppState> = app.state();
@@ -203,6 +217,9 @@ pub fn run() {
                     "capture_fullscreen" => {
                         let state: tauri::State<'_, AppState> = app.state();
                         let _ = capture_cmds::trigger_fullscreen_capture(app.clone(), state);
+                    }
+                    "open_clipboard" => {
+                        let _ = clipboard_cmds::toggle_clipboard_drawer(app.clone());
                     }
                     "open_gallery" => {
                         if let Some(win) = app.get_webview_window("main") {
@@ -233,10 +250,11 @@ pub fn run() {
 
             Ok(())
         })
-        // Minimize `main` window to System Tray on close instead of terminating background process
+        // Minimize `main`, `overlay`, and `clipboard` windows to System Tray on close instead of terminating background process
         .on_window_event(|window, event| {
             if let WindowEvent::CloseRequested { api, .. } = event {
-                if window.label() == "main" || window.label() == "overlay" {
+                let lbl = window.label();
+                if lbl == "main" || lbl == "overlay" || lbl == "clipboard" {
                     api.prevent_close();
                     let _ = window.hide();
                 }
@@ -246,6 +264,16 @@ pub fn run() {
             capture_cmds::trigger_region_capture,
             capture_cmds::trigger_fullscreen_capture,
             capture_cmds::save_annotated_capture,
+            clipboard_cmds::toggle_clipboard_drawer,
+            clipboard_cmds::list_clipboard_history,
+            clipboard_cmds::paste_clipboard_item,
+            clipboard_cmds::annotate_clipboard_item,
+            clipboard_cmds::promote_clipboard_to_gallery,
+            clipboard_cmds::toggle_pin_clipboard_item,
+            clipboard_cmds::delete_clipboard_item,
+            clipboard_cmds::clear_unpinned_clipboard_history,
+            clipboard_cmds::get_clipboard_paused,
+            clipboard_cmds::set_clipboard_paused,
             gallery_cmds::list_captures,
             gallery_cmds::scan_unindexed_media,
             gallery_cmds::import_external_media,
