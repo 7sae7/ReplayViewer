@@ -12,7 +12,7 @@ import {
 import type Konva from "konva";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { listen } from "@tauri-apps/api/event";
-import { Maximize2, Minimize2, ZoomIn } from "lucide-react";
+import { Lock, Maximize2, Minimize2, Unlock, ZoomIn } from "lucide-react";
 import { normalizeCropRect, toPhysicalRect } from "../../lib/dpi";
 import {
   getFrozenCaptureUrl,
@@ -20,7 +20,10 @@ import {
   isTauriRuntime,
   saveAnnotatedCapture,
 } from "./overlay-helpers";
-import { useEditorStore } from "../../stores/useEditorStore";
+import {
+  transformShapeToNewBounds,
+  useEditorStore,
+} from "../../stores/useEditorStore";
 import { useSettingsStore } from "../../stores/useSettingsStore";
 import { FloatingToolbar } from "./FloatingToolbar";
 import type {
@@ -43,62 +46,6 @@ function dataUrlToUint8Array(dataUrl: string): Uint8Array {
     bytes[i] = binaryStr.charCodeAt(i);
   }
   return bytes;
-}
-
-function shiftShapeToLocalCrop(
-  shape: AnnotationShape,
-  crop: CropRect
-): AnnotationShape {
-  const dx = -crop.x;
-  const dy = -crop.y;
-  if (shape.tool === "arrow") {
-    return {
-      ...shape,
-      points: [
-        shape.points[0] + dx,
-        shape.points[1] + dy,
-        shape.points[2] + dx,
-        shape.points[3] + dy,
-      ],
-    };
-  }
-  if (shape.tool === "rect" || shape.tool === "pixelate") {
-    return {
-      ...shape,
-      x: shape.x + dx,
-      y: shape.y + dy,
-    };
-  }
-  if (shape.tool === "text") {
-    return {
-      ...shape,
-      x: shape.x + dx,
-      y: shape.y + dy,
-    };
-  }
-  if (shape.tool === "pen") {
-    const pts: number[] = [];
-    for (let i = 0; i < shape.points.length; i += 2) {
-      pts.push(shape.points[i] + dx, shape.points[i + 1] + dy);
-    }
-    return {
-      ...shape,
-      points: pts,
-    };
-  }
-  return shape;
-}
-
-function shiftShapeFromLocalToBounds(
-  shape: AnnotationShape,
-  bounds: CropRect
-): AnnotationShape {
-  return shiftShapeToLocalCrop(shape, {
-    x: -bounds.x,
-    y: -bounds.y,
-    width: bounds.width,
-    height: bounds.height,
-  });
 }
 
 export const OverlayApp: React.FC<OverlayAppProps> = ({
@@ -139,8 +86,11 @@ export const OverlayApp: React.FC<OverlayAppProps> = ({
     height: window.innerHeight || 1080,
   });
 
-  // For Clipboard Image Edit Mode (Alt+V -> Annotate): tracks centered image bounds at 1:1 or scaled size
+  // For Clipboard Image Edit Mode (Alt+V -> Annotate):
+  // - `imageBounds` is the visual display box on screen (1:1, 2x, 4x, Fit, or corner-dragged).
+  // - `lockOriginalOutputSize` defaults to `true` so visual zooming NEVER alters the saved image dimensions unless unlocked!
   const [imageBounds, setImageBounds] = useState<CropRect | null>(null);
+  const [lockOriginalOutputSize, setLockOriginalOutputSize] = useState(true);
   const [resizingCorner, setResizingCorner] = useState<ResizeCorner | null>(
     null
   );
@@ -193,6 +143,7 @@ export const OverlayApp: React.FC<OverlayAppProps> = ({
     (meta: CaptureSessionMeta) => {
       setSessionMeta(meta);
       resetSession();
+      setLockOriginalOutputSize(true);
 
       const viewW = window.innerWidth || 1920;
       const viewH = window.innerHeight || 1080;
@@ -200,26 +151,26 @@ export const OverlayApp: React.FC<OverlayAppProps> = ({
 
       const isClipEdit = Boolean(meta.sourceClipboardId);
       if (isClipEdit) {
-        // Fix #6: Center clipboard image at 1:1 actual pixel dimensions & auto-select cropRect
-        // so saving works immediately and tiny images don't stretch to fill the whole screen!
-        const bounds = computeCenteredBounds(
-          meta.width || 400,
-          meta.height || 300,
-          viewW,
-          viewH,
-          1
-        );
+        const origW = Math.max(1, meta.width || 400);
+        const origH = Math.max(1, meta.height || 300);
+        const bounds = computeCenteredBounds(origW, origH, viewW, viewH, 1);
         setImageBounds(bounds);
         setCropRect(bounds);
 
-        // Hydrate cross-session Ctrl+Z / Ctrl+Y vector history if present
+        // Hydrate cross-session Ctrl+Z / Ctrl+Y vector history from canonical (0..origW, 0..origH) space
         let restored: AnnotationShape[] = [];
         if (meta.initialAnnotationsJson) {
           try {
             const parsed = JSON.parse(meta.initialAnnotationsJson);
             if (Array.isArray(parsed)) {
+              const sourceSpace: CropRect = {
+                x: 0,
+                y: 0,
+                width: origW,
+                height: origH,
+              };
               restored = (parsed as AnnotationShape[]).map((s) =>
-                shiftShapeFromLocalToBounds(s, bounds)
+                transformShapeToNewBounds(s, sourceSpace, bounds)
               );
             }
           } catch {
@@ -279,7 +230,7 @@ export const OverlayApp: React.FC<OverlayAppProps> = ({
     };
   }, [loadFrozenFrame, loadSettings]);
 
-  // Scale / Expand helper for Clipboard Edit Mode (1:1, 2x, 4x, Fit to Screen)
+  // Visual Zoom helper for Clipboard Edit Mode (1:1, 2x, 4x, Fit to Screen)
   const applyClipboardImageScale = useCallback(
     (mode: "1x" | "2x" | "4x" | "fit") => {
       if (!imageBounds) return;
@@ -291,8 +242,8 @@ export const OverlayApp: React.FC<OverlayAppProps> = ({
         const maxW = Math.round(viewport.width * 0.78);
         const maxH = Math.round(viewport.height * 0.72);
         const ratio = Math.min(maxW / origW, maxH / origH);
-        const w = Math.max(24, Math.round(origW * ratio));
-        const h = Math.max(24, Math.round(origH * ratio));
+        const w = Math.max(16, Math.round(origW * ratio));
+        const h = Math.max(16, Math.round(origH * ratio));
         nextBounds = {
           x: Math.round((viewport.width - w) / 2),
           y: Math.round((viewport.height - h) / 2),
@@ -326,9 +277,12 @@ export const OverlayApp: React.FC<OverlayAppProps> = ({
     ]
   );
 
-  // Corner handle dragging to expand/resize clipboard image bounds interactively
+  // Corner handle dragging to visually zoom (aspect-locked when Output is Locked) or resize
   useEffect(() => {
     if (!resizingCorner || !imageBounds) return;
+
+    const origAspect =
+      Math.max(1, sessionMeta.width) / Math.max(1, sessionMeta.height);
 
     const onMouseMove = (e: MouseEvent) => {
       const minSize = 16;
@@ -339,24 +293,38 @@ export const OverlayApp: React.FC<OverlayAppProps> = ({
 
       if (resizingCorner === "se") {
         nextW = Math.max(minSize, e.clientX - imageBounds.x);
-        nextH = Math.max(minSize, e.clientY - imageBounds.y);
+        nextH = lockOriginalOutputSize
+          ? Math.max(minSize, Math.round(nextW / origAspect))
+          : Math.max(minSize, e.clientY - imageBounds.y);
       } else if (resizingCorner === "sw") {
         const right = imageBounds.x + imageBounds.width;
         nextX = Math.min(right - minSize, e.clientX);
         nextW = right - nextX;
-        nextH = Math.max(minSize, e.clientY - imageBounds.y);
+        nextH = lockOriginalOutputSize
+          ? Math.max(minSize, Math.round(nextW / origAspect))
+          : Math.max(minSize, e.clientY - imageBounds.y);
       } else if (resizingCorner === "ne") {
         const bottom = imageBounds.y + imageBounds.height;
-        nextY = Math.min(bottom - minSize, e.clientY);
         nextW = Math.max(minSize, e.clientX - imageBounds.x);
-        nextH = bottom - nextY;
+        if (lockOriginalOutputSize) {
+          nextH = Math.max(minSize, Math.round(nextW / origAspect));
+          nextY = bottom - nextH;
+        } else {
+          nextY = Math.min(bottom - minSize, e.clientY);
+          nextH = bottom - nextY;
+        }
       } else if (resizingCorner === "nw") {
         const right = imageBounds.x + imageBounds.width;
         const bottom = imageBounds.y + imageBounds.height;
         nextX = Math.min(right - minSize, e.clientX);
-        nextY = Math.min(bottom - minSize, e.clientY);
         nextW = right - nextX;
-        nextH = bottom - nextY;
+        if (lockOriginalOutputSize) {
+          nextH = Math.max(minSize, Math.round(nextW / origAspect));
+          nextY = bottom - nextH;
+        } else {
+          nextY = Math.min(bottom - minSize, e.clientY);
+          nextH = bottom - nextY;
+        }
       }
 
       const nextBounds: CropRect = {
@@ -380,7 +348,15 @@ export const OverlayApp: React.FC<OverlayAppProps> = ({
       window.removeEventListener("mousemove", onMouseMove);
       window.removeEventListener("mouseup", onMouseUp);
     };
-  }, [imageBounds, resizingCorner, setCropRect, transformAnnotationsToBounds]);
+  }, [
+    imageBounds,
+    lockOriginalOutputSize,
+    resizingCorner,
+    sessionMeta.height,
+    sessionMeta.width,
+    setCropRect,
+    transformAnnotationsToBounds,
+  ]);
 
   const handleCloseOverlay = useCallback(async () => {
     resetSession();
@@ -393,6 +369,67 @@ export const OverlayApp: React.FC<OverlayAppProps> = ({
     }
   }, [onCloseInBrowserPreview, resetSession]);
 
+  // Compute exact output pixel dimensions and Konva export pixelRatio
+  // When `lockOriginalOutputSize` is true (default), zooming to 4x on a 100x100 image
+  // uses `exportPixelRatio = 100 / 400 = 0.25` so the saved file stays 100x100!
+  const effectiveRect = cropRect || imageBounds;
+  const hasValidCrop = Boolean(
+    effectiveRect && effectiveRect.width >= 1 && effectiveRect.height >= 1
+  );
+
+  const computeExportMetrics = useCallback(() => {
+    if (!effectiveRect) {
+      return { outputWidth: 0, outputHeight: 0, exportPixelRatio: 1 };
+    }
+    if (isClipboardEditMode && imageBounds) {
+      if (lockOriginalOutputSize) {
+        const ratioX =
+          Math.max(1, sessionMeta.width) / Math.max(1, imageBounds.width);
+        const ratioY =
+          Math.max(1, sessionMeta.height) / Math.max(1, imageBounds.height);
+        return {
+          outputWidth: Math.max(1, Math.round(effectiveRect.width * ratioX)),
+          outputHeight: Math.max(1, Math.round(effectiveRect.height * ratioY)),
+          exportPixelRatio: ratioX,
+        };
+      } else {
+        return {
+          outputWidth: Math.max(1, Math.round(effectiveRect.width)),
+          outputHeight: Math.max(1, Math.round(effectiveRect.height)),
+          exportPixelRatio: 1,
+        };
+      }
+    }
+
+    const dpiScale = sessionMeta.scaleFactor || 1;
+    const phys = toPhysicalRect(effectiveRect, dpiScale);
+    return {
+      outputWidth: Math.max(1, phys.width),
+      outputHeight: Math.max(1, phys.height),
+      exportPixelRatio: dpiScale,
+    };
+  }, [
+    effectiveRect,
+    imageBounds,
+    isClipboardEditMode,
+    lockOriginalOutputSize,
+    sessionMeta.height,
+    sessionMeta.scaleFactor,
+    sessionMeta.width,
+  ]);
+
+  const { outputWidth, outputHeight } = computeExportMetrics();
+
+  const viewZoomPercent =
+    isClipboardEditMode && imageBounds
+      ? Math.max(
+          1,
+          Math.round(
+            (imageBounds.width / Math.max(1, sessionMeta.width)) * 100
+          )
+        )
+      : 100;
+
   const handleSaveCapture = useCallback(async () => {
     const activeRect = cropRect || imageBounds;
     if (
@@ -404,25 +441,36 @@ export const OverlayApp: React.FC<OverlayAppProps> = ({
       return;
     }
 
-    const scale = sessionMeta.scaleFactor || 1;
+    const {
+      outputWidth: targetOutW,
+      outputHeight: targetOutH,
+      exportPixelRatio: targetRatio,
+    } = computeExportMetrics();
+
     const exportConfig = {
       x: activeRect.x,
       y: activeRect.y,
       width: Math.max(1, activeRect.width),
       height: Math.max(1, activeRect.height),
-      pixelRatio: scale,
+      pixelRatio: targetRatio,
       mimeType: "image/png",
     };
 
-    // 1. Export flattened image (with all annotations visible)
+    // 1. Export flattened image (with all annotations visible) at target output resolution
     const flattenedDataUrl = stageRef.current.toDataURL(exportConfig);
     const flattenedBytes = dataUrlToUint8Array(flattenedDataUrl);
 
     // 2. Export clean base image (with only destructive Pixelate redactions visible)
-    //    + serialize non-destructive vector annotations for cross-session Ctrl+Z / Ctrl+Y!
+    //    + serialize non-destructive vector annotations in canonical (0..targetOutW, 0..targetOutH) space!
+    const canonicalOutputRect: CropRect = {
+      x: 0,
+      y: 0,
+      width: targetOutW,
+      height: targetOutH,
+    };
     const nonDestructiveShapes = annotations
       .filter((a) => a.tool !== "pixelate")
-      .map((a) => shiftShapeToLocalCrop(a, activeRect));
+      .map((a) => transformShapeToNewBounds(a, activeRect, canonicalOutputRect));
     const annotationsJson = JSON.stringify(nonDestructiveShapes);
 
     let baseImageBytes: Uint8Array | undefined;
@@ -435,15 +483,14 @@ export const OverlayApp: React.FC<OverlayAppProps> = ({
       baseImageBytes = dataUrlToUint8Array(baseDataUrl);
     }
 
-    const physical = toPhysicalRect(activeRect, scale);
     await saveAnnotatedCapture(
       flattenedBytes,
       settings?.copyToClipboardOnSave ?? true,
       settings?.imageFormat ?? "webp",
       flattenedDataUrl,
       {
-        width: Math.max(1, physical.width),
-        height: Math.max(1, physical.height),
+        width: targetOutW,
+        height: targetOutH,
       },
       {
         baseImageBytes,
@@ -457,10 +504,10 @@ export const OverlayApp: React.FC<OverlayAppProps> = ({
     }
   }, [
     annotations,
+    computeExportMetrics,
     cropRect,
     imageBounds,
     onCloseInBrowserPreview,
-    sessionMeta.scaleFactor,
     sessionMeta.sourceClipboardId,
     settings?.copyToClipboardOnSave,
     settings?.imageFormat,
@@ -638,43 +685,60 @@ export const OverlayApp: React.FC<OverlayAppProps> = ({
     setTextPromptValue("");
   };
 
-  const effectiveRect = cropRect || imageBounds;
-  const hasValidCrop = Boolean(
-    effectiveRect && effectiveRect.width >= 1 && effectiveRect.height >= 1
-  );
-  const physicalRect =
-    hasValidCrop && effectiveRect
-      ? toPhysicalRect(effectiveRect, sessionMeta.scaleFactor)
-      : null;
-
   const pixelateAnnotations = annotations.filter((a) => a.tool === "pixelate");
   const vectorAnnotations = annotations.filter((a) => a.tool !== "pixelate");
 
   return (
     <div className="relative w-screen h-screen overflow-hidden cursor-crosshair select-none bg-base-300">
-      {/* Top Instruction & Scale Banner */}
+      {/* Top Instruction, Output Lock Toggle & Visual Zoom Banner */}
       <div className="fixed top-4 left-1/2 -translate-x-1/2 z-40 flex items-center gap-2.5 px-4 py-2 rounded-box bg-base-200/95 border border-base-300 text-xs text-base-content shadow-2xl">
         <span className="badge badge-primary badge-sm font-semibold">
           {isClipboardEditMode ? "Alt + V Annotate" : "Alt + S"}
         </span>
-        {physicalRect ? (
+        {hasValidCrop ? (
           <>
-            <span>
-              Size:{" "}
-              <strong className="font-mono">
-                {Math.max(1, physicalRect.width)} ×{" "}
-                {Math.max(1, physicalRect.height)} px
-              </strong>
-            </span>
-            {isClipboardEditMode && (
+            {isClipboardEditMode ? (
               <>
+                {/* 1-Click Output Lock vs. Resize Output Toggle Pill */}
+                <button
+                  type="button"
+                  onClick={() => setLockOriginalOutputSize((prev) => !prev)}
+                  className={`btn btn-xs gap-1.5 font-mono ${
+                    lockOriginalOutputSize
+                      ? "btn-soft btn-success"
+                      : "btn-soft btn-warning"
+                  }`}
+                  title={
+                    lockOriginalOutputSize
+                      ? "Output dimensions are locked to original 1:1 size (Zooming is visual only). Click to apply zoom to saved output size."
+                      : "Output dimensions will resize to match your current zoom/scale. Click to lock back to original 1:1 output size."
+                  }
+                >
+                  {lockOriginalOutputSize ? (
+                    <>
+                      <Lock className="w-3 h-3" />
+                      Output: {outputWidth} × {outputHeight} px (Locked)
+                    </>
+                  ) : (
+                    <>
+                      <Unlock className="w-3 h-3" />
+                      Output: {outputWidth} × {outputHeight} px (Resize Output)
+                    </>
+                  )}
+                </button>
+
                 <span className="opacity-40">|</span>
+
+                <span className="font-mono text-[11px] opacity-80">
+                  View: <strong>{viewZoomPercent}%</strong>
+                </span>
+
                 <div className="join">
                   <button
                     type="button"
                     onClick={() => applyClipboardImageScale("1x")}
                     className="btn btn-xs btn-ghost join-item font-mono"
-                    title="Reset to 1:1 actual pixel dimensions"
+                    title="View at 100% (1:1)"
                   >
                     <Minimize2 className="w-3 h-3 mr-1" /> 1:1
                   </button>
@@ -682,7 +746,7 @@ export const OverlayApp: React.FC<OverlayAppProps> = ({
                     type="button"
                     onClick={() => applyClipboardImageScale("2x")}
                     className="btn btn-xs btn-ghost join-item font-mono"
-                    title="Expand image 200%"
+                    title="Magnify view to 200%"
                   >
                     <ZoomIn className="w-3 h-3 mr-1" /> 2×
                   </button>
@@ -690,7 +754,7 @@ export const OverlayApp: React.FC<OverlayAppProps> = ({
                     type="button"
                     onClick={() => applyClipboardImageScale("4x")}
                     className="btn btn-xs btn-ghost join-item font-mono"
-                    title="Expand small image 400%"
+                    title="Magnify view to 400%"
                   >
                     4×
                   </button>
@@ -698,14 +762,23 @@ export const OverlayApp: React.FC<OverlayAppProps> = ({
                     type="button"
                     onClick={() => applyClipboardImageScale("fit")}
                     className="btn btn-xs btn-ghost join-item"
-                    title="Expand to fit screen"
+                    title="Magnify view to fit screen"
                   >
-                    <Maximize2 className="w-3 h-3 mr-1" /> Fit Screen
+                    <Maximize2 className="w-3 h-3 mr-1" /> Fit
                   </button>
                 </div>
-                <span className="text-[11px] opacity-70">
-                  (Or drag corner handles)
+              </>
+            ) : (
+              <>
+                <span>
+                  Selected Area:{" "}
+                  <strong className="font-mono">
+                    {outputWidth} × {outputHeight} px
+                  </strong>{" "}
+                  ({sessionMeta.scaleFactor.toFixed(2)}x DPI)
                 </span>
+                <span className="opacity-40">|</span>
+                <span>Drag again to re-select or pick an annotation tool</span>
               </>
             )}
             <span className="opacity-40">|</span>
@@ -736,7 +809,7 @@ export const OverlayApp: React.FC<OverlayAppProps> = ({
         onMouseUp={handleStageMouseUp}
       >
         <Layer>
-          {/* Dark Checker/Canvas backdrop when editing a centered clipboard image */}
+          {/* Dark Canvas backdrop when editing a centered clipboard image */}
           {isClipboardEditMode && (
             <Rect
               x={0}
@@ -747,7 +820,7 @@ export const OverlayApp: React.FC<OverlayAppProps> = ({
             />
           )}
 
-          {/* Frozen Background Frame: 1:1 Centered for Clipboard Edit, or Fullscreen for Alt+S */}
+          {/* Frozen Background Frame: Centered for Clipboard Edit, or Fullscreen for Alt+S */}
           {bgImage && (
             <KonvaImage
               image={bgImage}
@@ -866,7 +939,7 @@ export const OverlayApp: React.FC<OverlayAppProps> = ({
       )}
 
       {/* CSS Dimming Mask, Crisp Selection Border & Draggable Corner Handles */}
-      {hasValidCrop && effectiveRect && physicalRect && (
+      {hasValidCrop && effectiveRect && (
         <div
           style={{
             left: effectiveRect.x,
@@ -877,13 +950,14 @@ export const OverlayApp: React.FC<OverlayAppProps> = ({
           }}
           className="fixed pointer-events-none border-2 border-primary z-30"
         >
-          {/* Live Physical Pixel Dimensions Badge */}
+          {/* Live Output & View Dimensions Badge */}
           <div className="absolute -top-7 left-0 badge badge-primary badge-sm font-mono font-semibold shadow whitespace-nowrap">
-            {Math.max(1, physicalRect.width)} ×{" "}
-            {Math.max(1, physicalRect.height)}
+            {isClipboardEditMode && lockOriginalOutputSize
+              ? `Output ${outputWidth} × ${outputHeight} px (${viewZoomPercent}% View)`
+              : `${outputWidth} × ${outputHeight} px`}
           </div>
 
-          {/* 4 Interactive Corner Resize Handles when editing a Clipboard Image */}
+          {/* 4 Interactive Corner Handles when editing a Clipboard Image */}
           {isClipboardEditMode && (
             <>
               <div
@@ -891,7 +965,11 @@ export const OverlayApp: React.FC<OverlayAppProps> = ({
                   e.stopPropagation();
                   setResizingCorner("nw");
                 }}
-                title="Drag corner to expand/resize image"
+                title={
+                  lockOriginalOutputSize
+                    ? "Drag corner to magnify view (Output stays locked)"
+                    : "Drag corner to resize output image"
+                }
                 className="pointer-events-auto absolute -top-2 -left-2 w-4 h-4 rounded-full bg-primary border-2 border-base-100 cursor-nwse-resize shadow"
               />
               <div
@@ -899,7 +977,11 @@ export const OverlayApp: React.FC<OverlayAppProps> = ({
                   e.stopPropagation();
                   setResizingCorner("ne");
                 }}
-                title="Drag corner to expand/resize image"
+                title={
+                  lockOriginalOutputSize
+                    ? "Drag corner to magnify view (Output stays locked)"
+                    : "Drag corner to resize output image"
+                }
                 className="pointer-events-auto absolute -top-2 -right-2 w-4 h-4 rounded-full bg-primary border-2 border-base-100 cursor-nesw-resize shadow"
               />
               <div
@@ -907,7 +989,11 @@ export const OverlayApp: React.FC<OverlayAppProps> = ({
                   e.stopPropagation();
                   setResizingCorner("sw");
                 }}
-                title="Drag corner to expand/resize image"
+                title={
+                  lockOriginalOutputSize
+                    ? "Drag corner to magnify view (Output stays locked)"
+                    : "Drag corner to resize output image"
+                }
                 className="pointer-events-auto absolute -bottom-2 -left-2 w-4 h-4 rounded-full bg-primary border-2 border-base-100 cursor-nesw-resize shadow"
               />
               <div
@@ -915,7 +1001,11 @@ export const OverlayApp: React.FC<OverlayAppProps> = ({
                   e.stopPropagation();
                   setResizingCorner("se");
                 }}
-                title="Drag corner to expand/resize image"
+                title={
+                  lockOriginalOutputSize
+                    ? "Drag corner to magnify view (Output stays locked)"
+                    : "Drag corner to resize output image"
+                }
                 className="pointer-events-auto absolute -bottom-2 -right-2 w-4 h-4 rounded-full bg-primary border-2 border-base-100 cursor-nwse-resize shadow"
               />
             </>

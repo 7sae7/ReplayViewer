@@ -136,15 +136,23 @@ sequenceDiagram
 
 ---
 
-### 4.3 Phase 1.5: Visual Image Clipboard Flow (`Alt + V`)
+### 4.3 Phase 1.5.1: Visual Image Clipboard Flow, Non-Destructive Vector Layers & Visual Zoom (`Alt + V`)
 
-1. **Event Subscription:** Rust listens to OS clipboard change notifications (zero polling CPU usage).
-2. **Ingest & Hash:** When an image is detected on the clipboard, Rust reads the raw RGBA buffer and computes a `blake3` hash (< 1ms for 1080p).
-3. **Deduplication Check:**
-   * If `blake3_hash` already exists in `clipboard_history`, update `copied_at = CURRENT_TIMESTAMP` to move it to the top of the drawer.
-   * If new, write the full image to `app_data/clipboard_cache/<hash>.webp` and a `200px` thumbnail to `app_data/clipboard_cache/<hash>_thumb.webp`.
-4. **FIFO Ring Eviction:**
-   Rust queries `settings.clipboard_max_items` (default `10`, configurable `5–50`) and deletes both the SQLite rows and disk files for any unpinned rows exceeding the limit.
+1. **Zero-Overhead OS Clipboard Sequence Watcher:**
+   * On Windows, Rust checks `clipboard_win::raw::seq_num()` (`GetClipboardSequenceNumber()`, ~20ns atomic read that does not open or lock the clipboard) and respects Windows clipboard privacy flags (`ExcludeClipboardContentFromMonitorProcessing`).
+   * Only when the sequence counter advances does Rust read the image via `arboard::Clipboard`.
+2. **Sub-Millisecond Pixel Digest & Deduplication:**
+   * Computes a collision-resistant digest over `(width, height, raw_rgba_bytes)` using hardware-accelerated SIMD `crc32fast` (full buffer, ~0.3ms for 1080p) + `Sha256` (`< 0.5ms` total).
+   * If `blake3_hash` already exists in `clipboard_history`, updates `copied_at` and marks it `CURRENTLY COPIED` (`active_clipboard_hash`) without duplicating files on disk.
+   * If new, writes the full image to `app_data/clipboard_cache/clip_<hash>.webp` and a `200px` thumbnail to `app_data/clipboard_cache/clip_<hash>_thumb.webp`.
+3. **Pinned-on-Top Ordering & FIFO Ring Eviction:**
+   * Queries return `ORDER BY is_pinned DESC, copied_at DESC` so pinned items stay anchored at the top while unpinned items flow underneath.
+   * Enforces `settings.clipboard_max_items` (`5`, `10`, `20`, or `50` unpinned items), deleting both SQLite rows and `.webp` files for evicted unpinned items.
+   * Remembers the user's window Always-on-Top toggle (`clipboard_always_on_top`) across `Alt + V` sessions.
+4. **1:1 Centered Annotation, Visual Zoom vs. Output Resize Lock, & Cross-Session `Ctrl + Z` / `Ctrl + Y`:**
+   * Clicking **Annotate (`A`)** on any clipboard item loads its clean `base_file_path` into the `overlay` window centered at its **1:1 actual pixel dimensions**, with `cropRect` pre-selected to the image bounds.
+   * **Visual Zoom by Default (`Output Locked`):** Zooming via `1:1`, `2×`, `4×`, `Fit`, or dragging the 4 corner handles magnifies the canvas for editing while exporting with `pixelRatio = origWidth / displayWidth` so a `100×100` image zoomed to `400%` still saves at `100×100` (with a 1-click **`Output: Locked` ↔ `Resize Output`** toggle pill if the user wants to save the scaled dimensions).
+   * **Cross-Session `Ctrl + Z` / `Ctrl + Y` Vector History (`0 MB` Idle RAM):** On save, non-destructive vector shapes (`Arrow`, `Rect`, `Pen`, `Text`) are normalized to canonical `(0..outputW, 0..outputH)` coordinates and stored in `clipboard_history.annotations_json` (~1–2 KB), while a clean `base_file_path` (with only destructive `Pixelate` redactions baked in for security) is saved alongside the flattened `.webp`. Re-opening the item in the annotator hydrates the saved shapes into Zustand's Undo stack (`past`) so `Ctrl + Z` and `Ctrl + Y` work across sessions.
 
 ---
 
@@ -234,20 +242,22 @@ CREATE VIRTUAL TABLE IF NOT EXISTS captures_fts USING fts5(
     tokenize = 'porter unicode61'
 );
 
--- 4. Phase 1.5 Visual Clipboard History Ring (Alt + V)
+-- 4. Phase 1.5.1 Visual Clipboard History Ring (Alt + V)
 CREATE TABLE IF NOT EXISTS clipboard_history (
-    id              TEXT PRIMARY KEY,
-    blake3_hash     TEXT NOT NULL UNIQUE,           -- Prevents duplicate entries on repeated Ctrl+C
-    file_path       TEXT NOT NULL,
-    thumb_path      TEXT NOT NULL,
-    width           INTEGER NOT NULL,
-    height          INTEGER NOT NULL,
-    size_bytes      INTEGER NOT NULL,
-    is_pinned       INTEGER NOT NULL DEFAULT 0,
-    copied_at       TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+    id                  TEXT PRIMARY KEY,
+    blake3_hash         TEXT NOT NULL UNIQUE,           -- Prevents duplicate entries on repeated Ctrl+C
+    file_path           TEXT NOT NULL,                  -- Flattened .webp image
+    thumb_path          TEXT NOT NULL,                  -- 200px .webp thumbnail
+    base_file_path      TEXT DEFAULT NULL,              -- Clean base .webp (only Pixelate redactions baked in)
+    annotations_json    TEXT NOT NULL DEFAULT '[]',     -- Vector shapes for cross-session Ctrl+Z / Ctrl+Y
+    width               INTEGER NOT NULL,
+    height              INTEGER NOT NULL,
+    size_bytes          INTEGER NOT NULL,
+    is_pinned           INTEGER NOT NULL DEFAULT 0,
+    copied_at           TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
 
-CREATE INDEX IF NOT EXISTS idx_clipboard_copied_at ON clipboard_history(copied_at DESC);
+CREATE INDEX IF NOT EXISTS idx_clipboard_copied_at ON clipboard_history(is_pinned DESC, copied_at DESC);
 
 -- 5. User Settings, Keybinds & Working Storage Directory
 CREATE TABLE IF NOT EXISTS settings (
@@ -316,8 +326,14 @@ To support **Windows, macOS, and Linux** cleanly now—and prepare for **Android
 | `open_in_file_explorer` | 1.0 | `path: String` | `()` | Opens file (highlighted) or folder in Windows Explorer / macOS Finder / Linux `xdg-open` |
 | `seed_benchmark_captures` | 1.0 | `count: u32` | `usize` | Inserts 500+ real WebP-backed benchmark captures in a single SQLite transaction |
 | `get_settings` / `update_settings` | 1.0 | `SettingsPayload` | `SettingsPayload` | Reads/updates hotkeys, working `captures_dir`, image format, and storage limits |
-| `list_clipboard_history` | 1.5 | *None* | `Vec<ClipboardItem>` | Returns the 5–50 items in the `Alt + V` ring buffer |
-| `run_storage_cleanup` | 1.5 | `dry_run: bool` | `CleanupReport` | Executes max-GB and max-age retention rules on unpinned items |
+| `toggle_clipboard_drawer` | 1.5.1 | *None* | `bool` | Shows/hides the frameless `Alt + V` clipboard window using persisted `clipboard_always_on_top` |
+| `get_clipboard_always_on_top` / `set_clipboard_always_on_top` | 1.5.1 | `always_on_top: bool` | `bool` | Reads/persists the user's Always-on-Top window pin choice across `Alt + V` openings |
+| `list_clipboard_history` | 1.5.1 | *None* | `Vec<ClipboardItem>` | Returns `Alt + V` items (`ORDER BY is_pinned DESC, copied_at DESC`) with `is_currently_copied` |
+| `paste_clipboard_item` | 1.5.1 | `id: String` | `ClipboardItem` | Writes historical image to OS clipboard, marks `CURRENTLY COPIED`, and closes drawer |
+| `annotate_clipboard_item` | 1.5.1 | `id: String` | `CaptureSessionMeta` | Loads clean `base_file_path` + `annotations_json` into 1:1 centered `overlay` annotator |
+| `promote_clipboard_to_gallery` | 1.5.1 | `id: String` | `CaptureRecord` | Archives a clipboard item permanently into the Gallery working folder |
+| `toggle_pin_clipboard_item` / `delete_clipboard_item` / `clear_unpinned_clipboard_history` | 1.5.1 | `id, pinned` | `()` / `usize` | Pins items to top (exempt from FIFO eviction), deletes single item, or clears unpinned items |
+| `run_storage_cleanup` | 1.5.3 | `dry_run: bool` | `CleanupReport` | Executes max-GB and max-age retention rules on unpinned items |
 | `save_replay_buffer` | 2.0 | *None* | `CaptureRecord` | Concatenates rolling video segments into a saved `.mp4` clip (`Alt + C`) |
 | `trim_video_clip` | 2.0 | `id, start_ms, end_ms, replace_original` | `CaptureRecord` | Lossless/fast FFmpeg trim of a saved video clip |
 | `semantic_visual_search` | 2.0.5 | `query: String, limit: u32` | `Vec<CaptureRecord>` | Ranks unlabeled images via opt-in `CLIP-INT8` 512-d vector cosine similarity in `< 8 ms` |
