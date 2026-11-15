@@ -1,7 +1,10 @@
 import React, { useEffect, useState } from "react";
 import {
   Check,
+  Clock,
   Cpu,
+  Eye,
+  FileText,
   Folder,
   FolderInput,
   FolderOpen,
@@ -10,22 +13,31 @@ import {
   HardDrive,
   ImagePlus,
   Keyboard,
+  Pin,
   RotateCcw,
   Save,
   ShieldCheck,
+  Sparkles,
 } from "lucide-react";
-import { formatBytes } from "../../lib/dpi";
+import { formatBytes, formatDeletionCountdown } from "../../lib/dpi";
 import {
+  enforceStoragePoliciesNow,
   getDefaultCapturesDir,
+  getStorageStatusPreview,
   importExternalMedia,
   migrateCapturesToFolder,
   openInFileExplorer,
   pickFolderDialog,
+  runOcrBackfillNow,
   scanUnindexedMedia,
 } from "../../lib/tauri-client";
 import { useGalleryStore } from "../../stores/useGalleryStore";
 import { useSettingsStore } from "../../stores/useSettingsStore";
-import type { SettingsPayload, UnindexedScanResult } from "../../types/ipc";
+import type {
+  SettingsPayload,
+  StorageStatusSummary,
+  UnindexedScanResult,
+} from "../../types/ipc";
 
 export const SettingsPanel: React.FC = () => {
   const { settings, isSaving, loadSettings, saveSettings } = useSettingsStore();
@@ -47,6 +59,13 @@ export const SettingsPanel: React.FC = () => {
     useState<UnindexedScanResult | null>(null);
   const [isImporting, setIsImporting] = useState(false);
 
+  // Storage Quota & OCR Status Preview
+  const [storageStatus, setStorageStatus] =
+    useState<StorageStatusSummary | null>(null);
+  const [showDryRunModal, setShowDryRunModal] = useState(false);
+  const [isRunningPolicy, setIsRunningPolicy] = useState(false);
+  const [isRunningOcr, setIsRunningOcr] = useState(false);
+
   useEffect(() => {
     loadSettings();
   }, [loadSettings]);
@@ -56,6 +75,13 @@ export const SettingsPanel: React.FC = () => {
       setForm({ ...settings });
     }
   }, [settings]);
+
+  useEffect(() => {
+    if (!form) return;
+    getStorageStatusPreview(form.maxStorageGb, form.autoCleanupDays)
+      .then(setStorageStatus)
+      .catch(() => {});
+  }, [form?.maxStorageGb, form?.autoCleanupDays]);
 
   const handleKeyDownRecorder = (
     e: React.KeyboardEvent,
@@ -176,6 +202,42 @@ export const SettingsPanel: React.FC = () => {
       setStatusMessage(
         `Set Storage Directory to built-in folder "${defaultDir}" — click "Save Changes" to apply.`
       );
+    }
+  };
+
+  const handleRunStoragePolicyNow = async () => {
+    setIsRunningPolicy(true);
+    try {
+      await saveSettings(form);
+      const summary = await enforceStoragePoliciesNow();
+      setStorageStatus(summary);
+      await fetchCaptures();
+      setShowDryRunModal(false);
+      setStatusMessage(
+        `Storage policy pass complete: ${summary.queuedCount} capture(s) now in 3-day Queued Deletion buffer, ${summary.expiredPurgedCount} expired capture(s) permanently deleted.`
+      );
+    } finally {
+      setIsRunningPolicy(false);
+    }
+  };
+
+  const handleRunOcrBackfill = async () => {
+    setIsRunningOcr(true);
+    try {
+      const processed = await runOcrBackfillNow();
+      const refreshed = await getStorageStatusPreview(
+        form.maxStorageGb,
+        form.autoCleanupDays
+      );
+      setStorageStatus(refreshed);
+      await fetchCaptures();
+      setStatusMessage(
+        processed > 0
+          ? `Native OS OCR scanned ${processed} capture(s) and indexed detected text into FTS5!`
+          : "All captures in this folder have already been scanned by Native OS OCR."
+      );
+    } finally {
+      setIsRunningOcr(false);
     }
   };
 
@@ -406,34 +468,137 @@ export const SettingsPanel: React.FC = () => {
             <div className="card-body p-5 space-y-4">
               <h3 className="card-title text-sm flex items-center gap-2">
                 <HardDrive className="w-4 h-4 text-warning" />
-                Smart Storage & Clipboard Ring (v1.5)
+                Smart Storage, 3-Day Grace Buffer &amp; Native OCR (v1.5)
               </h3>
 
-              <div className="space-y-4 text-xs">
+              <div className="space-y-3.5 text-xs">
+                {/* Max Library Storage Cap */}
                 <div>
-                  <div className="flex justify-between mb-1.5">
-                    <span className="text-base-content/80">
-                      Max Library Storage Cap
+                  <div className="flex justify-between mb-1">
+                    <span className="text-base-content/80 font-medium">
+                      Max Library Storage Cap (Default: 10 GB)
                     </span>
                     <span className="badge badge-warning badge-sm font-mono">
-                      {form.maxStorageGb} GB
+                      {form.maxStorageGb === 0
+                        ? "Unlimited"
+                        : `${form.maxStorageGb} GB`}
                     </span>
                   </div>
                   <input
                     type="range"
-                    min={5}
+                    min={0}
                     max={100}
-                    step={5}
+                    step={1}
                     value={form.maxStorageGb}
                     onChange={(e) =>
                       setForm({ ...form, maxStorageGb: Number(e.target.value) })
                     }
                     className="range range-warning range-xs w-full"
                   />
+                  <p className="text-[10px] text-base-content/55 mt-1">
+                    <strong className="text-warning">Pinned items are never pruned.</strong>{" "}
+                    Pruned unpinned items are held in <strong>Queued Deletion</strong> for 3 days before permanent deletion.
+                  </p>
                 </div>
 
-                <div>
-                  <div className="flex justify-between mb-1.5">
+                {/* Max Retention Age (Unpinned) */}
+                <div className="flex items-center justify-between gap-2 pt-1 border-t border-base-300">
+                  <div>
+                    <span className="text-base-content/80 font-medium block">
+                      Max Retention Age (Unpinned)
+                    </span>
+                    <span className="text-[10px] text-base-content/55">
+                      Default: No max retention age (Keep Forever)
+                    </span>
+                  </div>
+                  <select
+                    value={form.autoCleanupDays}
+                    onChange={(e) =>
+                      setForm({
+                        ...form,
+                        autoCleanupDays: Number(e.target.value),
+                      })
+                    }
+                    className="select select-xs select-bordered bg-base-100 font-mono text-[11px]"
+                  >
+                    <option value={0}>No Max Age (Keep Forever)</option>
+                    <option value={7}>Older than 7 Days</option>
+                    <option value={14}>Older than 14 Days</option>
+                    <option value={30}>Older than 30 Days</option>
+                    <option value={60}>Older than 60 Days</option>
+                    <option value={90}>Older than 90 Days</option>
+                    <option value={180}>Older than 180 Days</option>
+                    <option value={365}>Older than 365 Days</option>
+                  </select>
+                </div>
+
+                {/* Live Storage Breakdown & 3-Day Queued Deletion Status */}
+                {storageStatus && (
+                  <div className="p-2.5 rounded-lg bg-base-100 border border-base-300 space-y-2">
+                    <div className="grid grid-cols-3 gap-2 text-[11px]">
+                      <div>
+                        <span className="text-warning font-semibold flex items-center gap-1">
+                          <Pin className="w-3 h-3" /> Pinned (Immune)
+                        </span>
+                        <span className="font-mono text-base-content/80">
+                          {storageStatus.pinnedCount} ({formatBytes(storageStatus.pinnedBytes)})
+                        </span>
+                      </div>
+                      <div>
+                        <span className="text-primary font-semibold block">
+                          Unpinned Active
+                        </span>
+                        <span className="font-mono text-base-content/80">
+                          {storageStatus.unpinnedCount} ({formatBytes(storageStatus.unpinnedBytes)})
+                        </span>
+                      </div>
+                      <div>
+                        <span className="text-error font-semibold flex items-center gap-1">
+                          <Clock className="w-3 h-3" /> Queued (3d Grace)
+                        </span>
+                        <span className="font-mono text-base-content/80">
+                          {storageStatus.queuedCount} ({formatBytes(storageStatus.queuedBytes)})
+                        </span>
+                      </div>
+                    </div>
+
+                    {storageStatus.nextExpiryAt && (
+                      <div className="text-[10px] font-mono text-warning flex items-center justify-between pt-1 border-t border-base-300">
+                        <span>Next permanent auto-deletion:</span>
+                        <span>
+                          {formatDeletionCountdown(storageStatus.nextExpiryAt).compactLabel}
+                        </span>
+                      </div>
+                    )}
+
+                    <div className="flex items-center justify-between gap-2 pt-1 border-t border-base-300">
+                      <button
+                        type="button"
+                        onClick={() => setShowDryRunModal(true)}
+                        className="btn btn-xs btn-outline border-base-300 gap-1 flex-1"
+                      >
+                        <Eye className="w-3 h-3 text-warning" />
+                        Preview Cleanup ({storageStatus.candidateCount})
+                      </button>
+                      <button
+                        type="button"
+                        disabled={isRunningOcr}
+                        onClick={handleRunOcrBackfill}
+                        title="Scan unindexed captures using native OS OCR (Windows.Media.Ocr / Apple Vision)"
+                        className="btn btn-xs btn-soft btn-info gap-1 flex-1"
+                      >
+                        <FileText className="w-3 h-3" />
+                        {isRunningOcr
+                          ? "Scanning OCR..."
+                          : `Scan OCR (${storageStatus.pendingOcrCount} pending)`}
+                      </button>
+                    </div>
+                  </div>
+                )}
+
+                {/* Visual Clipboard Ring Slots */}
+                <div className="pt-1 border-t border-base-300">
+                  <div className="flex justify-between mb-1">
                     <span className="text-base-content/80">
                       Visual Clipboard Ring Slots (Alt + V)
                     </span>
@@ -630,6 +795,106 @@ export const SettingsPanel: React.FC = () => {
                     Import {unindexedPrompt.count} Image(s)
                   </>
                 )}
+              </button>
+            </div>
+          </div>
+        </dialog>
+      )}
+
+      {/* Modal 3: Dry-Run Storage Policy Preview Modal */}
+      {showDryRunModal && storageStatus && (
+        <dialog
+          className="modal modal-open"
+          onClick={() => setShowDryRunModal(false)}
+        >
+          <div
+            className="modal-box max-w-lg bg-base-200 border border-base-300 space-y-3"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <h3 className="font-bold text-sm flex items-center gap-2">
+              <Clock className="w-4 h-4 text-warning" />
+              Storage Policy Preview (3-Day Queued Deletion Buffer)
+            </h3>
+
+            <div className="text-xs text-base-content/80 space-y-2">
+              <p>
+                With a cap of{" "}
+                <strong>
+                  {form.maxStorageGb === 0 ? "Unlimited" : `${form.maxStorageGb} GB`}
+                </strong>{" "}
+                and retention age of{" "}
+                <strong>
+                  {form.autoCleanupDays === 0
+                    ? "Keep Forever"
+                    : `${form.autoCleanupDays} days`}
+                </strong>
+                :
+              </p>
+
+              <div className="p-3 rounded-lg bg-base-100 border border-base-300 space-y-1.5 font-mono text-[11px]">
+                <div className="flex justify-between">
+                  <span>Pinned Captures (100% Immune):</span>
+                  <span className="text-warning font-bold">
+                    {storageStatus.pinnedCount} items ({formatBytes(storageStatus.pinnedBytes)})
+                  </span>
+                </div>
+                <div className="flex justify-between">
+                  <span>Unpinned Active Captures:</span>
+                  <span>
+                    {storageStatus.unpinnedCount} items ({formatBytes(storageStatus.unpinnedBytes)})
+                  </span>
+                </div>
+                <div className="flex justify-between">
+                  <span>Currently in 3-Day Queued Deletion:</span>
+                  <span className="text-error">
+                    {storageStatus.queuedCount} items ({formatBytes(storageStatus.queuedBytes)})
+                  </span>
+                </div>
+                <div className="flex justify-between pt-1 border-t border-base-300">
+                  <span>Would Move to 3-Day Queue Now:</span>
+                  <span className="text-primary font-bold">
+                    {storageStatus.candidateCount} items ({formatBytes(storageStatus.candidateBytes)})
+                  </span>
+                </div>
+              </div>
+
+              {storageStatus.candidateSamples.length > 0 && (
+                <div className="space-y-1">
+                  <span className="text-[11px] font-semibold text-base-content/70">
+                    Oldest unpinned captures that would enter the 3-day grace buffer:
+                  </span>
+                  <div className="p-2 rounded bg-base-100 border border-base-300 max-h-36 overflow-y-auto space-y-1 font-mono text-[10px]">
+                    {storageStatus.candidateSamples.map((c) => (
+                      <div key={c.id} className="flex items-center justify-between gap-2">
+                        <span className="truncate">{c.fileName}</span>
+                        <span className="text-warning shrink-0">
+                          {c.reason} • {formatBytes(c.sizeBytes)}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+            </div>
+
+            <div className="modal-action">
+              <button
+                type="button"
+                onClick={() => setShowDryRunModal(false)}
+                className="btn btn-xs btn-ghost"
+              >
+                Close
+              </button>
+              <button
+                type="button"
+                disabled={isRunningPolicy}
+                onClick={handleRunStoragePolicyNow}
+                className="btn btn-xs btn-warning gap-1.5"
+              >
+                <Sparkles className="w-3.5 h-3.5" />
+                {isRunningPolicy
+                  ? "Applying Policy..."
+                  : "Apply & Run Policy Pass Now"}
               </button>
             </div>
           </div>

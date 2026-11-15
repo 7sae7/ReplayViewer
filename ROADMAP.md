@@ -30,8 +30,8 @@ To stand out in technical interviews and real-world usage, every phase is measur
 ### Milestone 1.1: Foundation, Frameless daisyUI v5 UI, Tray Daemon & SQLite Core
 - [x] Scaffold Tauri v2 + React 19 + TypeScript + Vite + **Tailwind CSS v4 + daisyUI v5** workspace.
 - [x] **Frameless Custom daisyUI Titlebar:** Replace the native Windows titlebar (`decorations: false`) with an integrated daisyUI draggable titlebar (`Minimize`, `Maximize/Restore`, `Close to Tray`) and a live **10-Theme Switcher** (`night`, `dark`, `dim`, `dracula`, `synthwave`, `cyberpunk`, `sunset`, `business`, `nord`, `light`).
-- [x] Configure system tray menu (*Capture Region*, *Instant Fullscreen Capture*, *Open Gallery*, *Quit*) and intercept window close events so the app minimizes silently to tray.
-- [x] Initialize embedded `rusqlite` database (`AppData/Local/com.replayviewer.app/replay_viewer_v2.db`) with `PRAGMA journal_mode = WAL`, non-destructive column migrations, and user-configurable media storage folders (`Pictures/ReplayViewer/captures` by default).
+- [x] Configure system tray menu (*Capture Region*, *Instant Fullscreen Capture*, *Open Gallery*, *Quit*), intercept window close events so the app minimizes silently to tray, and enforce **Single-Instance Startup (`single_instance.rs`)** so launching `replay-viewer.exe` a second time brings the existing running instance to the foreground instead of spawning a duplicate tray icon.
+- [x] Initialize embedded `rusqlite` database (`AppData/Local/com.replayviewer.app/replay_viewer_v2.db`) with `PRAGMA journal_mode = WAL`, non-destructive column migrations, and a portable built-in `./captures` default storage directory next to `replay-viewer.exe` (with automatic fallback to `Pictures/ReplayViewer/captures` if installed in a read-only folder).
 - [x] Register configurable global shortcuts (`Alt + S` for region capture, `Alt + Shift + S` for instant fullscreen capture, `Alt + G` for gallery, `Alt + V` for visual clipboard, and `Alt + C` for replay clip save—avoiding NVIDIA's `Alt + R` performance overlay).
 
 ### Milestone 1.2: Anti-Cheat Safe Capture, Fullscreen Mode & Persistent Region Selector (`Alt + S`)
@@ -60,12 +60,13 @@ To stand out in technical interviews and real-world usage, every phase is measur
 
 ---
 
-## Phase 1.5: Visual Image Clipboard (`Alt + V`) & Smart Storage (`v1.5` — UP NEXT)
+## Phase 1.5: Visual Image Clipboard (`Alt + V`), Smart Storage 3-Day Grace Buffer & Native OS OCR (`v1.5` — COMPLETED)
 
-**Goal:** Solve Windows `Win + V` image reliability problems and automate storage quota cleanup.
+**Status:** Complete & Verified  
+**Goal:** Solve Windows `Win + V` image reliability and lock-contention problems, automate storage quota cleanup with a 3-day safety buffer and 100% pinned immunity, and index image text using zero-bloat Native OS OCR.
 
 ### Milestone 1.5.1: The `Alt + V` Visual Image Clipboard (Windows `Win + V` for Images)
-- [x] Implement a background OS clipboard image watcher in Rust (`arboard` + `clipboard-win` sequence counter) that detects images copied from *any* application (browsers, Discord, design tools, or ReplayViewer itself) with near-zero idle CPU usage and Windows privacy marker compliance (`ExcludeClipboardContentFromMonitorProcessing`).
+- [x] Implement a non-blocking background OS clipboard image watcher in Rust (`clipboard-win` sequence counter + `180ms` settle debounce + `< 1ms` `OpenClipboard` raw `memcpy` of `"PNG"` or `CF_DIBV5`/`CF_DIB`) that detects 12 MB+ images copied from *any* application (Discord, browsers, design tools, or ReplayViewer) with zero UI stutter and Windows privacy marker compliance (`ExcludeClipboardContentFromMonitorProcessing`).
 - [x] Compute a sub-millisecond pixel digest (`crc32fast` SIMD + `Sha256`, `< 0.5ms`) on raw RGBA pixel bytes to deduplicate repeated copies—bumping existing images to the top of the history list instead of duplicating storage.
 - [x] Store full clipboard images in `clipboard_cache/` with `200px` `.webp` thumbnails, keep **Pinned images anchored at the top** (`ORDER BY is_pinned DESC, copied_at DESC`), and enforce a user-configurable **FIFO ring buffer limit** (`5`, `10`, `20`, or `50` unpinned images) in SQLite.
 - [x] Build the frameless daisyUI v5 `Alt + V` quick-paste popup window (`clipboard`):
@@ -80,15 +81,16 @@ To stand out in technical interviews and real-world usage, every phase is measur
 - [x] SQLite **FTS5 (`captures_fts`)** sub-5ms search across tags, groups, source application names, and OCR text.
 - [x] Date-range, Recently Copied (`last_copied_at`), Group, and Media-Type (`Screenshots` / `Videos` / `Pinned`) filters.
 
-### Milestone 1.5.3: Automated Storage Quota & Cleanup Engine
-- [ ] Build a background storage policy runner in Rust supporting two user-configurable rules:
-  1. **Max Folder Quota** (e.g., *"Cap library at 15 GB; auto-delete oldest unpinned captures when exceeded"*).
-  2. **Max Retention Age** (e.g., *"Auto-delete unpinned captures older than 30 days"*).
-- [ ] Provide a visual storage breakdown bar in Settings with a **"Preview Cleanup (Dry Run)"** button so users never lose files unexpectedly.
+### Milestone 1.5.3: Automated Storage Quota, Pinned Immunity & 3-Day "Queued Deletion" Grace Buffer
+- [x] Build a background storage policy runner in Rust supporting two user-configurable rules:
+  1. **Max Folder Quota (Default: `10 GB`):** Automatically queues the oldest unpinned captures when unpinned active storage exceeds the cap (`0 = Unlimited`).
+  2. **Max Retention Age (Default: `0` = No Max Retention Age / Keep Forever):** Optional age rule (`7`, `14`, `30`, `60`, `90`, `180`, `365` days) for unpinned captures.
+- [x] **100% Pinned Immunity (`is_pinned = 1`):** Pinned images and videos are never pruned or queued for deletion, and pinning any queued item immediately rescues it (`queued_delete_at = NULL`).
+- [x] **3-Day "Queued Deletion" Grace Buffer (`queued_delete_at`):** Pruned unpinned captures are held for **3 days** before permanent deletion from disk. Dedicated **`Queued Deletion (X)`** Gallery filter tab + Settings breakdown show the live countdown & exact auto-deletion datetime (`"2d 23h left • Deletes Nov 18, 20:35"`) with 1-click **Restore**, **Pin & Restore**, and **Preview Cleanup (Dry Run)**.
 
 ### Milestone 1.5.4: Zero-Bloat Native OS Background OCR Indexing
-- [ ] **Native OS Neural OCR (`0 MB` Installer & Idle RAM Bloat):** Call built-in OS OCR APIs directly from Rust (`Windows.Media.Ocr` via WinRT on Windows, `VNRecognizeTextRequest` on macOS, with optional on-demand `ocrs` fallback on Linux) on a background thread (`~50–120 ms` per capture) *after* the screenshot is already copied to the clipboard.
-- [ ] **Instant `< 2 ms` FTS5 Text Search:** Populate `captures.ocr_text` and sync with the `captures_fts` virtual table so searching *"error 500"*, *"invoice"*, or a player username finds matching screenshots across 10,000+ items without re-scanning images at query time.
+- [x] **Native OS Neural OCR (`0 MB` Installer & Idle RAM Bloat):** Call built-in OS OCR APIs directly from Rust (`Windows.Media.Ocr` via WinRT `OcrEngine` + `SoftwareBitmap` BGRA8 on Windows, `VNRecognizeTextRequest` on macOS, and `ocrs`/`tesseract` fallback on Linux) on a background thread (`~50–120 ms` per capture) *after* the screenshot is already copied to the clipboard.
+- [x] **Instant `< 2 ms` FTS5 Text Search & Lightbox OCR Inspector:** Populate `captures.ocr_text` + `ocr_status` (`'pending' | 'done' | 'failed'`), sync with the `captures_fts` virtual table, display copyable **Detected Text (Native OS OCR)** in the Lightbox, and provide a **"Scan OCR"** backfill button in Settings.
 
 ---
 

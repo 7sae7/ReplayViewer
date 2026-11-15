@@ -2,6 +2,7 @@ pub mod commands;
 pub mod db;
 pub mod error;
 pub mod services;
+pub mod single_instance;
 pub mod state;
 
 use std::path::PathBuf;
@@ -45,6 +46,12 @@ pub fn resolve_default_captures_dir(app: &tauri::AppHandle) -> (PathBuf, PathBuf
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Enforce a single running instance: if another ReplayViewer instance is already open,
+    // signal it to show & focus the main Gallery window and exit immediately (no duplicate tray icon).
+    let Some(single_instance_listener) = single_instance::acquire_single_instance_listener() else {
+        return;
+    };
+
     tauri::Builder::default()
         .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(
@@ -165,8 +172,18 @@ pub fn run() {
                 active_clipboard_hash: RwLock::new(None),
             });
 
+            // Listen for subsequent `.exe` launches and bring the existing `main` window to the foreground
+            single_instance::spawn_single_instance_focus_handler(
+                single_instance_listener,
+                app.handle().clone(),
+            );
+
             // Phase 1.5.1: Spawn background OS clipboard image watcher
             services::clipboard::spawn_clipboard_watcher(app.handle().clone());
+
+            // Phase 1.5.3 & 1.5.4: Enforce 3-day storage grace quota & backfill pending native OS OCR
+            let _ = services::storage_cleanup::enforce_storage_policies_now(app.handle());
+            let _ = services::ocr::run_ocr_backfill_batch(app.handle(), 50);
 
             // Register Global Shortcuts (Alt+S, Alt+Shift+S, Alt+G, Alt+V, Alt+C)
             let alt_s = Shortcut::new(Some(Modifiers::ALT), Code::KeyS);
@@ -306,6 +323,10 @@ pub fn run() {
             gallery_cmds::pick_folder_dialog,
             gallery_cmds::open_in_file_explorer,
             gallery_cmds::seed_benchmark_captures,
+            gallery_cmds::restore_queued_captures,
+            gallery_cmds::get_storage_status_preview,
+            gallery_cmds::enforce_storage_policies_now,
+            gallery_cmds::run_ocr_backfill_now,
             gallery_cmds::get_latest_capture_meta,
             gallery_cmds::add_tag_to_capture,
             settings_cmds::get_settings,

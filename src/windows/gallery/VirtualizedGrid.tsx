@@ -3,15 +3,18 @@ import { useVirtualizer } from "@tanstack/react-virtual";
 import {
   Check,
   ClipboardCheck,
+  Clock,
   Copy,
+  FileText,
   Folder,
   FolderOpen,
   Maximize2,
   Pin,
+  RotateCcw,
   Trash2,
 } from "lucide-react";
 import type { CaptureRecord } from "../../types/ipc";
-import { formatBytes } from "../../lib/dpi";
+import { formatBytes, formatDeletionCountdown } from "../../lib/dpi";
 import {
   copyCaptureToClipboard,
   openInFileExplorer,
@@ -27,6 +30,7 @@ interface VirtualizedGridProps {
   onSelect: (capture: CaptureRecord) => void;
   onTogglePin: (id: string, currentPinned: boolean) => void;
   onDelete: (id: string) => void;
+  onRestoreQueued?: (id: string, alsoPin?: boolean) => void;
   onCopied?: () => void;
 }
 
@@ -46,6 +50,7 @@ export const VirtualizedGrid: React.FC<VirtualizedGridProps> = ({
   onSelect,
   onTogglePin,
   onDelete,
+  onRestoreQueued,
   onCopied,
 }) => {
   const parentRef = useRef<HTMLDivElement | null>(null);
@@ -377,10 +382,39 @@ export const VirtualizedGrid: React.FC<VirtualizedGridProps> = ({
                             <Folder className="w-2.5 h-2.5" /> {item.groupName}
                           </div>
                         )}
+
+                        {item.ocrText && (
+                          <div
+                            title={`OCR Indexed Text: ${item.ocrText.slice(0, 140)}`}
+                            className="badge badge-info badge-xs gap-1 font-mono shadow"
+                          >
+                            <FileText className="w-2.5 h-2.5" /> OCR
+                          </div>
+                        )}
                       </div>
 
                       {/* Top Right Quick Actions */}
-                      <div className="absolute top-2 right-2 flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity z-10">
+                      <div
+                        className={`absolute top-2 right-2 flex items-center gap-1 transition-opacity z-10 ${
+                          item.queuedDeleteAt
+                            ? "opacity-100"
+                            : "opacity-0 group-hover:opacity-100"
+                        }`}
+                      >
+                        {item.queuedDeleteAt && onRestoreQueued && (
+                          <button
+                            type="button"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              onRestoreQueued(item.id, false);
+                            }}
+                            title="Restore from Queued Deletion back to Active Library"
+                            className="btn btn-xs btn-success gap-1 px-2 shadow font-semibold"
+                          >
+                            <RotateCcw className="w-3 h-3" />
+                            Restore
+                          </button>
+                        )}
                         <button
                           type="button"
                           onClick={(e) => {
@@ -401,6 +435,8 @@ export const VirtualizedGrid: React.FC<VirtualizedGridProps> = ({
                           title={
                             item.isPinned
                               ? "Unpin (Allow Auto-Cleanup)"
+                              : item.queuedDeleteAt
+                              ? "Pin & Rescue from Queued Deletion"
                               : "Pin (Exempt from Auto-Cleanup)"
                           }
                           className={`btn btn-xs btn-square shadow ${
@@ -433,7 +469,11 @@ export const VirtualizedGrid: React.FC<VirtualizedGridProps> = ({
                             e.stopPropagation();
                             onDelete(item.id);
                           }}
-                          title="Delete Capture"
+                          title={
+                            item.queuedDeleteAt
+                              ? "Delete Permanently From Disk Now"
+                              : "Delete Capture"
+                          }
                           className="btn btn-xs btn-square bg-base-100/85 hover:btn-error shadow"
                         >
                           <Trash2 className="w-3.5 h-3.5" />
@@ -446,22 +486,41 @@ export const VirtualizedGrid: React.FC<VirtualizedGridProps> = ({
                         </div>
                       )}
 
-                      {item.lastCopiedAt && (
+                      {item.queuedDeleteAt ? (
                         <div
-                          title={`Copied to clipboard at ${new Date(
-                            item.lastCopiedAt
-                          ).toLocaleTimeString()}`}
-                          className="badge badge-accent badge-xs gap-1 absolute bottom-2 left-2 opacity-90"
+                          title={`Scheduled for permanent deletion on ${new Date(
+                            item.queuedDeleteAt
+                          ).toLocaleString()}`}
+                          className="absolute inset-x-0 bottom-0 bg-error/90 text-error-content px-2.5 py-1 flex items-center justify-between gap-1.5 text-[10px] font-mono font-bold z-10"
                         >
-                          <ClipboardCheck className="w-2.5 h-2.5" />
-                          Clipboard
+                          <span className="flex items-center gap-1 truncate">
+                            <Clock className="w-3 h-3 shrink-0" />
+                            {formatDeletionCountdown(item.queuedDeleteAt).compactLabel}
+                          </span>
+                          <span className="opacity-90 shrink-0">
+                            {item.width}×{item.height}
+                          </span>
                         </div>
-                      )}
+                      ) : (
+                        <>
+                          {item.lastCopiedAt && (
+                            <div
+                              title={`Copied to clipboard at ${new Date(
+                                item.lastCopiedAt
+                              ).toLocaleTimeString()}`}
+                              className="badge badge-accent badge-xs gap-1 absolute bottom-2 left-2 opacity-90"
+                            >
+                              <ClipboardCheck className="w-2.5 h-2.5" />
+                              Clipboard
+                            </div>
+                          )}
 
-                      <div className="badge badge-neutral badge-xs font-mono gap-1 absolute bottom-2 right-2 opacity-90">
-                        <Maximize2 className="w-2.5 h-2.5" />
-                        {item.width}×{item.height}
-                      </div>
+                          <div className="badge badge-neutral badge-xs font-mono gap-1 absolute bottom-2 right-2 opacity-90">
+                            <Maximize2 className="w-2.5 h-2.5" />
+                            {item.width}×{item.height}
+                          </div>
+                        </>
+                      )}
                     </figure>
 
                     {/* Metadata Footer */}

@@ -12,9 +12,13 @@
    Spawning a new WebView2 window on Windows takes 200–400ms. ReplayViewer initializes a hidden, frameless, transparent `overlay` window at startup and toggles visibility *after* the screen buffer is frozen in Rust. Both the `main` gallery window and `overlay` window run frameless (`decorations: false`) with a custom daisyUI v5 titlebar (`data-tauri-drag-region`) and native window controls (Minimize, Maximize/Restore, Close to Tray).
 3. **SQLite WAL Mode + FTS5 Inverted Index + B-Tree Indexed Sorting:**
    All capture metadata, groups/collections, tags, OCR text, `last_copied_at` timestamps, and clipboard history live in a local SQLite database (`AppData/Local/com.replayviewer.app/replay_viewer_v2.db`) running with `PRAGMA journal_mode = WAL;` and `PRAGMA synchronous = NORMAL;`. Full-text search across tags, groups, source apps, and OCR text uses an **FTS5 virtual table** (`< 5ms` query latency), while B-Tree indexes (`idx_captures_created_at`, `idx_captures_size_bytes`, `idx_captures_last_copied`, `idx_captures_group_name`) allow instant forward/reverse sorting (`DESC` ↔ `ASC`) in `< 1ms` even across 50,000+ records.
-4. **Disk-Backed Visual Clipboard with Hash Deduplication (`Alt + V`):**
-   Only the active clipboard image resides in OS RAM. Historical clipboard images (5–50 slots) are hashed with `blake3` in Rust for instant deduplication, stored on disk as `.webp`/`.png` blobs, and previewed via 200px thumbnails (~15 KB each).
-5. **Hybrid Segmented Ring Buffer for 30s–20m Replays (`Alt + C`):**
+4. **Disk-Backed Visual Clipboard with `< 1ms` Non-Blocking OS Lock & Hash Deduplication (`Alt + V`):**
+   Only the active clipboard image resides in OS RAM. To prevent freezing source applications (like Discord or browsers) when copying 12 MB+ images, Rust waits for a `180ms` clipboard settle window, holds the Windows `OpenClipboard` lock for **< 1ms** (performing only a raw RAM `memcpy` of `"PNG"` or `CF_DIBV5`/`CF_DIB`), and decodes/hashes outside the lock. Historical clipboard images (5–50 slots) are hashed in `< 0.5ms` for instant deduplication, stored on disk, and previewed via 200px thumbnails (~15 KB each).
+5. **Single-Instance Loopback Guard & Portable `./captures` Default Storage:**
+   On startup, `single_instance.rs` binds a crash-proof loopback `TcpListener` recorded in `%LOCALAPPDATA%\com.replayviewer.app\instance.lock`. Launching `replay-viewer.exe` a second time sends `"FOCUS_MAIN\n"` to the running instance—bringing the existing `main` window to the foreground instead of spawning duplicate processes or tray icons. New installations default to a portable `./captures` folder next to `replay-viewer.exe` (falling back to `Pictures/ReplayViewer/captures` only if installed in a read-only directory).
+6. **Smart Storage Quota with 100% Pinned Immunity & 3-Day "Queued Deletion" Grace Buffer (`v1.5.3`):**
+   Defaults to a **10 GB** library cap and **No Max Retention Age (`0` = Keep Forever)**. Pinned captures (`is_pinned = 1`) are **never** pruned or counted toward eviction. When unpinned captures exceed the storage cap or optional retention age, they are placed into a **3-day "Queued Deletion" grace period (`queued_delete_at = now + 3 days`)** where users can view the exact countdown & deletion datetime and restore or pin them before permanent disk removal.
+7. **Hybrid Segmented Ring Buffer for 30s–20m Replays (`Alt + C`):**
    Instead of holding 4 GB of video in RAM for a 20-minute replay, the replay engine encodes 2-second hardware-accelerated segments (NVENC / AMF / QuickSync / VideoToolbox) into a rolling ring directory and executes a lossless stream copy (`ffmpeg -f concat -c copy`) in **< 0.5 seconds** on save. Uses `Alt + C` ("Save Clip") by default to avoid colliding with NVIDIA's `Alt + R` performance overlay.
 
 ---
@@ -136,15 +140,16 @@ sequenceDiagram
 
 ---
 
-### 4.3 Phase 1.5.1: Visual Image Clipboard Flow, Non-Destructive Vector Layers & Visual Zoom (`Alt + V`)
+### 4.3 Phase 1.5.1: Visual Image Clipboard Flow, `< 1ms` Non-Blocking Lock, Non-Destructive Vector Layers & Visual Zoom (`Alt + V`)
 
-1. **Zero-Overhead OS Clipboard Sequence Watcher:**
+1. **Zero-Stutter `< 1ms` Non-Blocking OS Clipboard Watcher:**
    * On Windows, Rust checks `clipboard_win::raw::seq_num()` (`GetClipboardSequenceNumber()`, ~20ns atomic read that does not open or lock the clipboard) and respects Windows clipboard privacy flags (`ExcludeClipboardContentFromMonitorProcessing`).
-   * Only when the sequence counter advances does Rust read the image via `arboard::Clipboard`.
-2. **Sub-Millisecond Pixel Digest & Deduplication:**
+   * When a new sequence number is detected, Rust waits `180ms` (`wait_for_clipboard_settle`) so multi-format writers like Discord/Chromium finish writing all clipboard formats without lock contention.
+   * Rust then opens `OpenClipboard` for **< 1ms** solely to `memcpy` raw `"PNG"` bytes (or `CF_DIBV5`/`CF_DIB` bytes) into a Rust `Vec<u8>`, immediately closes `OpenClipboard`, and performs all image decoding, hashing, and disk persistence outside the OS lock.
+2. **Sub-Millisecond Pixel Digest & Fast Persistence:**
    * Computes a collision-resistant digest over `(width, height, raw_rgba_bytes)` using hardware-accelerated SIMD `crc32fast` (full buffer, ~0.3ms for 1080p) + `Sha256` (`< 0.5ms` total).
    * If `blake3_hash` already exists in `clipboard_history`, updates `copied_at` and marks it `CURRENTLY COPIED` (`active_clipboard_hash`) without duplicating files on disk.
-   * If new, writes the full image to `app_data/clipboard_cache/clip_<hash>.webp` and a `200px` thumbnail to `app_data/clipboard_cache/clip_<hash>_thumb.webp`.
+   * If new, writes raw `"PNG"` bytes directly to `app_data/clipboard_cache/` (`< 2ms`, zero re-encoding) or uses fast PNG compression (`CompressionType::Fast`, ~60ms) for `> 1080p` images, plus a `200px` `.webp` thumbnail (`FilterType::Triangle`).
 3. **Pinned-on-Top Ordering & FIFO Ring Eviction:**
    * Queries return `ORDER BY is_pinned DESC, copied_at DESC` so pinned items stay anchored at the top while unpinned items flow underneath.
    * Enforces `settings.clipboard_max_items` (`5`, `10`, `20`, or `50` unpinned items), deleting both SQLite rows and `.webp` files for evicted unpinned items.
@@ -175,13 +180,21 @@ flowchart LR
 
 ---
 
-### 4.5 Phase 1.5.4 & 2.0.5: Zero-Bloat Native OCR & Opt-In CLIP Semantic Visual Search
+### 4.5 Phase 1.5.3, 1.5.4 & 2.0.5: Smart Storage 3-Day Grace Buffer, Native OS OCR & Opt-In CLIP Semantic Visual Search
 
-1. **Zero-Bloat Native OS Background OCR (`v1.5.4`):**
-   * Instead of bundling a 50+ MB OCR runtime in the installer, Rust invokes the operating system's built-in hardware-accelerated OCR API (`Windows.Media.Ocr` on Windows 10/11, `VNRecognizeTextRequest` on macOS, with an on-demand `ocrs` fallback on Linux).
-   * Adds **`0 MB` to the base installer** and **`0 MB` to idle RAM**.
-   * Runs asynchronously (`~50–120 ms` per screenshot) *after* the capture is already copied to the clipboard, writing extracted text into `captures.ocr_text` and `captures_fts` for **`< 2 ms`** text queries across 10,000+ captures.
-2. **Opt-In Semantic AI Visual Search (`v2.0.5` — Finding `"cat"` in 10,000 Unlabeled Images):**
+1. **Automated Storage Quota, 100% Pinned Immunity & 3-Day "Queued Deletion" Grace Period (`v1.5.3`):**
+   * **Defaults:** `max_storage_gb = 10` (10 GB cap) and `auto_cleanup_days = 0` (No max retention age / Keep Forever).
+   * **Pinned Immunity:** Captures with `is_pinned = 1` are 100% exempt from both storage cap and retention age pruning. Pinning a capture that is currently in `Queued Deletion` immediately clears `queued_delete_at = NULL`.
+   * **Two-Stage 3-Day Grace Period (`queued_delete_at`):**
+     1. **Stage 1 (Soft Queue):** When unpinned active captures exceed `max_storage_gb` or `auto_cleanup_days`, the oldest unpinned captures are marked with `queued_delete_at = Utc::now() + Duration::days(3)`. They remain on disk and move into the Gallery's **`Queued Deletion (X)`** filter tab, displaying a live countdown (`"2d 23h left • Deletes Nov 18, 20:35"`) and 1-click **Restore** / **Pin & Restore** actions.
+     2. **Stage 2 (Permanent Purge):** Only after `queued_delete_at <= Utc::now()` (3 full days in the buffer without being restored or pinned) does the background cleanup runner delete the `.webp`/`.png`/`.mp4` file, thumbnail, and SQLite/FTS5 rows.
+2. **Zero-Bloat Native OS Background OCR (`v1.5.4`):**
+   * Instead of bundling a 50+ MB OCR runtime in the installer, Rust implements a cross-platform `OcrProvider` trait (`src-tauri/src/services/ocr.rs`) that invokes the operating system's built-in hardware-accelerated OCR API:
+     * **Windows 10/11:** WinRT `Windows::Media::Ocr::OcrEngine::TryCreateFromUserProfileLanguages()` + `SoftwareBitmap::CreateCopyFromBuffer` (`BGRA8` decoded in Rust so `.webp` works even without the Microsoft Store WebP WIC codec).
+     * **macOS:** Apple Vision framework (`VNRecognizeTextRequest`).
+     * **Linux:** Local `ocrs` / `tesseract` CLI fallback if installed.
+   * Tracks `ocr_status` (`'pending' | 'done' | 'failed'`) in SQLite so textless images are never re-scanned infinitely, and indexes extracted text into `captures.ocr_text` and `captures_fts` for **`< 2 ms`** text queries across 10,000+ captures.
+3. **Opt-In Semantic AI Visual Search (`v2.0.5` — Finding `"cat"` in 10,000 Unlabeled Images):**
    * **On-Demand Model Download (`0 MB` Base Installer Bloat):** Users who want semantic visual search can toggle *"Enable Smart AI Visual Search (~95 MB Download)"* in Settings, which downloads a quantized INT8 `MobileCLIP` / `CLIP-ViT-B32` ONNX model into `AppData/Local/com.replayviewer.app/models/`.
    * **One-Time Thumbnail Embedding (`1 KB` per Image):** When a capture is saved, the vision encoder processes its `320px` thumbnail once (~40–80 ms) and stores a 512-dimensional quantized vector (`512 bytes–1 KB`) in SQLite (`capture_embeddings` — only `10 MB` for 10,000 images).
    * **60-Second Lazy RAM Unloader (`0 MB` Idle Bloat):** The ONNX runtime session is automatically dropped from RAM after 60 seconds of inactivity so background tray RAM stays `< 50 MB`.
@@ -208,9 +221,11 @@ CREATE TABLE IF NOT EXISTS captures (
     duration_ms     INTEGER DEFAULT NULL,           -- NULL for screenshots, duration for videos
     source_app      TEXT DEFAULT NULL,              -- Window title / capture source
     ocr_text        TEXT DEFAULT '',                -- Indexed text inside image
-    is_pinned       INTEGER NOT NULL DEFAULT 0,     -- 1 = exempt from auto-cleanup rules
+    ocr_status      TEXT NOT NULL DEFAULT 'pending',-- 'pending' | 'done' | 'failed'
+    is_pinned       INTEGER NOT NULL DEFAULT 0,     -- 1 = 100% exempt from auto-cleanup rules
     group_name      TEXT NOT NULL DEFAULT '',       -- User-assigned Group / Collection name
     last_copied_at  TEXT DEFAULT NULL,              -- ISO timestamp when last copied to OS clipboard
+    queued_delete_at TEXT DEFAULT NULL,             -- ISO timestamp when 3-day grace period expires (NULL = active)
     created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
 
@@ -219,6 +234,7 @@ CREATE INDEX IF NOT EXISTS idx_captures_size_bytes ON captures(size_bytes DESC);
 CREATE INDEX IF NOT EXISTS idx_captures_last_copied ON captures(last_copied_at DESC);
 CREATE INDEX IF NOT EXISTS idx_captures_group_name ON captures(group_name);
 CREATE INDEX IF NOT EXISTS idx_captures_type_pinned ON captures(media_type, is_pinned);
+CREATE INDEX IF NOT EXISTS idx_captures_queued_delete ON captures(queued_delete_at);
 
 -- 2. Tags & Many-to-Many Join Table
 CREATE TABLE IF NOT EXISTS tags (
@@ -333,7 +349,10 @@ To support **Windows, macOS, and Linux** cleanly now—and prepare for **Android
 | `annotate_clipboard_item` | 1.5.1 | `id: String` | `CaptureSessionMeta` | Loads clean `base_file_path` + `annotations_json` into 1:1 centered `overlay` annotator |
 | `promote_clipboard_to_gallery` | 1.5.1 | `id: String` | `CaptureRecord` | Archives a clipboard item permanently into the Gallery working folder |
 | `toggle_pin_clipboard_item` / `delete_clipboard_item` / `clear_unpinned_clipboard_history` | 1.5.1 | `id, pinned` | `()` / `usize` | Pins items to top (exempt from FIFO eviction), deletes single item, or clears unpinned items |
-| `run_storage_cleanup` | 1.5.3 | `dry_run: bool` | `CleanupReport` | Executes max-GB and max-age retention rules on unpinned items |
+| `restore_queued_captures` | 1.5.3 | `ids: Vec<String>, also_pin: Option<bool>` | `usize` | Rescues captures from the 3-day `Queued Deletion` grace buffer (`queued_delete_at = NULL`) and optionally pins them |
+| `get_storage_status_preview` | 1.5.3 | `max_storage_gb, auto_cleanup_days` | `StorageStatusSummary` | Dry-run storage breakdown (Pinned vs. Unpinned vs. Queued 3-Day Grace) and candidate preview |
+| `enforce_storage_policies_now` | 1.5.3 | *None* | `StorageStatusSummary` | Queues over-quota/expired unpinned captures for 3-day deletion and purges captures past their 3-day grace window |
+| `run_ocr_backfill_now` | 1.5.4 | *None* | `usize` | Scans pending captures in the active folder using Native OS OCR and indexes text into `captures_fts` |
 | `save_replay_buffer` | 2.0 | *None* | `CaptureRecord` | Concatenates rolling video segments into a saved `.mp4` clip (`Alt + C`) |
 | `trim_video_clip` | 2.0 | `id, start_ms, end_ms, replace_original` | `CaptureRecord` | Lossless/fast FFmpeg trim of a saved video clip |
 | `semantic_visual_search` | 2.0.5 | `query: String, limit: u32` | `Vec<CaptureRecord>` | Ranks unlabeled images via opt-in `CLIP-INT8` 512-d vector cosine similarity in `< 8 ms` |

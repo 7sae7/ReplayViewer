@@ -82,8 +82,8 @@ pub fn get_settings(state: State<'_, AppState>) -> AppResult<SettingsPayload> {
         hotkey_save_replay: replay_key,
         image_format: get_str("image_format", "webp"),
         copy_to_clipboard_on_save: get_bool("copy_to_clipboard_on_save", true),
-        max_storage_gb: get_u32("max_storage_gb", 15),
-        auto_cleanup_days: get_u32("auto_cleanup_days", 30),
+        max_storage_gb: get_u32("max_storage_gb", 10),
+        auto_cleanup_days: get_u32("auto_cleanup_days", 0),
         clipboard_max_items: get_u32("clipboard_max_items", 10),
         launch_on_startup: get_bool("launch_on_startup", false),
         captures_dir: get_str("captures_dir", &current_dir),
@@ -92,6 +92,7 @@ pub fn get_settings(state: State<'_, AppState>) -> AppResult<SettingsPayload> {
 
 #[tauri::command]
 pub fn update_settings(
+    app: AppHandle,
     state: State<'_, AppState>,
     payload: SettingsPayload,
 ) -> AppResult<SettingsPayload> {
@@ -110,36 +111,41 @@ pub fn update_settings(
         }
     }
 
-    let conn = state
-        .db
-        .lock()
-        .map_err(|_| AppError::General("Failed to lock database".to_string()))?;
+    {
+        let conn = state
+            .db
+            .lock()
+            .map_err(|_| AppError::General("Failed to lock database".to_string()))?;
 
-    let pairs: [(&str, String); 12] = [
-        ("hotkey_region_capture", serde_json::to_string(&payload.hotkey_region_capture)?),
-        ("hotkey_fullscreen_capture", serde_json::to_string(&payload.hotkey_fullscreen_capture)?),
-        ("hotkey_open_gallery", serde_json::to_string(&payload.hotkey_open_gallery)?),
-        ("hotkey_visual_clipboard", serde_json::to_string(&payload.hotkey_visual_clipboard)?),
-        ("hotkey_save_replay", serde_json::to_string(&payload.hotkey_save_replay)?),
-        ("image_format", serde_json::to_string(&payload.image_format)?),
-        ("copy_to_clipboard_on_save", serde_json::to_string(&payload.copy_to_clipboard_on_save)?),
-        ("max_storage_gb", serde_json::to_string(&payload.max_storage_gb)?),
-        ("auto_cleanup_days", serde_json::to_string(&payload.auto_cleanup_days)?),
-        ("clipboard_max_items", serde_json::to_string(&payload.clipboard_max_items)?),
-        ("launch_on_startup", serde_json::to_string(&payload.launch_on_startup)?),
-        ("captures_dir", serde_json::to_string(&payload.captures_dir)?),
-    ];
+        let pairs: [(&str, String); 12] = [
+            ("hotkey_region_capture", serde_json::to_string(&payload.hotkey_region_capture)?),
+            ("hotkey_fullscreen_capture", serde_json::to_string(&payload.hotkey_fullscreen_capture)?),
+            ("hotkey_open_gallery", serde_json::to_string(&payload.hotkey_open_gallery)?),
+            ("hotkey_visual_clipboard", serde_json::to_string(&payload.hotkey_visual_clipboard)?),
+            ("hotkey_save_replay", serde_json::to_string(&payload.hotkey_save_replay)?),
+            ("image_format", serde_json::to_string(&payload.image_format)?),
+            ("copy_to_clipboard_on_save", serde_json::to_string(&payload.copy_to_clipboard_on_save)?),
+            ("max_storage_gb", serde_json::to_string(&payload.max_storage_gb)?),
+            ("auto_cleanup_days", serde_json::to_string(&payload.auto_cleanup_days)?),
+            ("clipboard_max_items", serde_json::to_string(&payload.clipboard_max_items)?),
+            ("launch_on_startup", serde_json::to_string(&payload.launch_on_startup)?),
+            ("captures_dir", serde_json::to_string(&payload.captures_dir)?),
+        ];
 
-    for (k, v) in pairs {
-        conn.execute(
-            "INSERT INTO settings (key, value, updated_at) VALUES (?1, ?2, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
-             ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
-            params![k, v],
-        )?;
+        for (k, v) in pairs {
+            conn.execute(
+                "INSERT INTO settings (key, value, updated_at) VALUES (?1, ?2, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+                params![k, v],
+            )?;
+        }
+
+        // Immediately enforce new FIFO limit on unpinned clipboard items if lowered
+        let _ = enforce_fifo_limit(&conn, payload.clipboard_max_items);
     }
 
-    // Immediately enforce new FIFO limit on unpinned clipboard items if lowered
-    let _ = enforce_fifo_limit(&conn, payload.clipboard_max_items);
+    // Enforce storage quota / retention rules (3-day Queued Deletion grace buffer)
+    let _ = crate::services::storage_cleanup::enforce_storage_policies_now(&app);
 
     Ok(payload)
 }

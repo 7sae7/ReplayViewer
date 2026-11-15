@@ -7,6 +7,7 @@ import {
   Camera,
   CheckSquare,
   ClipboardCheck,
+  Clock,
   Columns,
   Copy,
   Database,
@@ -20,6 +21,7 @@ import {
   Palette,
   Pin,
   RefreshCw,
+  RotateCcw,
   Search,
   Settings,
   Sparkles,
@@ -78,10 +80,13 @@ export const GalleryApp: React.FC<GalleryAppProps> = ({
     groups,
     totalCount,
     totalBytes,
+    queuedDeletionCount,
+    queuedDeletionBytes,
     searchQuery,
     mediaTypeFilter,
     onlyPinned,
     onlyRecentClipboard,
+    onlyQueuedDeletion,
     activeGroup,
     dateRange,
     sortBy,
@@ -95,6 +100,7 @@ export const GalleryApp: React.FC<GalleryAppProps> = ({
     setMediaTypeFilter,
     setOnlyPinned,
     setOnlyRecentClipboard,
+    setOnlyQueuedDeletion,
     setActiveGroup,
     setDateRange,
     setSortBy,
@@ -109,6 +115,7 @@ export const GalleryApp: React.FC<GalleryAppProps> = ({
     batchMoveSelectedToFolder,
     setSelectedCapture,
     togglePin,
+    restoreQueued,
     removeCaptures,
     addTag,
     reconcileOrphans,
@@ -156,6 +163,7 @@ export const GalleryApp: React.FC<GalleryAppProps> = ({
     loadSettings();
 
     let unlistenGallery: (() => void) | undefined;
+    let unlistenOcr: (() => void) | undefined;
     let unlistenToast: (() => void) | undefined;
 
     if (isTauriRuntime()) {
@@ -169,6 +177,12 @@ export const GalleryApp: React.FC<GalleryAppProps> = ({
         unlistenGallery = fn;
       });
 
+      listen("gallery:ocr_updated", () => {
+        fetchCaptures();
+      }).then((fn) => {
+        unlistenOcr = fn;
+      });
+
       listen<string>("shortcut:toast", (event) => {
         showToast(event.payload);
       }).then((fn) => {
@@ -177,6 +191,7 @@ export const GalleryApp: React.FC<GalleryAppProps> = ({
     }
     return () => {
       if (unlistenGallery) unlistenGallery();
+      if (unlistenOcr) unlistenOcr();
       if (unlistenToast) unlistenToast();
     };
   }, [fetchCaptures, loadSettings]);
@@ -295,7 +310,28 @@ export const GalleryApp: React.FC<GalleryAppProps> = ({
     }
   };
 
+  const handleRestoreQueued = async (id: string, alsoPin = false) => {
+    const count = await restoreQueued([id], alsoPin);
+    if (count > 0) {
+      showToast(
+        alsoPin
+          ? "Capture pinned & rescued from Queued Deletion!"
+          : "Capture restored from Queued Deletion to active library!"
+      );
+    }
+  };
+
   // Batch Multi-Select Handlers
+  const handleBatchRestoreQueued = async (alsoPin = false) => {
+    if (selectedIds.length === 0) return;
+    const count = await restoreQueued(selectedIds, alsoPin);
+    showToast(
+      alsoPin
+        ? `Pinned & restored ${count} capture(s) from Queued Deletion.`
+        : `Restored ${count} capture(s) from Queued Deletion.`
+    );
+  };
+
   const handleBatchDelete = async () => {
     const count = selectedIds.length;
     if (count === 0) return;
@@ -364,11 +400,11 @@ export const GalleryApp: React.FC<GalleryAppProps> = ({
                 ReplayViewer
               </h1>
               <span className="badge badge-soft badge-primary badge-xs font-mono font-semibold">
-                v1.5.1
+                v1.5
               </span>
             </div>
             <p className="text-[10px] text-base-content/60 font-mono">
-              {totalCount.toLocaleString()} items • {formatBytes(totalBytes)} • SQLite WAL + FTS5
+              {totalCount.toLocaleString()} items • {formatBytes(totalBytes)} • SQLite WAL + FTS5 + Native OCR
             </p>
           </div>
         </div>
@@ -519,9 +555,10 @@ export const GalleryApp: React.FC<GalleryAppProps> = ({
                 onClick={() => {
                   setOnlyPinned(false);
                   setOnlyRecentClipboard(false);
+                  setOnlyQueuedDeletion(false);
                 }}
                 className={`btn btn-xs join-item ${
-                  !onlyPinned && !onlyRecentClipboard
+                  !onlyPinned && !onlyRecentClipboard && !onlyQueuedDeletion
                     ? "btn-primary"
                     : "btn-ghost bg-base-100"
                 }`}
@@ -548,6 +585,21 @@ export const GalleryApp: React.FC<GalleryAppProps> = ({
               >
                 <ClipboardCheck className="w-3 h-3" />
                 Recently Copied
+              </button>
+              <button
+                type="button"
+                onClick={() => setOnlyQueuedDeletion(!onlyQueuedDeletion)}
+                title="Captures pruned by storage cap or retention policy, held for 3 days before permanent deletion"
+                className={`btn btn-xs join-item gap-1 ${
+                  onlyQueuedDeletion
+                    ? "btn-error"
+                    : queuedDeletionCount > 0
+                    ? "btn-soft btn-warning"
+                    : "btn-ghost bg-base-100"
+                }`}
+              >
+                <Clock className="w-3 h-3" />
+                Queued Deletion ({queuedDeletionCount})
               </button>
             </div>
 
@@ -581,7 +633,7 @@ export const GalleryApp: React.FC<GalleryAppProps> = ({
               <option value="">All Groups ({groups.length})</option>
               {groups.map((g) => (
                 <option key={g} value={g}>
-                  📁 {g}
+                  {g}
                 </option>
               ))}
             </select>
@@ -705,6 +757,75 @@ export const GalleryApp: React.FC<GalleryAppProps> = ({
         </div>
       )}
 
+      {/* Queued Deletion (3-Day Grace Period) Banner */}
+      {activeTab === "gallery" && onlyQueuedDeletion && (
+        <div className="flex flex-wrap items-center justify-between gap-3 px-6 py-2.5 bg-warning/15 border-b border-warning/40 text-xs">
+          <div className="flex items-center gap-2.5">
+            <Clock className="w-4 h-4 text-warning shrink-0" />
+            <div>
+              <span className="font-bold text-base-content">
+                Queued Deletion Buffer (3-Day Grace Period)
+              </span>
+              <span className="text-base-content/75 ml-2">
+                Unpinned captures pruned by your storage cap or retention policy are held here for{" "}
+                <strong className="text-warning">3 days</strong> before permanent deletion from disk.{" "}
+                <strong>Pinned items are never pruned.</strong>
+              </span>
+            </div>
+          </div>
+
+          <div className="flex items-center gap-2">
+            <span className="badge badge-warning badge-sm font-mono">
+              {queuedDeletionCount} queued • {formatBytes(queuedDeletionBytes)}
+            </span>
+            {items.length > 0 && (
+              <>
+                <button
+                  type="button"
+                  onClick={async () => {
+                    const count = await restoreQueued(
+                      items.map((i) => i.id),
+                      false
+                    );
+                    showToast(`Restored all ${count} capture(s) to active library.`);
+                  }}
+                  className="btn btn-xs btn-success gap-1"
+                >
+                  <RotateCcw className="w-3 h-3" />
+                  Restore All ({items.length})
+                </button>
+                <button
+                  type="button"
+                  onClick={async () => {
+                    const count = await restoreQueued(
+                      items.map((i) => i.id),
+                      true
+                    );
+                    showToast(`Pinned & restored all ${count} capture(s).`);
+                  }}
+                  className="btn btn-xs btn-warning gap-1"
+                >
+                  <Pin className="w-3 h-3" />
+                  Pin &amp; Restore All
+                </button>
+                <button
+                  type="button"
+                  onClick={async () => {
+                    const count = items.length;
+                    await removeCaptures(items.map((i) => i.id));
+                    showToast(`Permanently deleted ${count} queued capture(s) from disk.`);
+                  }}
+                  className="btn btn-xs btn-error gap-1"
+                >
+                  <Trash2 className="w-3 h-3" />
+                  Delete All Permanently
+                </button>
+              </>
+            )}
+          </div>
+        </div>
+      )}
+
       {/* Multi-Select Batch Action Toolbar */}
       {activeTab === "gallery" && selectedIds.length > 0 && (
         <div className="flex flex-wrap items-center justify-between gap-2 px-6 py-2 bg-primary/15 border-b border-primary/40 text-xs animate-fade-in">
@@ -730,6 +851,27 @@ export const GalleryApp: React.FC<GalleryAppProps> = ({
           </div>
 
           <div className="flex items-center gap-2">
+            {onlyQueuedDeletion && (
+              <>
+                <button
+                  type="button"
+                  onClick={() => handleBatchRestoreQueued(false)}
+                  className="btn btn-xs btn-success gap-1.5"
+                >
+                  <RotateCcw className="w-3.5 h-3.5" />
+                  Restore Selected
+                </button>
+                <button
+                  type="button"
+                  onClick={() => handleBatchRestoreQueued(true)}
+                  className="btn btn-xs btn-warning gap-1.5"
+                >
+                  <Pin className="w-3.5 h-3.5" />
+                  Pin &amp; Restore Selected
+                </button>
+              </>
+            )}
+
             <button
               type="button"
               onClick={() => {
@@ -996,6 +1138,7 @@ export const GalleryApp: React.FC<GalleryAppProps> = ({
           onSelect={(cap) => setSelectedCapture(cap)}
           onTogglePin={togglePin}
           onDelete={(id) => removeCaptures([id])}
+          onRestoreQueued={handleRestoreQueued}
           onCopied={() => fetchCaptures()}
         />
       ) : (
@@ -1010,6 +1153,7 @@ export const GalleryApp: React.FC<GalleryAppProps> = ({
           onTogglePin={togglePin}
           onDelete={(id) => removeCaptures([id])}
           onAddTag={addTag}
+          onRestoreQueued={handleRestoreQueued}
         />
       )}
     </div>
