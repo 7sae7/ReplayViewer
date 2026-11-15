@@ -35,6 +35,7 @@ import {
   openInFileExplorer,
   pickFolderDialog,
   scanUnindexedMedia,
+  toggleClipboardDrawer,
   triggerFullscreenCapture,
   triggerRegionCapture,
 } from "../../lib/tauri-client";
@@ -52,6 +53,7 @@ import { VirtualizedGrid } from "./VirtualizedGrid";
 
 interface GalleryAppProps {
   onOpenOverlayPreview?: () => void;
+  onOpenClipboardPreview?: () => void;
 }
 
 const DAISY_THEMES = [
@@ -69,6 +71,7 @@ const DAISY_THEMES = [
 
 export const GalleryApp: React.FC<GalleryAppProps> = ({
   onOpenOverlayPreview,
+  onOpenClipboardPreview,
 }) => {
   const {
     items,
@@ -245,6 +248,14 @@ export const GalleryApp: React.FC<GalleryAppProps> = ({
     showToast("Instant Fullscreen Capture saved & copied (Zero Focus Loss)!");
   };
 
+  const handleOpenClipboardDrawer = async () => {
+    if (isTauriRuntime()) {
+      await toggleClipboardDrawer();
+    } else if (onOpenClipboardPreview) {
+      onOpenClipboardPreview();
+    }
+  };
+
   const handleReconcile = async () => {
     const pruned = await reconcileOrphans();
     const scan = await scanUnindexedMedia();
@@ -353,7 +364,7 @@ export const GalleryApp: React.FC<GalleryAppProps> = ({
                 ReplayViewer
               </h1>
               <span className="badge badge-soft badge-primary badge-xs font-mono font-semibold">
-                v1.0 MVP
+                v1.5.1
               </span>
             </div>
             <p className="text-[10px] text-base-content/60 font-mono">
@@ -407,6 +418,16 @@ export const GalleryApp: React.FC<GalleryAppProps> = ({
           >
             <Monitor className="w-3.5 h-3.5 text-success" />
             Fullscreen
+          </button>
+
+          <button
+            type="button"
+            onClick={handleOpenClipboardDrawer}
+            title="Open Visual Image Clipboard Drawer (Alt + V)"
+            className="btn btn-xs btn-neutral h-7 px-2.5 gap-1"
+          >
+            <ClipboardCheck className="w-3.5 h-3.5 text-info" />
+            Clipboard (Alt+V)
           </button>
 
           {/* daisyUI Boxed Tabs */}

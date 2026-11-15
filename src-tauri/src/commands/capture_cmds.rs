@@ -9,6 +9,7 @@ use crate::services::capture::{
     freeze_active_screen, persist_capture_and_thumbnail, persist_raw_rgba_and_thumbnail,
     ScreenCaptureProvider, XcapCaptureProvider,
 };
+use crate::services::clipboard::ingest_rgba_into_clipboard_history;
 use crate::state::{AppState, CaptureSessionMeta};
 
 /// Triggered via `Alt + S` or UI button: freezes active screen in RAM as an uncompressed BMP (< 3ms)
@@ -50,9 +51,10 @@ pub fn trigger_fullscreen_capture(
 ) -> AppResult<CaptureRecord> {
     let raw = XcapCaptureProvider.capture_active_monitor()?;
 
-    // Copy raw RGBA image to OS clipboard immediately
+    // Copy raw RGBA image to OS clipboard immediately & record in Alt+V Visual Clipboard ring
     let rgba_img = tauri::image::Image::new(&raw.rgba_bytes, raw.width, raw.height);
     let _ = app.clipboard().write_image(&rgba_img);
+    let _ = ingest_rgba_into_clipboard_history(&app, &raw.rgba_bytes, raw.width, raw.height);
 
     let captures_dir = state
         .captures_dir
@@ -126,6 +128,12 @@ pub fn save_annotated_capture(
             let rgba = decoded.to_rgba8();
             let tauri_img = tauri::image::Image::new(rgba.as_raw(), rgba.width(), rgba.height());
             let _ = app.clipboard().write_image(&tauri_img);
+            let _ = ingest_rgba_into_clipboard_history(
+                &app,
+                rgba.as_raw(),
+                rgba.width(),
+                rgba.height(),
+            );
         }
     }
 

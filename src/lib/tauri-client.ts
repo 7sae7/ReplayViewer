@@ -2,6 +2,7 @@ import { invoke, convertFileSrc } from "@tauri-apps/api/core";
 import type {
   CaptureRecord,
   CaptureSessionMeta,
+  ClipboardItem,
   GalleryFilter,
   PaginatedCaptures,
   SettingsPayload,
@@ -19,6 +20,8 @@ export function isTauriRuntime(): boolean {
 // Browser Dev / Preview Fallback State (Used when running `vite` outside Tauri)
 // ---------------------------------------------------------------------------
 let mockCaptures: CaptureRecord[] = [];
+let mockClipboardItems: ClipboardItem[] = [];
+let mockClipboardPaused = false;
 let mockInitialized = false;
 
 function createMockSvgDataUrl(
@@ -151,6 +154,18 @@ function ensureMockSeed() {
       createdAt: createdIso,
     };
   });
+
+  mockClipboardItems = mockCaptures.slice(0, 4).map((c, idx) => ({
+    id: `clip-seed-${idx + 1}`,
+    blake3Hash: `mock-hash-${idx + 1}`,
+    filePath: c.filePath,
+    thumbPath: c.thumbPath,
+    width: c.width,
+    height: c.height,
+    sizeBytes: c.sizeBytes,
+    isPinned: idx === 0,
+    copiedAt: new Date(now - idx * 600_000).toISOString(),
+  }));
 }
 
 let mockSettings: SettingsPayload = {
@@ -522,6 +537,141 @@ export async function updateSettings(
   }
   mockSettings = { ...payload };
   return { ...mockSettings };
+}
+
+// ---------------------------------------------------------------------------
+// Phase 1.5.1: Visual Image Clipboard (Alt + V) Client API
+// ---------------------------------------------------------------------------
+
+export async function toggleClipboardDrawer(): Promise<boolean> {
+  if (isTauriRuntime()) {
+    return invoke<boolean>("toggle_clipboard_drawer");
+  }
+  return true;
+}
+
+export async function listClipboardHistory(): Promise<ClipboardItem[]> {
+  if (isTauriRuntime()) {
+    return invoke<ClipboardItem[]>("list_clipboard_history");
+  }
+  ensureMockSeed();
+  return [...mockClipboardItems].sort((a, b) =>
+    b.copiedAt.localeCompare(a.copiedAt)
+  );
+}
+
+export async function pasteClipboardItem(id: string): Promise<ClipboardItem> {
+  if (isTauriRuntime()) {
+    return invoke<ClipboardItem>("paste_clipboard_item", { id });
+  }
+  ensureMockSeed();
+  const nowIso = new Date().toISOString();
+  let target = mockClipboardItems[0];
+  mockClipboardItems = mockClipboardItems.map((item) => {
+    if (item.id === id) {
+      target = { ...item, copiedAt: nowIso };
+      return target;
+    }
+    return item;
+  });
+  return target;
+}
+
+export async function annotateClipboardItem(
+  id: string
+): Promise<CaptureSessionMeta> {
+  if (isTauriRuntime()) {
+    return invoke<CaptureSessionMeta>("annotate_clipboard_item", { id });
+  }
+  ensureMockSeed();
+  const found = mockClipboardItems.find((i) => i.id === id);
+  return {
+    sessionId: `clip-annotate-${Date.now()}`,
+    monitorId: 0,
+    width: found?.width ?? 1920,
+    height: found?.height ?? 1080,
+    scaleFactor: 1.0,
+    capturedAt: new Date().toISOString(),
+  };
+}
+
+export async function promoteClipboardToGallery(
+  id: string
+): Promise<CaptureRecord> {
+  if (isTauriRuntime()) {
+    return invoke<CaptureRecord>("promote_clipboard_to_gallery", { id });
+  }
+  ensureMockSeed();
+  const item =
+    mockClipboardItems.find((i) => i.id === id) || mockClipboardItems[0];
+  const nowIso = new Date().toISOString();
+  const record: CaptureRecord = {
+    id: `promoted-${Date.now()}`,
+    mediaType: "screenshot",
+    filePath: item.filePath,
+    thumbPath: item.thumbPath,
+    width: item.width,
+    height: item.height,
+    sizeBytes: item.sizeBytes,
+    durationMs: null,
+    sourceApp: "Visual Clipboard (Alt + V)",
+    ocrText: "",
+    isPinned: item.isPinned,
+    groupName: "",
+    lastCopiedAt: item.copiedAt,
+    tags: ["clipboard"],
+    createdAt: nowIso,
+  };
+  mockCaptures = [record, ...mockCaptures];
+  return record;
+}
+
+export async function togglePinClipboardItem(
+  id: string,
+  pinned: boolean
+): Promise<void> {
+  if (isTauriRuntime()) {
+    return invoke<void>("toggle_pin_clipboard_item", { id, pinned });
+  }
+  ensureMockSeed();
+  mockClipboardItems = mockClipboardItems.map((i) =>
+    i.id === id ? { ...i, isPinned: pinned } : i
+  );
+}
+
+export async function deleteClipboardItem(id: string): Promise<boolean> {
+  if (isTauriRuntime()) {
+    return invoke<boolean>("delete_clipboard_item", { id });
+  }
+  ensureMockSeed();
+  const before = mockClipboardItems.length;
+  mockClipboardItems = mockClipboardItems.filter((i) => i.id !== id);
+  return mockClipboardItems.length < before;
+}
+
+export async function clearUnpinnedClipboardHistory(): Promise<number> {
+  if (isTauriRuntime()) {
+    return invoke<number>("clear_unpinned_clipboard_history");
+  }
+  ensureMockSeed();
+  const before = mockClipboardItems.length;
+  mockClipboardItems = mockClipboardItems.filter((i) => i.isPinned);
+  return before - mockClipboardItems.length;
+}
+
+export async function getClipboardPaused(): Promise<boolean> {
+  if (isTauriRuntime()) {
+    return invoke<boolean>("get_clipboard_paused");
+  }
+  return mockClipboardPaused;
+}
+
+export async function setClipboardPaused(paused: boolean): Promise<boolean> {
+  if (isTauriRuntime()) {
+    return invoke<boolean>("set_clipboard_paused", { paused });
+  }
+  mockClipboardPaused = paused;
+  return mockClipboardPaused;
 }
 
 export async function seedSyntheticBenchmarkItems(count = 500): Promise<number> {

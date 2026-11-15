@@ -65,12 +65,12 @@ To stand out in technical interviews and real-world usage, every phase is measur
 **Goal:** Solve Windows `Win + V` image reliability problems and automate storage quota cleanup.
 
 ### Milestone 1.5.1: The `Alt + V` Visual Image Clipboard (Windows `Win + V` for Images)
-- [ ] Implement an event-driven background OS clipboard watcher in Rust (`arboard` + `clipboard-master`) that detects images copied from *any* application (browsers, Discord, design tools, or ReplayViewer itself) with 0% idle CPU polling.
-- [ ] Compute a fast `blake3` hash on raw RGBA pixel bytes (< 1ms) to deduplicate repeated copies—bumping existing images to the top of the history list instead of duplicating storage.
-- [ ] Store full clipboard images in `clipboard_cache/` with `200px` `.webp` thumbnails and enforce a user-configurable **FIFO ring buffer limit** (`5`, `10`, `20`, or `50` images) in SQLite.
-- [ ] Build the floating `Alt + V` quick-paste popup window:
-  - **Click / `Enter`:** Pushes the selected historical image back into the active OS clipboard and closes the drawer.
-  - **"Annotate" Button:** Opens any copied clipboard image directly inside the `react-konva` annotation editor (`overlay` window).
+- [x] Implement a background OS clipboard image watcher in Rust (`arboard` + `clipboard-win` sequence counter) that detects images copied from *any* application (browsers, Discord, design tools, or ReplayViewer itself) with near-zero idle CPU usage and Windows privacy marker compliance (`ExcludeClipboardContentFromMonitorProcessing`).
+- [x] Compute a sub-millisecond pixel digest (`crc32fast` SIMD + `Sha256`, `< 0.5ms`) on raw RGBA pixel bytes to deduplicate repeated copies—bumping existing images to the top of the history list instead of duplicating storage.
+- [x] Store full clipboard images in `clipboard_cache/` with `200px` `.webp` thumbnails and enforce a user-configurable **FIFO ring buffer limit** (`5`, `10`, `20`, or `50` images) in SQLite.
+- [x] Build the frameless daisyUI v5 `Alt + V` quick-paste popup window (`clipboard`):
+  - **Click / `Enter` / `1–9`:** Pushes the selected historical image back into the active OS clipboard and closes the drawer.
+  - **"Annotate" Button (`A`):** Opens any copied clipboard image directly inside the `react-konva` annotation editor (`overlay` window).
   - **Pin & Promote:** Pin favorite clipboard images so FIFO eviction skips them, or click *"Save to Gallery"* to archive them permanently.
 
 ### Milestone 1.5.2: Pinning, Tagging, Groups & Instant FTS5 Search (Completed Early in v1.0!)

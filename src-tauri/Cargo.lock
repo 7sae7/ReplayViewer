@@ -3336,11 +3336,16 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 name = "replay-viewer"
 version = "1.0.0"
 dependencies = [
+ "arboard",
  "chrono",
+ "clipboard-win",
+ "crc32fast",
+ "hex",
  "image",
  "rusqlite",
  "serde",
  "serde_json",
+ "sha2",
  "tauri",
  "tauri-build",
  "tauri-plugin-clipboard-manager",

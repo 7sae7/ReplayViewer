@@ -49,6 +49,18 @@ export interface UnindexedScanResult {
   sampleNames: string[];
 }
 
+export interface ClipboardItem {
+  id: string;
+  blake3Hash: string;
+  filePath: string;
+  thumbPath: string;
+  width: number;
+  height: number;
+  sizeBytes: number;
+  isPinned: boolean;
+  copiedAt: string;
+}
+
 export interface CaptureSessionMeta {
   sessionId: string;
   monitorId: number;

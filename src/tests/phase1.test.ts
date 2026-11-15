@@ -1,5 +1,12 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import { formatBytes, normalizeCropRect, toPhysicalRect } from "../lib/dpi";
+import {
+  clearUnpinnedClipboardHistory,
+  listClipboardHistory,
+  pasteClipboardItem,
+  promoteClipboardToGallery,
+  togglePinClipboardItem,
+} from "../lib/tauri-client";
 import { useEditorStore } from "../stores/useEditorStore";
 import type { ArrowAnnotation, PixelateAnnotation } from "../types/ipc";
 
@@ -98,5 +105,31 @@ describe("Command Pattern Undo / Redo Stack (useEditorStore)", () => {
       "a1",
       "a2",
     ]);
+  });
+});
+
+describe("Phase 1.5.1 Visual Clipboard Drawer (Alt + V) Operations", () => {
+  it("lists clipboard history, bumps pasted items to #1, protects pinned items, and promotes to gallery", async () => {
+    const initial = await listClipboardHistory();
+    expect(initial.length).toBeGreaterThanOrEqual(3);
+
+    // Paste the last item and verify it bumps to #1 (newest copiedAt)
+    const oldest = initial[initial.length - 1];
+    await pasteClipboardItem(oldest.id);
+    const afterPaste = await listClipboardHistory();
+    expect(afterPaste[0].id).toBe(oldest.id);
+
+    // Pin the top item and clear unpinned items
+    await togglePinClipboardItem(oldest.id, true);
+    const clearedCount = await clearUnpinnedClipboardHistory();
+    expect(clearedCount).toBeGreaterThanOrEqual(1);
+
+    const remaining = await listClipboardHistory();
+    expect(remaining.every((item) => item.isPinned)).toBe(true);
+
+    // Promote pinned clipboard item permanently to Gallery
+    const promoted = await promoteClipboardToGallery(remaining[0].id);
+    expect(promoted.tags).toContain("clipboard");
+    expect(promoted.sourceApp).toBe("Visual Clipboard (Alt + V)");
   });
 });

@@ -1,5 +1,5 @@
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{atomic::AtomicBool, Arc, Mutex, RwLock};
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 
@@ -28,4 +28,6 @@ pub struct AppState {
     pub latest_capture: RwLock<Option<FrozenFrame>>,
     pub captures_dir: RwLock<PathBuf>,
     pub thumbs_dir: RwLock<PathBuf>,
+    pub clipboard_cache_dir: PathBuf,
+    pub clipboard_paused: AtomicBool,
 }

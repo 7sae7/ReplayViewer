@@ -1,4 +1,5 @@
 pub mod captures_repo;
+pub mod clipboard_repo;
 
 use std::path::Path;
 use rusqlite::Connection;
