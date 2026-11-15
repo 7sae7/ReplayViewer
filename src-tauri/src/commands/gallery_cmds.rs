@@ -6,7 +6,8 @@ use tauri_plugin_clipboard_manager::ClipboardExt;
 use uuid::Uuid;
 
 use crate::db::captures_repo::{
-    self, insert_capture, CaptureRecord, GalleryFilter, PaginatedCaptures, UnindexedScanResult,
+    self, insert_capture, CaptureRecord, GalleryFilter, PaginatedCaptures, StorageStatusSummary,
+    UnindexedScanResult,
 };
 use crate::error::{AppError, AppResult};
 use crate::services::capture::ensure_benchmark_sample_image;
@@ -47,7 +48,7 @@ pub fn scan_unindexed_media(state: State<'_, AppState>) -> AppResult<UnindexedSc
 }
 
 #[tauri::command]
-pub fn import_external_media(state: State<'_, AppState>) -> AppResult<usize> {
+pub fn import_external_media(app: AppHandle, state: State<'_, AppState>) -> AppResult<usize> {
     let active_dir = state
         .captures_dir
         .read()
@@ -58,11 +59,20 @@ pub fn import_external_media(state: State<'_, AppState>) -> AppResult<usize> {
         .read()
         .map_err(|_| AppError::General("Failed to lock thumbs_dir".to_string()))?
         .clone();
-    let mut conn = state
-        .db
-        .lock()
-        .map_err(|_| AppError::General("Failed to lock database".to_string()))?;
-    captures_repo::import_external_media(&mut conn, &active_dir, &thumbs_dir)
+    let imported = {
+        let mut conn = state
+            .db
+            .lock()
+            .map_err(|_| AppError::General("Failed to lock database".to_string()))?;
+        captures_repo::import_external_media(&mut conn, &active_dir, &thumbs_dir)?
+    };
+
+    if imported > 0 {
+        let _ = crate::services::ocr::run_ocr_backfill_batch(&app, 100);
+        let _ = crate::services::storage_cleanup::enforce_storage_policies_now(&app);
+    }
+
+    Ok(imported)
 }
 
 #[tauri::command]
@@ -341,6 +351,7 @@ pub fn seed_benchmark_captures(
             duration_ms: None,
             source_app: Some(format!("{} #{}", app, i + 1)),
             ocr_text: format!("{} item {}", ocr, i + 1),
+            ocr_status: "done".to_string(),
             is_pinned: i % 25 == 0,
             group_name: group.to_string(),
             last_copied_at: if i % 20 == 0 {
@@ -348,6 +359,7 @@ pub fn seed_benchmark_captures(
             } else {
                 None
             },
+            queued_delete_at: None,
             tags: vec![tag.to_string(), "benchmark".to_string()],
             created_at,
         };
@@ -356,6 +368,42 @@ pub fn seed_benchmark_captures(
 
     tx.commit()?;
     Ok(safe_count)
+}
+
+#[tauri::command]
+pub fn restore_queued_captures(
+    state: State<'_, AppState>,
+    ids: Vec<String>,
+    also_pin: bool,
+) -> AppResult<usize> {
+    let conn = state
+        .db
+        .lock()
+        .map_err(|_| AppError::General("Failed to lock database".to_string()))?;
+    captures_repo::restore_queued_captures(&conn, &ids, also_pin)
+}
+
+#[tauri::command]
+pub fn get_storage_status_preview(
+    app: AppHandle,
+    max_storage_gb: Option<u32>,
+    auto_cleanup_days: Option<u32>,
+) -> AppResult<StorageStatusSummary> {
+    crate::services::storage_cleanup::get_storage_status_preview(
+        &app,
+        max_storage_gb,
+        auto_cleanup_days,
+    )
+}
+
+#[tauri::command]
+pub fn enforce_storage_policies_now(app: AppHandle) -> AppResult<StorageStatusSummary> {
+    crate::services::storage_cleanup::enforce_storage_policies_now(&app)
+}
+
+#[tauri::command]
+pub fn run_ocr_backfill_now(app: AppHandle) -> AppResult<usize> {
+    crate::services::ocr::run_ocr_backfill_batch(&app, 250)
 }
 
 #[tauri::command]

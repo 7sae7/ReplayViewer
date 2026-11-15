@@ -20,8 +20,14 @@ Engineered to replace bloated, laggy utilities like Windows Xbox Game Bar while 
   Windowed grid with a live **1–8 Column Card Resizer**, **rubber-band marquee drag-to-select** (even starting directly on image cards), and batch operations to **Group**, **Tag**, **Delete**, or **Move to an External Folder**.
 * **Hardware-Accelerated Canvas Annotator (`react-konva` + Cross-Session Command Pattern Undo/Redo):**
   Starts `Alt + S` with no region pre-selected and stays in crop mode after dragging so you can refine your region freely before drawing arrows, rectangles, freehand ink, high-contrast text, and **destructive pixelate redactions**. Supports **1:1 centered editing from `Alt + V`** with visual zoom (`1:1`, `2×`, `4×`, `Fit`, corner drag) that keeps original output resolution locked by default (or 1-click output resize) and preserves **cross-session `Ctrl + Z` / `Ctrl + Y` vector history**.
-* **`Alt + V` Visual Image Clipboard Drawer:**
-  Frameless popup drawer (`Alt + V`) backed by an OS clipboard sequence watcher, `< 0.5ms` SIMD `crc32fast` + `Sha256` deduplication, `200px` WebP thumbnails, pinned-on-top items, a live `CURRENTLY COPIED` indicator, `1–9` instant paste shortcuts, and configurable FIFO ring eviction (`5–50` unpinned images).
+* **`Alt + V` Visual Image Clipboard Drawer (`< 1ms` Non-Blocking OS Lock):**
+  Frameless popup drawer (`Alt + V`) backed by an OS clipboard sequence watcher that holds `OpenClipboard` for `< 1ms` (preventing Discord/browser freezes on 12 MB+ images), `< 0.5ms` SIMD `crc32fast` + `Sha256` deduplication, `200px` WebP thumbnails, pinned-on-top items, a live `CURRENTLY COPIED` indicator, `1–9` instant paste shortcuts, and configurable FIFO ring eviction (`5–50` unpinned images).
+* **Smart Storage Quota (`10 GB` Default), 100% Pinned Immunity & 3-Day "Queued Deletion" Grace Buffer:**
+  Defaults to a **10 GB** library cap with **No Max Retention Age (Keep Forever)**. Pinned images/videos are never pruned. Unpinned captures pruned by quota or optional retention age enter a **3-day "Queued Deletion" grace period** with a live countdown & exact deletion datetime in the Gallery (`Queued Deletion (X)`) and Settings (`Preview Cleanup`), allowing 1-click **Restore** or **Pin & Restore** before permanent disk removal.
+* **Zero-Bloat Native OS Background OCR (`+0 MB` Installer Size):**
+  Extracts text inside screenshots on a background thread using built-in OS OCR engines (`Windows.Media.Ocr` WinRT on Windows, Apple `Vision` on macOS, `ocrs`/`tesseract` on Linux) and indexes it into SQLite `FTS5` for `< 2ms` text search and one-click Lightbox text copying.
+* **Single-Instance Enforcement & Portable `./captures` Default Folder:**
+  Launching `replay-viewer.exe` when an instance is already running focuses the existing window instead of spawning duplicate instances or tray icons, and defaults to a dedicated `./captures` folder next to the executable.
 
 ---
 
@@ -83,11 +89,11 @@ For full sequence diagrams, SQLite schema definitions, and IPC contracts, see **
   * [x] Anti-cheat safe `Alt + S` region capture (`< 3ms` BMP freeze) & `Alt + Shift + S` instant fullscreen capture (zero focus loss)
   * [x] `react-konva` annotation canvas (Arrow, Rect, Pen, Text, destructive Pixelate redaction, Undo/Redo)
   * [x] 60 FPS Virtualized Gallery (`Alt + G` toggle), Marquee Multi-Select, Batch Tag/Group/Move/Delete, and Working Folder migration & external image importer
-* **Phase 1.5 — Visual Clipboard, Storage Quota & Native OS OCR (`v1.5` — In Progress)**
-  * [x] **v1.5.1:** `Alt + V` Visual Image Clipboard Drawer (FIFO ring buffer, pinned-on-top, `CURRENTLY COPIED` badge, 1:1 centered annotation with visual zoom lock & cross-session `Ctrl + Z` / `Ctrl + Y`)
+* **Phase 1.5 — Visual Clipboard, 3-Day Storage Grace Buffer & Native OS OCR (`v1.5` — Completed)**
+  * [x] **v1.5.1:** `Alt + V` Visual Image Clipboard Drawer (`< 1ms` non-blocking `OpenClipboard` watcher, FIFO ring buffer, pinned-on-top, `CURRENTLY COPIED` badge, 1:1 centered annotation with visual zoom lock & cross-session `Ctrl + Z` / `Ctrl + Y`)
   * [x] **v1.5.2:** Pinning, Tagging, Custom Groups & Instant FTS5 Search
-  * [ ] **v1.5.3:** Automated Storage Quota (Max GB / Max Days) & Dry-Run Cleanup Engine
-  * [ ] **v1.5.4:** Zero-Bloat Native OS Background OCR (`Windows.Media.Ocr` / `Vision`, `+0 MB` installer size) indexed into `captures_fts`
+  * [x] **v1.5.3:** Automated Storage Quota (`10 GB` default cap, no default retention age, 100% Pinned immunity, **3-day "Queued Deletion" grace period** with countdown & restore, and Dry-Run Preview)
+  * [x] **v1.5.4:** Zero-Bloat Native OS Background OCR (`Windows.Media.Ocr` / Apple `Vision`, `+0 MB` installer size) indexed into `captures_fts` + Lightbox OCR inspector
 * **Phase 2.0 — Hardware Replay Buffer, Video Trimmer & Opt-In Visual AI (`v2.0` — Planned)**
   * [ ] **v2.0.1–2.0.2:** GPU-accelerated 30s–20m segmented ring buffer (`Alt + C` `< 0.5s` lossless FFmpeg concat + multi-track WASAPI audio)
   * [ ] **v2.0.3:** Built-in lossless Lightbox Video Trimmer

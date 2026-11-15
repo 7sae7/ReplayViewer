@@ -90,9 +90,11 @@ pub fn trigger_fullscreen_capture(
         duration_ms: None,
         source_app: Some("Fullscreen Capture".to_string()),
         ocr_text: String::new(),
+        ocr_status: "pending".to_string(),
         is_pinned: false,
         group_name: String::new(),
         last_copied_at: Some(now_iso.clone()),
+        queued_delete_at: None,
         tags: vec!["fullscreen".to_string()],
         created_at: now_iso,
     };
@@ -106,6 +108,11 @@ pub fn trigger_fullscreen_capture(
     }
 
     let _ = app.emit("gallery:updated", &record);
+    crate::services::ocr::spawn_background_ocr_and_storage_check(
+        app,
+        record.id.clone(),
+        record.file_path.clone(),
+    );
     Ok(record)
 }
 
@@ -185,6 +192,7 @@ pub fn save_annotated_capture(
         duration_ms: None,
         source_app: source_app.or_else(|| Some(default_source.to_string())),
         ocr_text: String::new(),
+        ocr_status: "pending".to_string(),
         is_pinned: false,
         group_name: String::new(),
         last_copied_at: if copy_to_clipboard || source_clipboard_id.is_some() {
@@ -192,6 +200,7 @@ pub fn save_annotated_capture(
         } else {
             None
         },
+        queued_delete_at: None,
         tags: if source_clipboard_id.is_some() {
             vec!["annotated".to_string(), "clipboard".to_string()]
         } else {
@@ -221,5 +230,10 @@ pub fn save_annotated_capture(
     }
 
     let _ = app.emit("gallery:updated", &record);
+    crate::services::ocr::spawn_background_ocr_and_storage_check(
+        app,
+        record.id.clone(),
+        record.file_path.clone(),
+    );
     Ok(record)
 }

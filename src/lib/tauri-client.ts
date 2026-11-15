@@ -6,6 +6,7 @@ import type {
   GalleryFilter,
   PaginatedCaptures,
   SettingsPayload,
+  StorageStatusSummary,
   UnindexedScanResult,
 } from "../types/ipc";
 
@@ -148,9 +149,11 @@ function ensureMockSeed() {
       durationMs: null,
       sourceApp: p.app,
       ocrText: p.ocr,
+      ocrStatus: "done",
       isPinned: p.pinned,
       groupName: p.group,
       lastCopiedAt: p.copied ? createdIso : null,
+      queuedDeleteAt: null,
       tags: p.tags,
       createdAt: createdIso,
     };
@@ -180,11 +183,11 @@ let mockSettings: SettingsPayload = {
   hotkeySaveReplay: "Alt+C",
   imageFormat: "webp",
   copyToClipboardOnSave: true,
-  maxStorageGb: 15,
-  autoCleanupDays: 30,
+  maxStorageGb: 10,
+  autoCleanupDays: 0,
   clipboardMaxItems: 10,
   launchOnStartup: false,
-  capturesDir: "C:\\Users\\shawp\\Pictures\\ReplayViewer\\captures",
+  capturesDir: "C:\\Users\\shawp\\Desktop\\ReplayViewer\\captures",
 };
 
 // ---------------------------------------------------------------------------
@@ -262,9 +265,11 @@ export async function triggerFullscreenCapture(): Promise<CaptureRecord> {
     durationMs: null,
     sourceApp: "Fullscreen Capture",
     ocrText: "Instant Fullscreen Capture",
+    ocrStatus: "done",
     isPinned: false,
     groupName: "",
     lastCopiedAt: nowIso,
+    queuedDeleteAt: null,
     tags: ["fullscreen"],
     createdAt: nowIso,
   };
@@ -318,9 +323,11 @@ export async function saveAnnotatedCapture(
       ? "Clipboard Annotation (Alt + V)"
       : "Region Capture",
     ocrText: "Annotated Region Screenshot",
+    ocrStatus: "done",
     isPinned: false,
     groupName: "",
     lastCopiedAt: copyToClipboard ? nowIso : null,
+    queuedDeleteAt: null,
     tags: options?.sourceClipboardId
       ? ["annotated", "clipboard"]
       : ["annotated"],
@@ -363,6 +370,11 @@ export async function listCaptures(
   ensureMockSeed();
   const q = (filter.searchQuery || "").trim().toLowerCase();
   const filtered = mockCaptures.filter((c) => {
+    if (filter.onlyQueuedDeletion) {
+      if (!c.queuedDeleteAt || c.isPinned) return false;
+    } else {
+      if (c.queuedDeleteAt) return false;
+    }
     if (filter.onlyPinned && !c.isPinned) return false;
     if (filter.onlyRecentClipboard && !c.lastCopiedAt) return false;
     if (filter.mediaType && c.mediaType !== filter.mediaType) return false;
@@ -377,6 +389,9 @@ export async function listCaptures(
 
   const dir = filter.sortDir === "asc" ? 1 : -1;
   filtered.sort((a, b) => {
+    if (filter.onlyQueuedDeletion) {
+      return (a.queuedDeleteAt || "").localeCompare(b.queuedDeleteAt || "");
+    }
     if (filter.sortBy === "size_bytes") {
       return (a.sizeBytes - b.sizeBytes) * dir;
     }
@@ -390,12 +405,17 @@ export async function listCaptures(
     new Set(mockCaptures.map((c) => c.groupName).filter(Boolean))
   ).sort();
 
-  const totalBytes = mockCaptures.reduce((acc, item) => acc + item.sizeBytes, 0);
+  const activeItems = mockCaptures.filter((c) => !c.queuedDeleteAt);
+  const queuedItems = mockCaptures.filter((c) => Boolean(c.queuedDeleteAt) && !c.isPinned);
+  const totalBytes = activeItems.reduce((acc, item) => acc + item.sizeBytes, 0);
+  const queuedDeletionBytes = queuedItems.reduce((acc, item) => acc + item.sizeBytes, 0);
   return {
     items: filtered.slice(0, limit),
     nextCursor: null,
-    totalCount: mockCaptures.length,
+    totalCount: activeItems.length,
     totalBytes,
+    queuedDeletionCount: queuedItems.length,
+    queuedDeletionBytes,
     groups,
   };
 }
@@ -435,8 +455,78 @@ export async function togglePinCapture(id: string, pinned: boolean): Promise<voi
   }
   ensureMockSeed();
   mockCaptures = mockCaptures.map((c) =>
-    c.id === id ? { ...c, isPinned: pinned } : c
+    c.id === id
+      ? { ...c, isPinned: pinned, queuedDeleteAt: pinned ? null : c.queuedDeleteAt }
+      : c
   );
+}
+
+export async function restoreQueuedCaptures(
+  ids: string[],
+  alsoPin = false
+): Promise<number> {
+  if (isTauriRuntime()) {
+    return invoke<number>("restore_queued_captures", { ids, alsoPin });
+  }
+  ensureMockSeed();
+  let restored = 0;
+  mockCaptures = mockCaptures.map((c) => {
+    if (!ids.includes(c.id)) return c;
+    restored++;
+    return {
+      ...c,
+      queuedDeleteAt: null,
+      isPinned: alsoPin ? true : c.isPinned,
+    };
+  });
+  return restored;
+}
+
+export async function getStorageStatusPreview(
+  maxStorageGb?: number,
+  autoCleanupDays?: number
+): Promise<StorageStatusSummary> {
+  if (isTauriRuntime()) {
+    return invoke<StorageStatusSummary>("get_storage_status_preview", {
+      maxStorageGb: maxStorageGb ?? null,
+      autoCleanupDays: autoCleanupDays ?? null,
+    });
+  }
+  ensureMockSeed();
+  const active = mockCaptures.filter((c) => !c.queuedDeleteAt);
+  const pinned = active.filter((c) => c.isPinned);
+  const unpinned = active.filter((c) => !c.isPinned);
+  const queued = mockCaptures.filter((c) => Boolean(c.queuedDeleteAt) && !c.isPinned);
+  return {
+    activeCount: active.length,
+    activeBytes: active.reduce((acc, c) => acc + c.sizeBytes, 0),
+    pinnedCount: pinned.length,
+    pinnedBytes: pinned.reduce((acc, c) => acc + c.sizeBytes, 0),
+    unpinnedCount: unpinned.length,
+    unpinnedBytes: unpinned.reduce((acc, c) => acc + c.sizeBytes, 0),
+    queuedCount: queued.length,
+    queuedBytes: queued.reduce((acc, c) => acc + c.sizeBytes, 0),
+    nextExpiryAt: queued[0]?.queuedDeleteAt ?? null,
+    candidateCount: 0,
+    candidateBytes: 0,
+    candidateSamples: [],
+    expiredPurgedCount: 0,
+    pendingOcrCount: mockCaptures.filter((c) => c.ocrStatus === "pending").length,
+  };
+}
+
+export async function enforceStoragePoliciesNow(): Promise<StorageStatusSummary> {
+  if (isTauriRuntime()) {
+    return invoke<StorageStatusSummary>("enforce_storage_policies_now");
+  }
+  return getStorageStatusPreview();
+}
+
+export async function runOcrBackfillNow(): Promise<number> {
+  if (isTauriRuntime()) {
+    return invoke<number>("run_ocr_backfill_now");
+  }
+  return 0;
 }
 
 export async function deleteCaptures(ids: string[]): Promise<number> {
@@ -689,9 +779,11 @@ export async function promoteClipboardToGallery(
     durationMs: null,
     sourceApp: "Visual Clipboard (Alt + V)",
     ocrText: "",
+    ocrStatus: "pending",
     isPinned: item.isPinned,
     groupName: "",
     lastCopiedAt: item.copiedAt,
+    queuedDeleteAt: null,
     tags: ["clipboard"],
     createdAt: nowIso,
   };
@@ -775,9 +867,11 @@ export async function seedSyntheticBenchmarkItems(count = 500): Promise<number> 
       durationMs: null,
       sourceApp: `${app} #${i + 1}`,
       ocrText: `Synthetic Benchmark Capture ${i + 1} (${accent})`,
+      ocrStatus: "done",
       isPinned: i % 25 === 0,
       groupName: groups[i % groups.length],
       lastCopiedAt: i % 20 === 0 ? createdIso : null,
+      queuedDeleteAt: null,
       tags: [app.toLowerCase().replace(/\s+/g, "-"), "benchmark"],
       createdAt: createdIso,
     });

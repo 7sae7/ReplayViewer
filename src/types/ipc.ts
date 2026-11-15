@@ -15,9 +15,11 @@ export interface CaptureRecord {
   durationMs: number | null;
   sourceApp: string | null;
   ocrText: string;
+  ocrStatus?: "pending" | "done" | "failed" | string;
   isPinned: boolean;
   groupName: string;
   lastCopiedAt: string | null;
+  queuedDeleteAt?: string | null;
   tags: string[];
   createdAt: string;
 }
@@ -27,6 +29,7 @@ export interface GalleryFilter {
   mediaType?: MediaType;
   onlyPinned: boolean;
   onlyRecentClipboard?: boolean;
+  onlyQueuedDeletion?: boolean;
   groupName?: string;
   tag?: string;
   dateRange?: DateRangeFilter;
@@ -39,7 +42,34 @@ export interface PaginatedCaptures {
   nextCursor: string | null;
   totalCount: number;
   totalBytes: number;
+  queuedDeletionCount?: number;
+  queuedDeletionBytes?: number;
   groups: string[];
+}
+
+export interface QueuedCandidateSample {
+  id: string;
+  fileName: string;
+  sizeBytes: number;
+  createdAt: string;
+  reason: string;
+}
+
+export interface StorageStatusSummary {
+  activeCount: number;
+  activeBytes: number;
+  pinnedCount: number;
+  pinnedBytes: number;
+  unpinnedCount: number;
+  unpinnedBytes: number;
+  queuedCount: number;
+  queuedBytes: number;
+  nextExpiryAt: string | null;
+  candidateCount: number;
+  candidateBytes: number;
+  candidateSamples: QueuedCandidateSample[];
+  expiredPurgedCount: number;
+  pendingOcrCount: number;
 }
 
 export interface UnindexedScanResult {

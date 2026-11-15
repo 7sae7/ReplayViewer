@@ -1,8 +1,14 @@
 import { beforeEach, describe, expect, it } from "vitest";
-import { formatBytes, normalizeCropRect, toPhysicalRect } from "../lib/dpi";
+import {
+  formatBytes,
+  formatDeletionCountdown,
+  normalizeCropRect,
+  toPhysicalRect,
+} from "../lib/dpi";
 import {
   clearUnpinnedClipboardHistory,
   getClipboardAlwaysOnTop,
+  getSettings,
   listClipboardHistory,
   pasteClipboardItem,
   promoteClipboardToGallery,
@@ -49,6 +55,20 @@ describe("High-DPI Coordinate Normalization & Storage Math", () => {
     expect(formatBytes(512)).toBe("512 B");
     expect(formatBytes(1024 * 500)).toBe("500.0 KB");
     expect(formatBytes(1024 * 1024 * 42.5)).toBe("42.5 MB");
+  });
+
+  it("formats 3-day queued deletion countdown and defaults to 10 GB cap with no retention age", async () => {
+    const settings = await getSettings();
+    expect(settings.maxStorageGb).toBe(10);
+    expect(settings.autoCleanupDays).toBe(0);
+
+    const nowMs = Date.UTC(2026, 10, 15, 20, 0, 0);
+    const threeDaysLaterIso = new Date(
+      nowMs + (2 * 24 * 60 + 23 * 60) * 60_000
+    ).toISOString();
+    const formatted = formatDeletionCountdown(threeDaysLaterIso, nowMs);
+    expect(formatted.countdown).toBe("2d 23h left");
+    expect(formatted.compactLabel).toContain("2d 23h left • Deletes");
   });
 });
 
