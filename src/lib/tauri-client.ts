@@ -22,6 +22,7 @@ export function isTauriRuntime(): boolean {
 let mockCaptures: CaptureRecord[] = [];
 let mockClipboardItems: ClipboardItem[] = [];
 let mockClipboardPaused = false;
+let mockClipboardAlwaysOnTop = true;
 let mockInitialized = false;
 
 function createMockSvgDataUrl(
@@ -160,10 +161,13 @@ function ensureMockSeed() {
     blake3Hash: `mock-hash-${idx + 1}`,
     filePath: c.filePath,
     thumbPath: c.thumbPath,
+    baseFilePath: c.filePath,
+    annotationsJson: "[]",
     width: c.width,
     height: c.height,
     sizeBytes: c.sizeBytes,
     isPinned: idx === 0,
+    isCurrentlyCopied: idx === 0,
     copiedAt: new Date(now - idx * 600_000).toISOString(),
   }));
 }
@@ -273,14 +277,26 @@ export async function saveAnnotatedCapture(
   copyToClipboard: boolean,
   imageFormat: "webp" | "png",
   dataUrlFallback?: string,
-  dimensions?: { width: number; height: number }
+  dimensions?: { width: number; height: number },
+  options?: {
+    baseImageBytes?: Uint8Array;
+    annotationsJson?: string;
+    sourceClipboardId?: string | null;
+  }
 ): Promise<CaptureRecord> {
   if (isTauriRuntime()) {
     return invoke<CaptureRecord>("save_annotated_capture", {
       imageBytes: Array.from(imageBytes),
       copyToClipboard,
       imageFormat,
-      sourceApp: "Region Capture",
+      sourceApp: options?.sourceClipboardId
+        ? "Clipboard Annotation (Alt + V)"
+        : "Region Capture",
+      baseImageBytes: options?.baseImageBytes
+        ? Array.from(options.baseImageBytes)
+        : null,
+      annotationsJson: options?.annotationsJson ?? null,
+      sourceClipboardId: options?.sourceClipboardId ?? null,
     });
   }
 
@@ -298,15 +314,36 @@ export async function saveAnnotatedCapture(
     height: dimensions?.height ?? 720,
     sizeBytes: imageBytes.byteLength || 195_000,
     durationMs: null,
-    sourceApp: "Region Capture",
+    sourceApp: options?.sourceClipboardId
+      ? "Clipboard Annotation (Alt + V)"
+      : "Region Capture",
     ocrText: "Annotated Region Screenshot",
     isPinned: false,
     groupName: "",
     lastCopiedAt: copyToClipboard ? nowIso : null,
-    tags: ["annotated"],
+    tags: options?.sourceClipboardId
+      ? ["annotated", "clipboard"]
+      : ["annotated"],
     createdAt: nowIso,
   };
   mockCaptures = [record, ...mockCaptures];
+
+  if (options?.sourceClipboardId) {
+    mockClipboardItems = mockClipboardItems.map((c) =>
+      c.id === options.sourceClipboardId
+        ? {
+            ...c,
+            filePath: url,
+            thumbPath: url,
+            annotationsJson: options.annotationsJson ?? "[]",
+            width: record.width,
+            height: record.height,
+            copiedAt: nowIso,
+            isCurrentlyCopied: true,
+          }
+        : { ...c, isCurrentlyCopied: false }
+    );
+  }
   return record;
 }
 
@@ -550,14 +587,41 @@ export async function toggleClipboardDrawer(): Promise<boolean> {
   return true;
 }
 
+export async function getClipboardAlwaysOnTop(): Promise<boolean> {
+  if (isTauriRuntime()) {
+    return invoke<boolean>("get_clipboard_always_on_top");
+  }
+  return mockClipboardAlwaysOnTop;
+}
+
+export async function setClipboardAlwaysOnTop(
+  alwaysOnTop: boolean
+): Promise<boolean> {
+  if (isTauriRuntime()) {
+    return invoke<boolean>("set_clipboard_always_on_top", { alwaysOnTop });
+  }
+  mockClipboardAlwaysOnTop = alwaysOnTop;
+  return mockClipboardAlwaysOnTop;
+}
+
 export async function listClipboardHistory(): Promise<ClipboardItem[]> {
   if (isTauriRuntime()) {
     return invoke<ClipboardItem[]>("list_clipboard_history");
   }
   ensureMockSeed();
-  return [...mockClipboardItems].sort((a, b) =>
-    b.copiedAt.localeCompare(a.copiedAt)
-  );
+  let newestAt = "";
+  for (const item of mockClipboardItems) {
+    if (item.copiedAt > newestAt) newestAt = item.copiedAt;
+  }
+  return [...mockClipboardItems]
+    .map((item) => ({
+      ...item,
+      isCurrentlyCopied: item.copiedAt === newestAt,
+    }))
+    .sort((a, b) => {
+      if (a.isPinned !== b.isPinned) return a.isPinned ? -1 : 1;
+      return b.copiedAt.localeCompare(a.copiedAt);
+    });
 }
 
 export async function pasteClipboardItem(id: string): Promise<ClipboardItem> {
@@ -569,10 +633,10 @@ export async function pasteClipboardItem(id: string): Promise<ClipboardItem> {
   let target = mockClipboardItems[0];
   mockClipboardItems = mockClipboardItems.map((item) => {
     if (item.id === id) {
-      target = { ...item, copiedAt: nowIso };
+      target = { ...item, copiedAt: nowIso, isCurrentlyCopied: true };
       return target;
     }
-    return item;
+    return { ...item, isCurrentlyCopied: false };
   });
   return target;
 }
@@ -592,6 +656,8 @@ export async function annotateClipboardItem(
     height: found?.height ?? 1080,
     scaleFactor: 1.0,
     capturedAt: new Date().toISOString(),
+    sourceClipboardId: found?.id ?? id,
+    initialAnnotationsJson: found?.annotationsJson ?? "[]",
   };
 }
 

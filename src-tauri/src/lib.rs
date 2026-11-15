@@ -43,17 +43,13 @@ pub fn run() {
                     } else if shortcut == &alt_g {
                         if let Some(main_win) = app.get_webview_window("main") {
                             let is_vis = main_win.is_visible().unwrap_or(false);
-                            let is_foc = main_win.is_focused().unwrap_or(false);
-                            if is_vis && is_foc {
-                                let _ = main_win.emit(
-                                    "shortcut:toast",
-                                    "Alt + G pressed — Gallery is already active (Close window to minimize to tray)",
-                                );
+                            let is_min = main_win.is_minimized().unwrap_or(false);
+                            if is_vis && !is_min {
+                                let _ = main_win.hide();
                             } else {
                                 let _ = main_win.show();
                                 let _ = main_win.unminimize();
                                 let _ = main_win.set_focus();
-                                let _ = main_win.emit("shortcut:toast", "Opened Gallery via Alt + G");
                             }
                         }
                     } else if shortcut == &alt_v {
@@ -147,6 +143,7 @@ pub fn run() {
                 thumbs_dir: RwLock::new(thumbs_dir),
                 clipboard_cache_dir,
                 clipboard_paused: AtomicBool::new(false),
+                active_clipboard_hash: RwLock::new(None),
             });
 
             // Phase 1.5.1: Spawn background OS clipboard image watcher
@@ -265,6 +262,8 @@ pub fn run() {
             capture_cmds::trigger_fullscreen_capture,
             capture_cmds::save_annotated_capture,
             clipboard_cmds::toggle_clipboard_drawer,
+            clipboard_cmds::get_clipboard_always_on_top,
+            clipboard_cmds::set_clipboard_always_on_top,
             clipboard_cmds::list_clipboard_history,
             clipboard_cmds::paste_clipboard_item,
             clipboard_cmds::annotate_clipboard_item,

@@ -8,13 +8,16 @@ use uuid::Uuid;
 
 use crate::db::captures_repo::{insert_capture, CaptureRecord};
 use crate::db::clipboard_repo::{
-    self, bump_clipboard_item_timestamp, get_clipboard_item, ClipboardItem,
+    self, bump_clipboard_item_timestamp, get_clipboard_always_on_top as repo_get_always_on_top,
+    get_clipboard_item, set_clipboard_always_on_top as repo_set_always_on_top, ClipboardItem,
 };
 use crate::error::{AppError, AppResult};
 use crate::services::capture::persist_raw_rgba_and_thumbnail;
+use crate::services::clipboard::resolve_editable_clipboard_image_path;
 use crate::state::{AppState, CaptureSessionMeta, FrozenFrame};
 
-/// Toggles the frameless `clipboard` drawer popup window (`Alt + V`).
+/// Toggles the frameless `clipboard` drawer popup window (`Alt + V`),
+/// respecting the user's persisted `clipboard_always_on_top` preference.
 #[tauri::command]
 pub fn toggle_clipboard_drawer(app: AppHandle) -> AppResult<bool> {
     if let Some(win) = app.get_webview_window("clipboard") {
@@ -23,11 +26,18 @@ pub fn toggle_clipboard_drawer(app: AppHandle) -> AppResult<bool> {
             let _ = win.hide();
             return Ok(false);
         } else {
-            let _ = win.set_always_on_top(true);
+            let state: State<'_, AppState> = app.state();
+            let always_on_top = state
+                .db
+                .lock()
+                .map(|conn| repo_get_always_on_top(&conn))
+                .unwrap_or(true);
+
+            let _ = win.set_always_on_top(always_on_top);
             let _ = win.show();
             let _ = win.unminimize();
             let _ = win.set_focus();
-            let _ = win.emit("clipboard:opened", true);
+            let _ = win.emit("clipboard:opened", always_on_top);
             return Ok(true);
         }
     }
@@ -35,16 +45,50 @@ pub fn toggle_clipboard_drawer(app: AppHandle) -> AppResult<bool> {
 }
 
 #[tauri::command]
-pub fn list_clipboard_history(state: State<'_, AppState>) -> AppResult<Vec<ClipboardItem>> {
+pub fn get_clipboard_always_on_top(state: State<'_, AppState>) -> AppResult<bool> {
     let conn = state
         .db
         .lock()
         .map_err(|_| AppError::General("Failed to lock database".to_string()))?;
-    clipboard_repo::list_clipboard_history(&conn)
+    Ok(repo_get_always_on_top(&conn))
+}
+
+#[tauri::command]
+pub fn set_clipboard_always_on_top(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    always_on_top: bool,
+) -> AppResult<bool> {
+    {
+        let conn = state
+            .db
+            .lock()
+            .map_err(|_| AppError::General("Failed to lock database".to_string()))?;
+        repo_set_always_on_top(&conn, always_on_top)?;
+    }
+    if let Some(win) = app.get_webview_window("clipboard") {
+        let _ = win.set_always_on_top(always_on_top);
+    }
+    Ok(always_on_top)
+}
+
+#[tauri::command]
+pub fn list_clipboard_history(state: State<'_, AppState>) -> AppResult<Vec<ClipboardItem>> {
+    let active_hash = state
+        .active_clipboard_hash
+        .read()
+        .ok()
+        .and_then(|g| g.clone());
+
+    let conn = state
+        .db
+        .lock()
+        .map_err(|_| AppError::General("Failed to lock database".to_string()))?;
+    clipboard_repo::list_clipboard_history(&conn, active_hash.as_deref())
 }
 
 /// Copies a historical `ClipboardItem` back into the active OS clipboard,
-/// bumps its `copied_at` timestamp to `#1`, and hides the `clipboard` popup drawer.
+/// marks it as `CURRENTLY COPIED`, bumps its `copied_at` timestamp, and hides the `clipboard` drawer.
 #[tauri::command]
 pub fn paste_clipboard_item(
     app: AppHandle,
@@ -67,6 +111,10 @@ pub fn paste_clipboard_item(
         .write_image(&tauri_img)
         .map_err(|e| AppError::General(e.to_string()))?;
 
+    if let Ok(mut active_guard) = state.active_clipboard_hash.write() {
+        *active_guard = Some(item.blake3_hash.clone());
+    }
+
     let now_iso = Utc::now().to_rfc3339();
     {
         let conn = state
@@ -76,6 +124,7 @@ pub fn paste_clipboard_item(
         bump_clipboard_item_timestamp(&conn, &id, &now_iso)?;
     }
     item.copied_at = now_iso;
+    item.is_currently_copied = true;
 
     if let Some(clip_win) = app.get_webview_window("clipboard") {
         let _ = clip_win.hide();
@@ -86,7 +135,8 @@ pub fn paste_clipboard_item(
 }
 
 /// Loads any historical `ClipboardItem` directly into the `overlay` (`react-konva`) annotation
-/// editor so the user can crop, draw arrows, redact/pixelate, or add text to any copied image!
+/// editor at its actual 1:1 dimensions, loading its clean `base_file_path` and restoring its
+/// vector `annotations_json` so `Ctrl + Z` / `Ctrl + Y` works across sessions!
 #[tauri::command]
 pub fn annotate_clipboard_item(
     app: AppHandle,
@@ -102,7 +152,8 @@ pub fn annotate_clipboard_item(
             .ok_or_else(|| AppError::General("Clipboard item not found".to_string()))?
     };
 
-    let decoded = image::open(&item.file_path)?;
+    let editable_path = resolve_editable_clipboard_image_path(&item);
+    let decoded = image::open(editable_path)?;
     let rgba = decoded.to_rgba8();
     let width = rgba.width();
     let height = rgba.height();
@@ -118,6 +169,8 @@ pub fn annotate_clipboard_item(
         height,
         scale_factor: 1.0,
         captured_at: Utc::now().to_rfc3339(),
+        source_clipboard_id: Some(item.id.clone()),
+        initial_annotations_json: Some(item.annotations_json.clone()),
     };
 
     {

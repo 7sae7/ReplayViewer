@@ -9,6 +9,7 @@ import {
   Pause,
   PenTool,
   Pin,
+  PinOff,
   Play,
   RefreshCw,
   Search,
@@ -20,6 +21,7 @@ import {
   annotateClipboardItem,
   clearUnpinnedClipboardHistory,
   deleteClipboardItem,
+  getClipboardAlwaysOnTop,
   getClipboardPaused,
   getSettings,
   isTauriRuntime,
@@ -27,6 +29,7 @@ import {
   pasteClipboardItem,
   promoteClipboardToGallery,
   resolveMediaSrc,
+  setClipboardAlwaysOnTop,
   setClipboardPaused,
   togglePinClipboardItem,
   updateSettings,
@@ -72,6 +75,7 @@ export const ClipboardApp: React.FC<ClipboardAppProps> = ({
   const [filterTab, setFilterTab] = useState<"all" | "pinned">("all");
   const [searchQuery, setSearchQuery] = useState("");
   const [paused, setPaused] = useState(false);
+  const [windowAlwaysOnTop, setWindowAlwaysOnTop] = useState(true);
   const [settings, setSettings] = useState<SettingsPayload | null>(null);
   const [toastMsg, setToastMsg] = useState<string | null>(null);
   const [copiedId, setCopiedId] = useState<string | null>(null);
@@ -95,13 +99,15 @@ export const ClipboardApp: React.FC<ClipboardAppProps> = ({
   const refreshClipboard = useCallback(async () => {
     setLoading(true);
     try {
-      const [history, isPaused, cfg] = await Promise.all([
+      const [history, isPaused, isOnTop, cfg] = await Promise.all([
         listClipboardHistory(),
         getClipboardPaused(),
+        getClipboardAlwaysOnTop(),
         getSettings(),
       ]);
       setItems(history);
       setPaused(isPaused);
+      setWindowAlwaysOnTop(isOnTop);
       setSettings(cfg);
     } finally {
       setLoading(false);
@@ -206,7 +212,7 @@ export const ClipboardApp: React.FC<ClipboardAppProps> = ({
       await refreshClipboard();
       showToast(
         !item.isPinned
-          ? "Pinned (protected from FIFO ring eviction)"
+          ? "Pinned to top (protected from FIFO ring eviction)"
           : "Unpinned item"
       );
     },
@@ -235,6 +241,17 @@ export const ClipboardApp: React.FC<ClipboardAppProps> = ({
       next
         ? "Paused OS Clipboard image history watcher"
         : "Resumed OS Clipboard image history watcher"
+    );
+  };
+
+  // Fix #1: Persistent Window "Always on Top" Toggle
+  const handleToggleWindowAlwaysOnTop = async () => {
+    const next = await setClipboardAlwaysOnTop(!windowAlwaysOnTop);
+    setWindowAlwaysOnTop(next);
+    showToast(
+      next
+        ? "Window pinned on top (remembered for next Alt+V)"
+        : "Window unpinned from top (remembered for next Alt+V)"
     );
   };
 
@@ -340,6 +357,29 @@ export const ClipboardApp: React.FC<ClipboardAppProps> = ({
         </div>
 
         <div className="flex items-center gap-1" data-no-drag>
+          {/* Fix #1: Window Always-on-Top Pin / Unpin Toggle (Persisted across Alt+V) */}
+          <button
+            onClick={handleToggleWindowAlwaysOnTop}
+            className={`btn btn-xs gap-1 ${
+              windowAlwaysOnTop ? "btn-primary" : "btn-ghost"
+            }`}
+            title={
+              windowAlwaysOnTop
+                ? "Window is pinned Always on Top — click to unpin (remembered on next Alt+V)"
+                : "Window is unpinned from top — click to keep Always on Top"
+            }
+          >
+            {windowAlwaysOnTop ? (
+              <>
+                <Pin className="w-3 h-3 fill-current" /> Top
+              </>
+            ) : (
+              <>
+                <PinOff className="w-3 h-3" /> Unpinned
+              </>
+            )}
+          </button>
+
           <button
             onClick={handleTogglePause}
             className={`btn btn-xs gap-1 ${
@@ -410,7 +450,7 @@ export const ClipboardApp: React.FC<ClipboardAppProps> = ({
               value={settings?.clipboardMaxItems ?? 10}
               onChange={(e) => handleChangeMaxItems(Number(e.target.value))}
               className="select select-xs w-20 font-mono"
-              title="Maximum unpinned images kept in ring buffer"
+              title="Maximum unpinned images kept in ring buffer (Pinned items are exempt)"
             >
               <option value={5}>5 imgs</option>
               <option value={10}>10 imgs</option>
@@ -461,6 +501,8 @@ export const ClipboardApp: React.FC<ClipboardAppProps> = ({
             const isSelected = idx === selectedIndex;
             const isCopied = copiedId === item.id;
             const shortcutNum = idx < 9 ? idx + 1 : null;
+            const hasEditableHistory =
+              Boolean(item.annotationsJson) && item.annotationsJson !== "[]";
 
             return (
               <div
@@ -470,41 +512,61 @@ export const ClipboardApp: React.FC<ClipboardAppProps> = ({
                 className={`card card-side card-border bg-base-200/80 hover:bg-base-200 transition-all cursor-pointer overflow-hidden ${
                   isSelected
                     ? "ring-2 ring-primary border-primary/50 shadow-md"
+                    : item.isCurrentlyCopied
+                    ? "border-success/60"
                     : "border-base-300"
                 }`}
               >
-                {/* 200px WebP Thumbnail Preview */}
-                <figure className="relative w-28 h-20 shrink-0 bg-base-300 overflow-hidden">
+                {/* Fix #3: Plain div container instead of <figure> so daisyUI never stretches child badges over the image! */}
+                <div className="relative w-28 h-20 shrink-0 bg-base-300 overflow-hidden border-r border-base-300">
                   <img
                     src={resolveMediaSrc(item.thumbPath)}
                     alt={`Clipboard ${item.width}x${item.height}`}
                     draggable={false}
-                    className="w-full h-full object-cover"
+                    className="w-full h-full object-contain bg-base-300"
                   />
-                  {shortcutNum !== null && (
-                    <kbd className="kbd kbd-xs absolute top-1.5 left-1.5 bg-base-100/90 text-base-content font-mono font-bold shadow-xs">
-                      {shortcutNum}
-                    </kbd>
-                  )}
-                  {item.isPinned && (
-                    <span className="badge badge-warning badge-xs absolute bottom-1.5 left-1.5 gap-0.5">
-                      <Pin className="w-2.5 h-2.5 fill-current" />
-                    </span>
-                  )}
-                </figure>
+                </div>
 
                 {/* Card Metadata & Quick Actions */}
-                <div className="card-body p-2.5 justify-between min-w-0">
-                  <div className="flex items-center justify-between gap-1">
-                    <div className="flex items-center gap-1.5 min-w-0">
+                <div className="card-body p-2 justify-between min-w-0">
+                  <div className="flex items-center justify-between gap-1 flex-wrap">
+                    <div className="flex items-center gap-1 min-w-0 flex-wrap">
+                      {shortcutNum !== null && (
+                        <kbd
+                          className="kbd kbd-xs font-mono font-bold"
+                          title={`Press ${shortcutNum} to instant-copy`}
+                        >
+                          {shortcutNum}
+                        </kbd>
+                      )}
                       <span className="badge badge-xs badge-neutral font-mono">
                         {item.width}×{item.height}
                       </span>
-                      <span className="text-[11px] text-base-content/60 font-mono truncate">
-                        {formatBytes(item.sizeBytes)}
-                      </span>
+                      {item.isPinned && (
+                        <span
+                          className="badge badge-warning badge-xs gap-0.5 font-semibold"
+                          title="Pinned to top (exempt from FIFO eviction)"
+                        >
+                          <Pin className="w-2.5 h-2.5 fill-current" /> Pinned
+                        </span>
+                      )}
+                      {/* Fix #5: CURRENTLY COPIED badge */}
+                      {item.isCurrentlyCopied && (
+                        <span className="badge badge-success badge-xs font-bold tracking-tight">
+                          CURRENTLY COPIED
+                        </span>
+                      )}
+                      {hasEditableHistory && (
+                        <span
+                          className="badge badge-info badge-soft badge-xs"
+                          title="Has editable vector annotations (Ctrl+Z / Ctrl+Y supported)"
+                        >
+                          Layers
+                        </span>
+                      )}
                     </div>
-                    <span className="text-[10px] text-base-content/50 shrink-0">
+                    <span className="text-[10px] text-base-content/50 shrink-0 font-mono">
+                      {formatBytes(item.sizeBytes)} •{" "}
                       {formatRelativeTime(item.copiedAt)}
                     </span>
                   </div>
@@ -526,7 +588,7 @@ export const ClipboardApp: React.FC<ClipboardAppProps> = ({
                       <button
                         onClick={(e) => handleAnnotateItem(item, e)}
                         className="btn btn-xs btn-ghost btn-square"
-                        title="Open in Annotation Editor (A)"
+                        title="Open in Annotation Editor at 1:1 Size (A)"
                       >
                         <PenTool className="w-3.5 h-3.5 text-info" />
                       </button>
@@ -547,7 +609,7 @@ export const ClipboardApp: React.FC<ClipboardAppProps> = ({
                         title={
                           item.isPinned
                             ? "Unpin item"
-                            : "Pin item (protect from FIFO eviction)"
+                            : "Pin item to top (protect from FIFO eviction)"
                         }
                       >
                         <Pin

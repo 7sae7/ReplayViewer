@@ -54,10 +54,13 @@ export interface ClipboardItem {
   blake3Hash: string;
   filePath: string;
   thumbPath: string;
+  baseFilePath: string | null;
+  annotationsJson: string;
   width: number;
   height: number;
   sizeBytes: number;
   isPinned: boolean;
+  isCurrentlyCopied: boolean;
   copiedAt: string;
 }
 
@@ -68,6 +71,8 @@ export interface CaptureSessionMeta {
   height: number;
   scaleFactor: number;
   capturedAt: string;
+  sourceClipboardId?: string | null;
+  initialAnnotationsJson?: string | null;
 }
 
 export interface SettingsPayload {

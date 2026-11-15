@@ -2,9 +2,11 @@ import { beforeEach, describe, expect, it } from "vitest";
 import { formatBytes, normalizeCropRect, toPhysicalRect } from "../lib/dpi";
 import {
   clearUnpinnedClipboardHistory,
+  getClipboardAlwaysOnTop,
   listClipboardHistory,
   pasteClipboardItem,
   promoteClipboardToGallery,
+  setClipboardAlwaysOnTop,
   togglePinClipboardItem,
 } from "../lib/tauri-client";
 import { useEditorStore } from "../stores/useEditorStore";
@@ -106,28 +108,74 @@ describe("Command Pattern Undo / Redo Stack (useEditorStore)", () => {
       "a2",
     ]);
   });
+
+  it("hydrates cross-session annotations from SQLite so Ctrl+Z / Ctrl+Y works immediately", () => {
+    const savedShapes: ArrowAnnotation[] = [
+      {
+        id: "saved-1",
+        tool: "arrow",
+        color: "#3b82f6",
+        strokeWidth: 4,
+        points: [0, 0, 50, 50],
+      },
+      {
+        id: "saved-2",
+        tool: "arrow",
+        color: "#10b981",
+        strokeWidth: 4,
+        points: [50, 50, 120, 120],
+      },
+    ];
+
+    useEditorStore.getState().hydrateAnnotations(savedShapes, "arrow");
+    expect(useEditorStore.getState().annotations).toHaveLength(2);
+    expect(useEditorStore.getState().past).toHaveLength(2);
+
+    // Pressing Ctrl+Z immediately undoes saved-2 from the previous session!
+    useEditorStore.getState().undo();
+    expect(useEditorStore.getState().annotations.map((a) => a.id)).toEqual([
+      "saved-1",
+    ]);
+
+    // Pressing Ctrl+Y restores saved-2!
+    useEditorStore.getState().redo();
+    expect(useEditorStore.getState().annotations.map((a) => a.id)).toEqual([
+      "saved-1",
+      "saved-2",
+    ]);
+  });
 });
 
 describe("Phase 1.5.1 Visual Clipboard Drawer (Alt + V) Operations", () => {
-  it("lists clipboard history, bumps pasted items to #1, protects pinned items, and promotes to gallery", async () => {
+  it("keeps pinned items on top, marks CURRENTLY COPIED item, remembers Always-on-Top, and promotes to gallery", async () => {
+    // 1. Verify persistent Always-on-Top toggle
+    expect(await getClipboardAlwaysOnTop()).toBe(true);
+    await setClipboardAlwaysOnTop(false);
+    expect(await getClipboardAlwaysOnTop()).toBe(false);
+    await setClipboardAlwaysOnTop(true);
+
     const initial = await listClipboardHistory();
     expect(initial.length).toBeGreaterThanOrEqual(3);
+    // Item #0 is pinned in seed data and stays on top
+    expect(initial[0].isPinned).toBe(true);
 
-    // Paste the last item and verify it bumps to #1 (newest copiedAt)
-    const oldest = initial[initial.length - 1];
-    await pasteClipboardItem(oldest.id);
+    // 2. Paste an unpinned item; pinned item stays at index 0, while pasted unpinned item is marked CURRENTLY COPIED
+    const unpinned = initial[initial.length - 1];
+    await pasteClipboardItem(unpinned.id);
     const afterPaste = await listClipboardHistory();
-    expect(afterPaste[0].id).toBe(oldest.id);
+    expect(afterPaste[0].isPinned).toBe(true);
+    const currentlyCopied = afterPaste.find((i) => i.isCurrentlyCopied);
+    expect(currentlyCopied?.id).toBe(unpinned.id);
 
-    // Pin the top item and clear unpinned items
-    await togglePinClipboardItem(oldest.id, true);
+    // 3. Pin the newly pasted item too and clear unpinned items
+    await togglePinClipboardItem(unpinned.id, true);
     const clearedCount = await clearUnpinnedClipboardHistory();
     expect(clearedCount).toBeGreaterThanOrEqual(1);
 
     const remaining = await listClipboardHistory();
     expect(remaining.every((item) => item.isPinned)).toBe(true);
 
-    // Promote pinned clipboard item permanently to Gallery
+    // 4. Promote pinned clipboard item permanently to Gallery
     const promoted = await promoteClipboardToGallery(remaining[0].id);
     expect(promoted.tags).toContain("clipboard");
     expect(promoted.sourceApp).toBe("Visual Clipboard (Alt + V)");

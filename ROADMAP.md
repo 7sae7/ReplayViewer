@@ -67,11 +67,13 @@ To stand out in technical interviews and real-world usage, every phase is measur
 ### Milestone 1.5.1: The `Alt + V` Visual Image Clipboard (Windows `Win + V` for Images)
 - [x] Implement a background OS clipboard image watcher in Rust (`arboard` + `clipboard-win` sequence counter) that detects images copied from *any* application (browsers, Discord, design tools, or ReplayViewer itself) with near-zero idle CPU usage and Windows privacy marker compliance (`ExcludeClipboardContentFromMonitorProcessing`).
 - [x] Compute a sub-millisecond pixel digest (`crc32fast` SIMD + `Sha256`, `< 0.5ms`) on raw RGBA pixel bytes to deduplicate repeated copies—bumping existing images to the top of the history list instead of duplicating storage.
-- [x] Store full clipboard images in `clipboard_cache/` with `200px` `.webp` thumbnails and enforce a user-configurable **FIFO ring buffer limit** (`5`, `10`, `20`, or `50` images) in SQLite.
+- [x] Store full clipboard images in `clipboard_cache/` with `200px` `.webp` thumbnails, keep **Pinned images anchored at the top** (`ORDER BY is_pinned DESC, copied_at DESC`), and enforce a user-configurable **FIFO ring buffer limit** (`5`, `10`, `20`, or `50` unpinned images) in SQLite.
 - [x] Build the frameless daisyUI v5 `Alt + V` quick-paste popup window (`clipboard`):
+  - **Persistent Always-on-Top Toggle:** Pin/unpin the `Alt + V` drawer window from the top (`clipboard_always_on_top`), remembered across openings.
+  - **`CURRENTLY COPIED` Indicator:** Live badge showing which clipboard item is currently sitting in the active OS clipboard.
   - **Click / `Enter` / `1–9`:** Pushes the selected historical image back into the active OS clipboard and closes the drawer.
-  - **"Annotate" Button (`A`):** Opens any copied clipboard image directly inside the `react-konva` annotation editor (`overlay` window).
-  - **Pin & Promote:** Pin favorite clipboard images so FIFO eviction skips them, or click *"Save to Gallery"* to archive them permanently.
+  - **1:1 Centered Annotation + Cross-Session `Ctrl + Z` / `Ctrl + Y` History (`A`):** Opens any clipboard image centered at its actual 1:1 pixel dimensions with scale buttons (`1:1`, `2×`, `4×`, `Fit Screen`) and 4 draggable corner handles, saving both the flattened bitmap and non-destructive vector layers (`annotations_json` + `base_file_path`) so re-editing preserves full `Ctrl + Z` / `Ctrl + Y` history while keeping `Pixelate` redactions destructive.
+  - **Pin & Promote:** Pin favorite clipboard images to the top so FIFO eviction skips them, or click *"Save to Gallery"* to archive them permanently.
 
 ### Milestone 1.5.2: Pinning, Tagging, Groups & Instant FTS5 Search (Completed Early in v1.0!)
 - [x] One-click **Pinning** (`is_pinned`), custom **Groups/Collections** (`group_name`), and **Tags** (`#bug`, `#valorant`, etc.) with batch editing.

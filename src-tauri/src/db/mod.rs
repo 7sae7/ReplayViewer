@@ -52,18 +52,20 @@ CREATE VIRTUAL TABLE IF NOT EXISTS captures_fts USING fts5(
 );
 
 CREATE TABLE IF NOT EXISTS clipboard_history (
-    id              TEXT PRIMARY KEY,
-    blake3_hash     TEXT NOT NULL UNIQUE,
-    file_path       TEXT NOT NULL,
-    thumb_path      TEXT NOT NULL,
-    width           INTEGER NOT NULL,
-    height          INTEGER NOT NULL,
-    size_bytes      INTEGER NOT NULL,
-    is_pinned       INTEGER NOT NULL DEFAULT 0,
-    copied_at       TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+    id                  TEXT PRIMARY KEY,
+    blake3_hash         TEXT NOT NULL UNIQUE,
+    file_path           TEXT NOT NULL,
+    thumb_path          TEXT NOT NULL,
+    base_file_path      TEXT DEFAULT NULL,
+    annotations_json    TEXT NOT NULL DEFAULT '[]',
+    width               INTEGER NOT NULL,
+    height              INTEGER NOT NULL,
+    size_bytes          INTEGER NOT NULL,
+    is_pinned           INTEGER NOT NULL DEFAULT 0,
+    copied_at           TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
 
-CREATE INDEX IF NOT EXISTS idx_clipboard_copied_at ON clipboard_history(copied_at DESC);
+CREATE INDEX IF NOT EXISTS idx_clipboard_copied_at ON clipboard_history(is_pinned DESC, copied_at DESC);
 
 CREATE TABLE IF NOT EXISTS settings (
     key             TEXT PRIMARY KEY,
@@ -93,6 +95,14 @@ pub fn init_db(db_path: &Path) -> AppResult<Connection> {
         "CREATE INDEX IF NOT EXISTS idx_captures_group_name ON captures(group_name)",
         [],
     );
+    let _ = conn.execute(
+        "ALTER TABLE clipboard_history ADD COLUMN base_file_path TEXT DEFAULT NULL",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE clipboard_history ADD COLUMN annotations_json TEXT NOT NULL DEFAULT '[]'",
+        [],
+    );
 
     seed_default_settings(&conn)?;
     Ok(conn)
@@ -111,6 +121,7 @@ fn seed_default_settings(conn: &Connection) -> AppResult<()> {
         ("max_storage_gb", "15"),
         ("auto_cleanup_days", "30"),
         ("clipboard_max_items", "10"),
+        ("clipboard_always_on_top", "true"),
         ("launch_on_startup", "false"),
     ];
 
