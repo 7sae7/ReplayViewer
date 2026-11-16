@@ -191,6 +191,56 @@ pub fn insert_capture(conn: &Connection, record: &CaptureRecord) -> AppResult<()
     Ok(())
 }
 
+/// Fetches a single capture record by its UUID (including tags).
+pub fn get_capture_by_id(conn: &Connection, id: &str) -> AppResult<Option<CaptureRecord>> {
+    let rec_opt = conn
+        .query_row(
+            "SELECT id, media_type, file_path, thumb_path, width, height, size_bytes, duration_ms,
+                    source_app, ocr_text, ocr_status, is_pinned, group_name, last_copied_at,
+                    queued_delete_at, created_at
+             FROM captures WHERE id = ?1",
+            params![id],
+            |row| {
+                Ok(CaptureRecord {
+                    id: row.get(0)?,
+                    media_type: row.get(1)?,
+                    file_path: row.get(2)?,
+                    thumb_path: row.get(3)?,
+                    width: row.get(4)?,
+                    height: row.get(5)?,
+                    size_bytes: row.get::<_, i64>(6)? as u64,
+                    duration_ms: row.get::<_, Option<i64>>(7)?.map(|v| v as u64),
+                    source_app: row.get(8)?,
+                    ocr_text: row.get(9)?,
+                    ocr_status: row.get(10)?,
+                    is_pinned: row.get::<_, i64>(11)? != 0,
+                    group_name: row.get(12)?,
+                    last_copied_at: row.get(13)?,
+                    queued_delete_at: row.get(14)?,
+                    tags: Vec::new(),
+                    created_at: row.get(15)?,
+                })
+            },
+        )
+        .ok();
+
+    let Some(mut rec) = rec_opt else {
+        return Ok(None);
+    };
+
+    if let Ok(mut tag_stmt) = conn.prepare(
+        "SELECT t.name FROM tags t
+         JOIN capture_tags ct ON ct.tag_id = t.id
+         WHERE ct.capture_id = ?1 ORDER BY t.name ASC",
+    ) {
+        if let Ok(rows) = tag_stmt.query_map(params![id], |r| r.get::<_, String>(0)) {
+            rec.tags = rows.flatten().collect();
+        }
+    }
+
+    Ok(Some(rec))
+}
+
 pub fn list_captures(
     conn: &Connection,
     cursor: Option<String>,

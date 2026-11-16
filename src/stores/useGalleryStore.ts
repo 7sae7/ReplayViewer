@@ -12,13 +12,11 @@ import {
   batchAddTags,
   batchSetGroup,
   deleteCaptures,
-  findSimilarCaptures,
   listCaptures,
   moveCapturesToFolder,
   reconcileOrphanedCaptures,
   restoreQueuedCaptures,
   seedSyntheticBenchmarkItems,
-  semanticVisualSearch,
   togglePinCapture,
 } from "../lib/tauri-client";
 
@@ -31,10 +29,8 @@ interface GalleryState {
   queuedDeletionBytes: number;
   isLoading: boolean;
 
-  // Filters, Sorting & Smart AI Visual Search
+  // Filters & Sorting
   searchQuery: string;
-  visualSearchMode: boolean;
-  similarToCapture: CaptureRecord | null;
   mediaTypeFilter: MediaType | undefined;
   onlyPinned: boolean;
   onlyRecentClipboard: boolean;
@@ -54,9 +50,6 @@ interface GalleryState {
   // Actions
   fetchCaptures: () => Promise<void>;
   setSearchQuery: (query: string) => Promise<void>;
-  setVisualSearchMode: (enabled: boolean) => Promise<void>;
-  findSimilar: (capture: CaptureRecord) => Promise<void>;
-  clearSimilarFilter: () => Promise<void>;
   setMediaTypeFilter: (mediaType: MediaType | undefined) => Promise<void>;
   setOnlyPinned: (onlyPinned: boolean) => Promise<void>;
   setOnlyRecentClipboard: (onlyRecentClipboard: boolean) => Promise<void>;
@@ -96,8 +89,6 @@ export const useGalleryStore = create<GalleryState>((set, get) => ({
   queuedDeletionBytes: 0,
   isLoading: false,
   searchQuery: "",
-  visualSearchMode: false,
-  similarToCapture: null,
   mediaTypeFilter: undefined,
   onlyPinned: false,
   onlyRecentClipboard: false,
@@ -117,9 +108,7 @@ export const useGalleryStore = create<GalleryState>((set, get) => ({
     try {
       const state = get();
       const filter: GalleryFilter = {
-        searchQuery: state.visualSearchMode
-          ? undefined
-          : state.searchQuery || undefined,
+        searchQuery: state.searchQuery || undefined,
         mediaType: state.mediaTypeFilter,
         onlyPinned: state.onlyPinned,
         onlyRecentClipboard: state.onlyRecentClipboard,
@@ -150,28 +139,7 @@ export const useGalleryStore = create<GalleryState>((set, get) => ({
   },
 
   setSearchQuery: async (searchQuery) => {
-    set({ searchQuery, similarToCapture: null });
-    await get().fetchCaptures();
-  },
-
-  setVisualSearchMode: async (visualSearchMode) => {
-    set({ visualSearchMode, similarToCapture: null });
-    await get().fetchCaptures();
-  },
-
-  findSimilar: async (capture) => {
-    set({
-      similarToCapture: capture,
-      onlyQueuedDeletion: false,
-      onlyPinned: false,
-      onlyRecentClipboard: false,
-      selectedCapture: null,
-    });
-    await get().fetchCaptures();
-  },
-
-  clearSimilarFilter: async () => {
-    set({ similarToCapture: null });
+    set({ searchQuery });
     await get().fetchCaptures();
   },
 

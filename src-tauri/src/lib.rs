@@ -549,6 +549,8 @@ pub fn run() {
             replay_cmds::get_replay_buffer_snapshot,
             replay_cmds::set_replay_buffer_active,
             replay_cmds::save_replay_buffer,
+            replay_cmds::probe_video_audio_tracks,
+            replay_cmds::trim_video_clip_cmd,
             replay_cmds::list_active_audio_sessions,
             replay_cmds::get_live_audio_peaks,
             replay_cmds::list_audio_input_devices,
