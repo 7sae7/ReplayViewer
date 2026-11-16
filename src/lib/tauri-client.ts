@@ -12,7 +12,7 @@ import type {
   SettingsPayload,
   StorageStatusSummary,
   UnindexedScanResult,
-  VisualSearchStatus,
+  VideoProbeInfo,
 } from "../types/ipc";
 
 export function isTauriRuntime(): boolean {
@@ -912,139 +912,82 @@ export async function updateAppAudioRule(
   );
 }
 
-export async function restoreQueuedCaptures(
-  ids: string[],
-  alsoPin = false
-): Promise<number> {
-  if (isTauriRuntime()) {
-    return invoke<number>("restore_queued_captures", { ids, alsoPin });
-  }
-  ensureMockSeed();
-  let restored = 0;
-  mockCaptures = mockCaptures.map((c) => {
-    if (!ids.includes(c.id)) return c;
-    restored++;
-    return {
-      ...c,
-      queuedDeleteAt: null,
-      isPinned: alsoPin ? true : c.isPinned,
-    };
-  });
-  return restored;
+export interface TrimVideoClipOptions {
+  id: string;
+  startMs: number;
+  endMs: number;
+  selectedAudioIndices?: number[];
+  mixSelectedAudio?: boolean;
+  targetMaxMb?: number | null;
+  replaceOriginal?: boolean;
 }
 
-export async function getStorageStatusPreview(
-  maxStorageGb?: number,
-  autoCleanupDays?: number
-): Promise<StorageStatusSummary> {
+export async function probeVideoAudioTracks(id: string): Promise<VideoProbeInfo> {
   if (isTauriRuntime()) {
-    return invoke<StorageStatusSummary>("get_storage_status_preview", {
-      maxStorageGb: maxStorageGb ?? null,
-      autoCleanupDays: autoCleanupDays ?? null,
+    return invoke<VideoProbeInfo>("probe_video_audio_tracks", { id });
+  }
+  ensureMockSeed();
+  const target = mockCaptures.find((c) => c.id === id);
+  return {
+    durationMs: target?.durationMs ?? 30_000,
+    sizeBytes: target?.sizeBytes ?? 28 * 1024 * 1024,
+    width: target?.width || 1920,
+    height: target?.height || 1080,
+    audioTracks: [
+      { streamIndex: 0, title: "Master Mix", channels: 2, codec: "aac" },
+      { streamIndex: 1, title: "Desktop Audio", channels: 2, codec: "aac" },
+      { streamIndex: 2, title: "Spotify.exe", channels: 2, codec: "aac" },
+      { streamIndex: 3, title: "Microphone", channels: 2, codec: "aac" },
+    ],
+  };
+}
+
+export async function trimVideoClip(
+  options: TrimVideoClipOptions
+): Promise<CaptureRecord> {
+  if (isTauriRuntime()) {
+    return invoke<CaptureRecord>("trim_video_clip_cmd", {
+      id: options.id,
+      startMs: Math.max(0, Math.round(options.startMs)),
+      endMs: Math.max(0, Math.round(options.endMs)),
+      selectedAudioIndices: options.selectedAudioIndices ?? null,
+      mixSelectedAudio: options.mixSelectedAudio ?? false,
+      targetMaxMb: options.targetMaxMb ?? null,
+      replaceOriginal: options.replaceOriginal ?? false,
     });
   }
   ensureMockSeed();
-  const active = mockCaptures.filter((c) => !c.queuedDeleteAt);
-  const pinned = active.filter((c) => c.isPinned);
-  const unpinned = active.filter((c) => !c.isPinned);
-  const queued = mockCaptures.filter((c) => Boolean(c.queuedDeleteAt) && !c.isPinned);
-  return {
-    activeCount: active.length,
-    activeBytes: active.reduce((acc, c) => acc + c.sizeBytes, 0),
-    pinnedCount: pinned.length,
-    pinnedBytes: pinned.reduce((acc, c) => acc + c.sizeBytes, 0),
-    unpinnedCount: unpinned.length,
-    unpinnedBytes: unpinned.reduce((acc, c) => acc + c.sizeBytes, 0),
-    queuedCount: queued.length,
-    queuedBytes: queued.reduce((acc, c) => acc + c.sizeBytes, 0),
-    nextExpiryAt: queued[0]?.queuedDeleteAt ?? null,
-    candidateCount: 0,
-    candidateBytes: 0,
-    candidateSamples: [],
-    expiredPurgedCount: 0,
-    pendingOcrCount: mockCaptures.filter((c) => c.ocrStatus === "pending").length,
+  const source = mockCaptures.find((c) => c.id === options.id);
+  if (!source) {
+    throw new Error(`Capture not found: ${options.id}`);
+  }
+  const clippedDurationMs = Math.max(
+    500,
+    Math.round(options.endMs) - Math.round(options.startMs)
+  );
+  const fullDurationMs = Math.max(clippedDurationMs, source.durationMs ?? 30_000);
+  const proportionalBytes = Math.max(
+    64 * 1024,
+    Math.round(source.sizeBytes * (clippedDurationMs / fullDurationMs))
+  );
+  const estimatedBytes = options.targetMaxMb
+    ? Math.min(proportionalBytes, Math.round(options.targetMaxMb * 1024 * 1024 * 0.92))
+    : proportionalBytes;
+  const trimmedId = `trim-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
+  const trimmed: CaptureRecord = {
+    ...source,
+    id: trimmedId,
+    filePath: source.filePath.replace(/\.mp4$/i, "") + `_trim_${trimmedId.slice(-4)}.mp4`,
+    sizeBytes: estimatedBytes,
+    durationMs: clippedDurationMs,
+    createdAt: new Date().toISOString(),
+    queuedDeleteAt: null,
   };
-}
-
-export async function enforceStoragePoliciesNow(): Promise<StorageStatusSummary> {
-  if (isTauriRuntime()) {
-    return invoke<StorageStatusSummary>("enforce_storage_policies_now");
+  if (options.replaceOriginal) {
+    mockCaptures = mockCaptures.filter((c) => c.id !== source.id);
   }
-  return getStorageStatusPreview();
-}
-
-export async function runOcrBackfillNow(): Promise<number> {
-  if (isTauriRuntime()) {
-    return invoke<number>("run_ocr_backfill_now");
-  }
-  return 0;
-}
-
-export async function semanticVisualSearch(
-  query: string,
-  limit = 200
-): Promise<CaptureRecord[]> {
-  if (isTauriRuntime()) {
-    return invoke<CaptureRecord[]>("semantic_visual_search", { query, limit });
-  }
-  ensureMockSeed();
-  const q = query.trim().toLowerCase();
-  if (!q) return [];
-  return mockCaptures
-    .filter((c) => {
-      if (c.queuedDeleteAt) return false;
-      const hay = `${c.sourceApp || ""} ${c.ocrText} ${c.tags.join(" ")} ${c.groupName}`.toLowerCase();
-      return hay.includes(q) || q.includes("dark") || q.includes("neon") || q.includes("ui");
-    })
-    .slice(0, limit);
-}
-
-export async function findSimilarCaptures(
-  captureId: string,
-  limit = 50
-): Promise<CaptureRecord[]> {
-  if (isTauriRuntime()) {
-    return invoke<CaptureRecord[]>("find_similar_captures", { captureId, limit });
-  }
-  ensureMockSeed();
-  const active = mockCaptures.filter((c) => !c.queuedDeleteAt);
-  const target = active.find((c) => c.id === captureId);
-  if (!target) return active.slice(0, limit);
-  return [target, ...active.filter((c) => c.id !== captureId)].slice(0, limit);
-}
-
-export async function getVisualSearchStatus(): Promise<VisualSearchStatus> {
-  if (isTauriRuntime()) {
-    return invoke<VisualSearchStatus>("get_visual_search_status");
-  }
-  ensureMockSeed();
-  const activeCount = mockCaptures.filter((c) => !c.queuedDeleteAt).length;
-  return {
-    enabled: mockSettings.aiVisualSearchEnabled ?? true,
-    modelVersion: "rv-vis-512-v1",
-    embeddingDim: 512,
-    bytesPerImage: 512,
-    indexedCount: activeCount,
-    unindexedCount: 0,
-    totalEmbeddingBytes: activeCount * 512,
-    modelLoadedInRam: false,
-    idleUnloadSeconds: 60,
-    secondsUntilUnload: null,
-  };
-}
-
-export async function runVisualIndexingNow(): Promise<number> {
-  if (isTauriRuntime()) {
-    return invoke<number>("run_visual_indexing_now");
-  }
-  ensureMockSeed();
-  return mockCaptures.length;
-}
-
-export async function unloadVisualModelNow(): Promise<void> {
-  if (isTauriRuntime()) {
-    return invoke<void>("unload_visual_model_now");
-  }
+  mockCaptures = [trimmed, ...mockCaptures];
+  return trimmed;
 }
 
 export async function deleteCaptures(ids: string[]): Promise<number> {

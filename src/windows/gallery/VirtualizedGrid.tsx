@@ -431,19 +431,6 @@ export const VirtualizedGrid: React.FC<VirtualizedGridProps> = ({
                         >
                           <Maximize2 className="w-3.5 h-3.5" />
                         </button>
-                        {!item.queuedDeleteAt && onFindSimilar && (
-                          <button
-                            type="button"
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              onFindSimilar(item);
-                            }}
-                            title="Find Visually Similar Captures (512-d AI Cosine Similarity)"
-                            className="btn btn-xs btn-square bg-base-100/85 hover:btn-accent shadow"
-                          >
-                            <Sparkles className="w-3.5 h-3.5" />
-                          </button>
-                        )}
                         <button
                           type="button"
                           onClick={(e) => {
