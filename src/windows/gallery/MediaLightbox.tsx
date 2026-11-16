@@ -8,6 +8,7 @@ import {
   Pin,
   Plus,
   RotateCcw,
+  Sparkles,
   Tag,
   Trash2,
   X,
@@ -27,6 +28,7 @@ interface MediaLightboxProps {
   onDelete: (id: string) => void;
   onAddTag: (captureId: string, tag: string) => Promise<void>;
   onRestoreQueued?: (id: string, alsoPin?: boolean) => void;
+  onFindSimilar?: (capture: CaptureRecord) => void;
 }
 
 export const MediaLightbox: React.FC<MediaLightboxProps> = ({
@@ -36,6 +38,7 @@ export const MediaLightbox: React.FC<MediaLightboxProps> = ({
   onDelete,
   onAddTag,
   onRestoreQueued,
+  onFindSimilar,
 }) => {
   const [newTag, setNewTag] = useState("");
   const [copied, setCopied] = useState(false);
@@ -279,6 +282,17 @@ export const MediaLightbox: React.FC<MediaLightboxProps> = ({
               <FolderOpen className="w-4 h-4 text-secondary" />
               Open in File Explorer / Finder
             </button>
+
+            {!capture.queuedDeleteAt && onFindSimilar && (
+              <button
+                type="button"
+                onClick={() => onFindSimilar(capture)}
+                className="btn btn-sm btn-soft btn-accent w-full gap-2"
+              >
+                <Sparkles className="w-4 h-4" />
+                Find Visually Similar (512-d AI)
+              </button>
+            )}
 
             <div className="grid grid-cols-2 gap-2">
               <button

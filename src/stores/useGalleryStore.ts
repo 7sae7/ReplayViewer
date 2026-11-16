@@ -12,11 +12,13 @@ import {
   batchAddTags,
   batchSetGroup,
   deleteCaptures,
+  findSimilarCaptures,
   listCaptures,
   moveCapturesToFolder,
   reconcileOrphanedCaptures,
   restoreQueuedCaptures,
   seedSyntheticBenchmarkItems,
+  semanticVisualSearch,
   togglePinCapture,
 } from "../lib/tauri-client";
 
@@ -29,8 +31,10 @@ interface GalleryState {
   queuedDeletionBytes: number;
   isLoading: boolean;
 
-  // Filters & Sorting
+  // Filters, Sorting & Smart AI Visual Search
   searchQuery: string;
+  visualSearchMode: boolean;
+  similarToCapture: CaptureRecord | null;
   mediaTypeFilter: MediaType | undefined;
   onlyPinned: boolean;
   onlyRecentClipboard: boolean;
@@ -50,6 +54,9 @@ interface GalleryState {
   // Actions
   fetchCaptures: () => Promise<void>;
   setSearchQuery: (query: string) => Promise<void>;
+  setVisualSearchMode: (enabled: boolean) => Promise<void>;
+  findSimilar: (capture: CaptureRecord) => Promise<void>;
+  clearSimilarFilter: () => Promise<void>;
   setMediaTypeFilter: (mediaType: MediaType | undefined) => Promise<void>;
   setOnlyPinned: (onlyPinned: boolean) => Promise<void>;
   setOnlyRecentClipboard: (onlyRecentClipboard: boolean) => Promise<void>;
@@ -89,6 +96,8 @@ export const useGalleryStore = create<GalleryState>((set, get) => ({
   queuedDeletionBytes: 0,
   isLoading: false,
   searchQuery: "",
+  visualSearchMode: false,
+  similarToCapture: null,
   mediaTypeFilter: undefined,
   onlyPinned: false,
   onlyRecentClipboard: false,
@@ -108,7 +117,9 @@ export const useGalleryStore = create<GalleryState>((set, get) => ({
     try {
       const state = get();
       const filter: GalleryFilter = {
-        searchQuery: state.searchQuery || undefined,
+        searchQuery: state.visualSearchMode
+          ? undefined
+          : state.searchQuery || undefined,
         mediaType: state.mediaTypeFilter,
         onlyPinned: state.onlyPinned,
         onlyRecentClipboard: state.onlyRecentClipboard,
@@ -120,15 +131,27 @@ export const useGalleryStore = create<GalleryState>((set, get) => ({
         sortDir: state.sortDir,
       };
       const result = await listCaptures(null, 5000, filter);
+
+      let displayItems = result.items;
+      if (state.similarToCapture && !state.onlyQueuedDeletion) {
+        displayItems = await findSimilarCaptures(state.similarToCapture.id, 100);
+      } else if (
+        state.visualSearchMode &&
+        state.searchQuery.trim().length > 0 &&
+        !state.onlyQueuedDeletion
+      ) {
+        displayItems = await semanticVisualSearch(state.searchQuery.trim(), 200);
+      }
+
       set((prev) => ({
-        items: result.items,
+        items: displayItems,
         groups: result.groups || [],
         totalCount: result.totalCount,
         totalBytes: result.totalBytes,
         queuedDeletionCount: result.queuedDeletionCount ?? 0,
         queuedDeletionBytes: result.queuedDeletionBytes ?? 0,
         selectedCapture: prev.selectedCapture
-          ? result.items.find((i) => i.id === prev.selectedCapture?.id) ?? prev.selectedCapture
+          ? displayItems.find((i) => i.id === prev.selectedCapture?.id) ?? prev.selectedCapture
           : null,
         isLoading: false,
       }));
@@ -139,7 +162,28 @@ export const useGalleryStore = create<GalleryState>((set, get) => ({
   },
 
   setSearchQuery: async (searchQuery) => {
-    set({ searchQuery });
+    set({ searchQuery, similarToCapture: null });
+    await get().fetchCaptures();
+  },
+
+  setVisualSearchMode: async (visualSearchMode) => {
+    set({ visualSearchMode, similarToCapture: null });
+    await get().fetchCaptures();
+  },
+
+  findSimilar: async (capture) => {
+    set({
+      similarToCapture: capture,
+      onlyQueuedDeletion: false,
+      onlyPinned: false,
+      onlyRecentClipboard: false,
+      selectedCapture: null,
+    });
+    await get().fetchCaptures();
+  },
+
+  clearSimilarFilter: async () => {
+    set({ similarToCapture: null });
     await get().fetchCaptures();
   },
 

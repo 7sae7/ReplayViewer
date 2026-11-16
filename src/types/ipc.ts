@@ -72,6 +72,19 @@ export interface StorageStatusSummary {
   pendingOcrCount: number;
 }
 
+export interface VisualSearchStatus {
+  enabled: boolean;
+  modelVersion: string;
+  embeddingDim: number;
+  bytesPerImage: number;
+  indexedCount: number;
+  unindexedCount: number;
+  totalEmbeddingBytes: number;
+  modelLoadedInRam: boolean;
+  idleUnloadSeconds: number;
+  secondsUntilUnload: number | null;
+}
+
 export interface UnindexedScanResult {
   folderPath: string;
   count: number;
@@ -116,6 +129,8 @@ export interface SettingsPayload {
   maxStorageGb: number;
   autoCleanupDays: number;
   clipboardMaxItems: number;
+  clipboardExcludedApps?: string[];
+  aiVisualSearchEnabled?: boolean;
   launchOnStartup: boolean;
   capturesDir: string;
 }

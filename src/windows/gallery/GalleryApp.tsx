@@ -83,6 +83,8 @@ export const GalleryApp: React.FC<GalleryAppProps> = ({
     queuedDeletionCount,
     queuedDeletionBytes,
     searchQuery,
+    visualSearchMode,
+    similarToCapture,
     mediaTypeFilter,
     onlyPinned,
     onlyRecentClipboard,
@@ -97,6 +99,9 @@ export const GalleryApp: React.FC<GalleryAppProps> = ({
     lastReconciledCount,
     fetchCaptures,
     setSearchQuery,
+    setVisualSearchMode,
+    findSimilar,
+    clearSimilarFilter,
     setMediaTypeFilter,
     setOnlyPinned,
     setOnlyRecentClipboard,
@@ -409,16 +414,28 @@ export const GalleryApp: React.FC<GalleryAppProps> = ({
           </div>
         </div>
 
-        {/* Instant FTS5 Search Input */}
+        {/* Instant FTS5 + Smart AI 512-d Visual Search Input */}
         {activeTab === "gallery" && (
-          <div className="flex-1 max-w-md min-w-[200px] mx-auto">
-            <label className="input input-xs input-bordered flex items-center gap-2 w-full bg-base-100 h-8">
-              <Search className="w-3.5 h-3.5 opacity-60" />
+          <div className="flex-1 max-w-lg min-w-[220px] mx-auto flex items-center gap-1.5">
+            <label
+              className={`input input-xs input-bordered flex items-center gap-2 w-full bg-base-100 h-8 ${
+                visualSearchMode ? "border-accent ring-1 ring-accent/40" : ""
+              }`}
+            >
+              {visualSearchMode ? (
+                <Sparkles className="w-3.5 h-3.5 text-accent shrink-0" />
+              ) : (
+                <Search className="w-3.5 h-3.5 opacity-60 shrink-0" />
+              )}
               <input
                 type="text"
                 value={searchQuery}
                 onChange={(e) => setSearchQuery(e.target.value)}
-                placeholder="Instant FTS5 search by app, #tag, group, or OCR text..."
+                placeholder={
+                  visualSearchMode
+                    ? "Smart AI Visual Search (e.g. cat, sunset, dark code, purple neon, chart)..."
+                    : "Instant FTS5 search by app, #tag, group, or OCR text..."
+                }
                 className="grow text-xs"
               />
               {searchQuery && (
@@ -431,6 +448,19 @@ export const GalleryApp: React.FC<GalleryAppProps> = ({
                 </button>
               )}
             </label>
+            <button
+              type="button"
+              onClick={() => setVisualSearchMode(!visualSearchMode)}
+              title="Toggle Smart AI Visual Search (512-d vector cosine similarity across colors, edges, and visual concepts)"
+              className={`btn btn-xs h-8 px-2.5 gap-1 shrink-0 ${
+                visualSearchMode
+                  ? "btn-accent font-bold shadow-sm"
+                  : "btn-outline border-base-300 bg-base-100"
+              }`}
+            >
+              <Sparkles className="w-3.5 h-3.5" />
+              AI Visual
+            </button>
           </div>
         )}
 
@@ -754,6 +784,32 @@ export const GalleryApp: React.FC<GalleryAppProps> = ({
               +500 Benchmark
             </button>
           </div>
+        </div>
+      )}
+
+      {/* Visually Similar Captures Filter Banner (Milestone 2.0.5) */}
+      {activeTab === "gallery" && similarToCapture && !onlyQueuedDeletion && (
+        <div className="flex flex-wrap items-center justify-between gap-3 px-6 py-2 bg-accent/15 border-b border-accent/40 text-xs">
+          <div className="flex items-center gap-2">
+            <Sparkles className="w-4 h-4 text-accent shrink-0" />
+            <span>
+              Showing captures visually similar to{" "}
+              <strong className="text-base-content">
+                {similarToCapture.sourceApp || "selected capture"}
+              </strong>{" "}
+              <span className="text-base-content/70 font-mono text-[11px]">
+                (Ranked by 512-d INT8 Vector Cosine Similarity)
+              </span>
+            </span>
+          </div>
+          <button
+            type="button"
+            onClick={clearSimilarFilter}
+            className="btn btn-xs btn-ghost gap-1"
+          >
+            <X className="w-3.5 h-3.5" />
+            Clear Visual Similarity Filter
+          </button>
         </div>
       )}
 
@@ -1139,6 +1195,7 @@ export const GalleryApp: React.FC<GalleryAppProps> = ({
           onTogglePin={togglePin}
           onDelete={(id) => removeCaptures([id])}
           onRestoreQueued={handleRestoreQueued}
+          onFindSimilar={(cap) => findSimilar(cap)}
           onCopied={() => fetchCaptures()}
         />
       ) : (
@@ -1154,6 +1211,7 @@ export const GalleryApp: React.FC<GalleryAppProps> = ({
           onDelete={(id) => removeCaptures([id])}
           onAddTag={addTag}
           onRestoreQueued={handleRestoreQueued}
+          onFindSimilar={(cap) => findSimilar(cap)}
         />
       )}
     </div>

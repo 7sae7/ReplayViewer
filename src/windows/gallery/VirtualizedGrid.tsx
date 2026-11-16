@@ -11,6 +11,7 @@ import {
   Maximize2,
   Pin,
   RotateCcw,
+  Sparkles,
   Trash2,
 } from "lucide-react";
 import type { CaptureRecord } from "../../types/ipc";
@@ -31,6 +32,7 @@ interface VirtualizedGridProps {
   onTogglePin: (id: string, currentPinned: boolean) => void;
   onDelete: (id: string) => void;
   onRestoreQueued?: (id: string, alsoPin?: boolean) => void;
+  onFindSimilar?: (capture: CaptureRecord) => void;
   onCopied?: () => void;
 }
 
@@ -51,6 +53,7 @@ export const VirtualizedGrid: React.FC<VirtualizedGridProps> = ({
   onTogglePin,
   onDelete,
   onRestoreQueued,
+  onFindSimilar,
   onCopied,
 }) => {
   const parentRef = useRef<HTMLDivElement | null>(null);
@@ -426,6 +429,19 @@ export const VirtualizedGrid: React.FC<VirtualizedGridProps> = ({
                         >
                           <Maximize2 className="w-3.5 h-3.5" />
                         </button>
+                        {!item.queuedDeleteAt && onFindSimilar && (
+                          <button
+                            type="button"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              onFindSimilar(item);
+                            }}
+                            title="Find Visually Similar Captures (512-d AI Cosine Similarity)"
+                            className="btn btn-xs btn-square bg-base-100/85 hover:btn-accent shadow"
+                          >
+                            <Sparkles className="w-3.5 h-3.5" />
+                          </button>
+                        )}
                         <button
                           type="button"
                           onClick={(e) => {

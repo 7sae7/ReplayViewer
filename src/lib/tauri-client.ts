@@ -8,6 +8,7 @@ import type {
   SettingsPayload,
   StorageStatusSummary,
   UnindexedScanResult,
+  VisualSearchStatus,
 } from "../types/ipc";
 
 export function isTauriRuntime(): boolean {
@@ -186,6 +187,22 @@ let mockSettings: SettingsPayload = {
   maxStorageGb: 10,
   autoCleanupDays: 0,
   clipboardMaxItems: 10,
+  clipboardExcludedApps: [
+    "1password",
+    "bitwarden",
+    "keepass",
+    "keepassxc",
+    "dashlane",
+    "lastpass",
+    "nordpass",
+    "protonpass",
+    "enpass",
+    "inprivate",
+    "incognito",
+    "private browsing",
+    "tor browser",
+  ],
+  aiVisualSearchEnabled: true,
   launchOnStartup: false,
   capturesDir: "C:\\Users\\shawp\\Desktop\\ReplayViewer\\captures",
 };
@@ -527,6 +544,73 @@ export async function runOcrBackfillNow(): Promise<number> {
     return invoke<number>("run_ocr_backfill_now");
   }
   return 0;
+}
+
+export async function semanticVisualSearch(
+  query: string,
+  limit = 200
+): Promise<CaptureRecord[]> {
+  if (isTauriRuntime()) {
+    return invoke<CaptureRecord[]>("semantic_visual_search", { query, limit });
+  }
+  ensureMockSeed();
+  const q = query.trim().toLowerCase();
+  if (!q) return [];
+  return mockCaptures
+    .filter((c) => {
+      if (c.queuedDeleteAt) return false;
+      const hay = `${c.sourceApp || ""} ${c.ocrText} ${c.tags.join(" ")} ${c.groupName}`.toLowerCase();
+      return hay.includes(q) || q.includes("dark") || q.includes("neon") || q.includes("ui");
+    })
+    .slice(0, limit);
+}
+
+export async function findSimilarCaptures(
+  captureId: string,
+  limit = 50
+): Promise<CaptureRecord[]> {
+  if (isTauriRuntime()) {
+    return invoke<CaptureRecord[]>("find_similar_captures", { captureId, limit });
+  }
+  ensureMockSeed();
+  const active = mockCaptures.filter((c) => !c.queuedDeleteAt);
+  const target = active.find((c) => c.id === captureId);
+  if (!target) return active.slice(0, limit);
+  return [target, ...active.filter((c) => c.id !== captureId)].slice(0, limit);
+}
+
+export async function getVisualSearchStatus(): Promise<VisualSearchStatus> {
+  if (isTauriRuntime()) {
+    return invoke<VisualSearchStatus>("get_visual_search_status");
+  }
+  ensureMockSeed();
+  const activeCount = mockCaptures.filter((c) => !c.queuedDeleteAt).length;
+  return {
+    enabled: mockSettings.aiVisualSearchEnabled ?? true,
+    modelVersion: "rv-vis-512-v1",
+    embeddingDim: 512,
+    bytesPerImage: 512,
+    indexedCount: activeCount,
+    unindexedCount: 0,
+    totalEmbeddingBytes: activeCount * 512,
+    modelLoadedInRam: false,
+    idleUnloadSeconds: 60,
+    secondsUntilUnload: null,
+  };
+}
+
+export async function runVisualIndexingNow(): Promise<number> {
+  if (isTauriRuntime()) {
+    return invoke<number>("run_visual_indexing_now");
+  }
+  ensureMockSeed();
+  return mockCaptures.length;
+}
+
+export async function unloadVisualModelNow(): Promise<void> {
+  if (isTauriRuntime()) {
+    return invoke<void>("unload_visual_model_now");
+  }
 }
 
 export async function deleteCaptures(ids: string[]): Promise<number> {

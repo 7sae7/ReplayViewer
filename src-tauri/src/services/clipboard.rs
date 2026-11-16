@@ -278,10 +278,14 @@ pub fn save_or_update_annotated_clipboard_item(
     Ok(())
 }
 
-/// Checks Windows OS clipboard privacy markers (`ExcludeClipboardContentFromMonitorProcessing`)
-/// so copies marked private by password managers or sensitive apps are ignored.
+/// Checks Windows OS clipboard privacy markers:
+/// 1. `ExcludeClipboardContentFromMonitorProcessing` (any presence = private)
+/// 2. `CanIncludeInClipboardHistory` (DWORD == 0 = excluded from clipboard history by 1Password, Bitwarden, KeePassXC, InPrivate/Incognito)
+/// 3. `CanUploadToCloudClipboard` (DWORD == 0 = excluded from cloud/history clipboard)
 #[cfg(target_os = "windows")]
 fn is_clipboard_marked_private() -> bool {
+    use clipboard_win::{formats, Getter};
+
     if let Some(fmt) =
         clipboard_win::raw::register_format("ExcludeClipboardContentFromMonitorProcessing")
     {
@@ -289,7 +293,128 @@ fn is_clipboard_marked_private() -> bool {
             return true;
         }
     }
+
+    for fmt_name in ["CanIncludeInClipboardHistory", "CanUploadToCloudClipboard"] {
+        if let Some(fmt) = clipboard_win::raw::register_format(fmt_name) {
+            if clipboard_win::raw::is_format_avail(fmt.get()) {
+                let mut buf = Vec::new();
+                if formats::RawData(fmt.get()).read_clipboard(&mut buf).is_ok() {
+                    if buf.len() >= 4 {
+                        let val = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+                        if val == 0 {
+                            return true;
+                        }
+                    } else if buf.first().copied() == Some(0) {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+
     false
+}
+
+/// Inspects a Windows `HWND` to retrieve its window title and owning process executable name
+/// (e.g., `"1password.exe | 1Password - Vault"` or `"msedge.exe | Sign In - InPrivate - Microsoft Edge"`).
+#[cfg(target_os = "windows")]
+fn inspect_hwnd_title_and_process(
+    hwnd: windows::Win32::Foundation::HWND,
+) -> String {
+    use windows::core::PWSTR;
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Threading::{
+        OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
+        PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::{GetWindowTextW, GetWindowThreadProcessId};
+
+    if hwnd.0.is_null() {
+        return String::new();
+    }
+
+    let mut title_buf = [0u16; 512];
+    let title_len = unsafe { GetWindowTextW(hwnd, &mut title_buf) };
+    let title = if title_len > 0 {
+        String::from_utf16_lossy(&title_buf[..title_len as usize])
+    } else {
+        String::new()
+    };
+
+    let mut pid: u32 = 0;
+    unsafe {
+        GetWindowThreadProcessId(hwnd, Some(&mut pid));
+    }
+
+    let mut exe_name = String::new();
+    if pid != 0 {
+        if let Ok(proc_handle) =
+            unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }
+        {
+            let mut path_buf = [0u16; 512];
+            let mut size = path_buf.len() as u32;
+            if unsafe {
+                QueryFullProcessImageNameW(
+                    proc_handle,
+                    PROCESS_NAME_WIN32,
+                    PWSTR(path_buf.as_mut_ptr()),
+                    &mut size,
+                )
+            }
+            .is_ok()
+                && size > 0
+            {
+                let full_path = String::from_utf16_lossy(&path_buf[..size as usize]);
+                exe_name = std::path::Path::new(&full_path)
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or(full_path);
+            }
+            let _ = unsafe { CloseHandle(proc_handle) };
+        }
+    }
+
+    format!("{} {}", exe_name, title).trim().to_string()
+}
+
+/// Returns foreground window process executable + window title context for Excluded Apps blocklist matching.
+#[cfg(target_os = "windows")]
+fn get_active_clipboard_source_context() -> String {
+    use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
+
+    let fg_hwnd = unsafe { GetForegroundWindow() };
+    inspect_hwnd_title_and_process(fg_hwnd)
+}
+
+/// Checks whether the active application / window context matches any entry in the user's
+/// Excluded Apps & Window Titles blocklist (e.g. `1password`, `bitwarden`, `keepass`, `incognito`, `inprivate`).
+pub fn is_source_app_excluded(excluded_rules: &[String], source_context: &str) -> bool {
+    let haystack = source_context.trim().to_lowercase();
+    if haystack.is_empty() {
+        return false;
+    }
+    for rule in excluded_rules {
+        let needle = rule.trim().to_lowercase();
+        if !needle.is_empty() && haystack.contains(&needle) {
+            return true;
+        }
+    }
+    false
+}
+
+fn load_excluded_apps_from_db(app: &AppHandle) -> Vec<String> {
+    let state: tauri::State<'_, AppState> = app.state();
+    let Ok(conn) = state.db.lock() else {
+        return crate::commands::settings_cmds::default_excluded_apps();
+    };
+    conn.query_row(
+        "SELECT value FROM settings WHERE key = 'clipboard_excluded_apps'",
+        [],
+        |r| r.get::<_, String>(0),
+    )
+    .ok()
+    .and_then(|v| serde_json::from_str::<Vec<String>>(&v).ok())
+    .unwrap_or_else(crate::commands::settings_cmds::default_excluded_apps)
 }
 
 /// Waits for the Windows clipboard sequence number to settle after an initial change.
@@ -496,6 +621,13 @@ pub fn spawn_clipboard_watcher(app: AppHandle) {
                 }
                 last_seq_num = wait_for_clipboard_settle(current_seq);
 
+                // Phase 2.0.4: Check Excluded Apps & Window Titles Blocklist before reading clipboard
+                let excluded_rules = load_excluded_apps_from_db(&app);
+                let source_ctx = get_active_clipboard_source_context();
+                if is_source_app_excluded(&excluded_rules, &source_ctx) {
+                    continue;
+                }
+
                 if let Some((rgba_bytes, width, height, raw_png)) =
                     read_windows_clipboard_unlocked()
                 {
@@ -545,4 +677,38 @@ pub fn resolve_editable_clipboard_image_path(item: &ClipboardItem) -> &str {
         }
     }
     item.file_path.as_str()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_excluded_apps_and_private_window_blocklist() {
+        let rules = crate::commands::settings_cmds::default_excluded_apps();
+        assert!(is_source_app_excluded(
+            &rules,
+            "1Password.exe 1Password - Personal Vault"
+        ));
+        assert!(is_source_app_excluded(
+            &rules,
+            "Bitwarden.exe Bitwarden Password Manager"
+        ));
+        assert!(is_source_app_excluded(
+            &rules,
+            "KeePassXC.exe Passwords.kdbx - KeePassXC"
+        ));
+        assert!(is_source_app_excluded(
+            &rules,
+            "chrome.exe Bank Login - Google Chrome (Incognito)"
+        ));
+        assert!(is_source_app_excluded(
+            &rules,
+            "msedge.exe Secret - InPrivate - Microsoft Edge"
+        ));
+        assert!(!is_source_app_excluded(
+            &rules,
+            "Discord.exe #general - Discord"
+        ));
+    }
 }

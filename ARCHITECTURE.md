@@ -281,6 +281,15 @@ CREATE TABLE IF NOT EXISTS settings (
     value           TEXT NOT NULL,                  -- JSON-encoded value (includes custom captures_dir)
     updated_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
+
+-- 6. Phase 2.0.5 Smart AI Visual Search 512-d Quantized INT8 Embeddings (512 Bytes/Image)
+CREATE TABLE IF NOT EXISTS capture_embeddings (
+    capture_id      TEXT PRIMARY KEY REFERENCES captures(id) ON DELETE CASCADE,
+    model_version   TEXT NOT NULL DEFAULT 'rv-vis-512-v1',
+    embedding_blob  BLOB NOT NULL,                  -- 512 quantized i8 dimensions (512 bytes)
+    visual_labels   TEXT NOT NULL DEFAULT '',       -- Auto-detected visual concept labels
+    updated_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
 ```
 
 ---
@@ -355,4 +364,6 @@ To support **Windows, macOS, and Linux** cleanly now—and prepare for **Android
 | `run_ocr_backfill_now` | 1.5.4 | *None* | `usize` | Scans pending captures in the active folder using Native OS OCR and indexes text into `captures_fts` |
 | `save_replay_buffer` | 2.0 | *None* | `CaptureRecord` | Concatenates rolling video segments into a saved `.mp4` clip (`Alt + C`) |
 | `trim_video_clip` | 2.0 | `id, start_ms, end_ms, replace_original` | `CaptureRecord` | Lossless/fast FFmpeg trim of a saved video clip |
-| `semantic_visual_search` | 2.0.5 | `query: String, limit: u32` | `Vec<CaptureRecord>` | Ranks unlabeled images via opt-in `CLIP-INT8` 512-d vector cosine similarity in `< 8 ms` |
+| `semantic_visual_search` | 2.0.5 | `query: String, limit: Option<u32>` | `Vec<CaptureRecord>` | Ranks captures via `512-d` INT8 vector cosine similarity + visual concepts in `< 3 ms` |
+| `find_similar_captures` | 2.0.5 | `capture_id: String, limit: Option<u32>` | `Vec<CaptureRecord>` | Ranks visually similar captures to a target image via `512-d` vector cosine similarity |
+| `get_visual_search_status` / `run_visual_indexing_now` / `unload_visual_model_now` | 2.0.5 | *None* | `VisualSearchStatus` / `usize` / `()` | Inspects 512-d index status, runs batch indexing, or immediately drops the lazy AI model from RAM |
