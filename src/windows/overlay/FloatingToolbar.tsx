@@ -2,7 +2,9 @@ import React from "react";
 import {
   ArrowUpRight,
   Check,
+  Copy,
   Crop,
+  Download,
   EyeOff,
   PenTool,
   Redo2,
@@ -18,7 +20,9 @@ import type { AnnotationTool } from "../../types/ipc";
 interface FloatingToolbarProps {
   top: number;
   left: number;
-  onSave: () => void;
+  onCopyOnly: () => void;
+  onSaveOnly: () => void;
+  onCopyAndSave: () => void;
   onCancel: () => void;
 }
 
@@ -47,7 +51,9 @@ const TOOLS: { id: AnnotationTool; label: string; icon: React.ReactNode }[] = [
 export const FloatingToolbar: React.FC<FloatingToolbarProps> = ({
   top,
   left,
-  onSave,
+  onCopyOnly,
+  onSaveOnly,
+  onCopyAndSave,
   onCancel,
 }) => {
   const {
@@ -164,23 +170,47 @@ export const FloatingToolbar: React.FC<FloatingToolbarProps> = ({
 
       <div className="divider divider-horizontal mx-0 my-1" />
 
-      {/* Cancel & Save Actions */}
+      {/* Cancel, Copy (Default), Save, and Copy & Save Actions */}
       <div className="flex items-center gap-1.5">
         <button
           type="button"
           onClick={onCancel}
+          title="Cancel Capture (Esc)"
           className="btn btn-sm btn-ghost gap-1"
         >
           <X className="w-4 h-4" />
           <kbd className="kbd kbd-xs">Esc</kbd>
         </button>
+
         <button
           type="button"
-          onClick={onSave}
-          className="btn btn-sm btn-primary gap-1.5"
+          onClick={onCopyOnly}
+          title="Copy to OS Clipboard & Alt+V ring without saving a file to disk (Ctrl+C / Cmd+C)"
+          className="btn btn-sm btn-primary gap-1.5 shadow"
         >
-          <Check className="w-4 h-4" />
-          Copy & Save
+          <Copy className="w-3.5 h-3.5" />
+          Copy
+          <kbd className="kbd kbd-xs text-base-content">Ctrl+C</kbd>
+        </button>
+
+        <button
+          type="button"
+          onClick={onSaveOnly}
+          title="Save file to Gallery folder on PC without overwriting your clipboard"
+          className="btn btn-sm btn-neutral gap-1.5"
+        >
+          <Download className="w-3.5 h-3.5" />
+          Save
+        </button>
+
+        <button
+          type="button"
+          onClick={onCopyAndSave}
+          title="Copy to Clipboard AND save file to Gallery folder on PC (Enter)"
+          className="btn btn-sm btn-success gap-1.5"
+        >
+          <Check className="w-3.5 h-3.5" />
+          Copy &amp; Save
           <kbd className="kbd kbd-xs text-base-content">Enter</kbd>
         </button>
       </div>

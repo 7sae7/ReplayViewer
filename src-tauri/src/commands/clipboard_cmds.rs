@@ -252,9 +252,11 @@ pub fn promote_clipboard_to_gallery(
         duration_ms: None,
         source_app: Some("Visual Clipboard (Alt + V)".to_string()),
         ocr_text: String::new(),
+        ocr_status: "pending".to_string(),
         is_pinned: item.is_pinned,
         group_name: String::new(),
         last_copied_at: Some(item.copied_at),
+        queued_delete_at: None,
         tags: vec!["clipboard".to_string()],
         created_at: now_iso,
     };
@@ -268,6 +270,11 @@ pub fn promote_clipboard_to_gallery(
     }
 
     let _ = app.emit("gallery:updated", &record);
+    crate::services::ocr::spawn_background_ocr_and_storage_check(
+        app,
+        record.id.clone(),
+        record.file_path.clone(),
+    );
     Ok(record)
 }
 

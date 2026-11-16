@@ -1,7 +1,23 @@
 import React, { useState } from "react";
-import { Copy, FolderOpen, Pin, Plus, Tag, Trash2, X } from "lucide-react";
+import {
+  Check,
+  Clock,
+  Copy,
+  FileText,
+  FolderOpen,
+  Pin,
+  Plus,
+  RotateCcw,
+  Tag,
+  Trash2,
+  X,
+} from "lucide-react";
 import type { CaptureRecord } from "../../types/ipc";
-import { formatBytes } from "../../lib/dpi";
+import {
+  formatBytes,
+  formatDeletionCountdown,
+  formatDurationMs,
+} from "../../lib/dpi";
 import {
   copyCaptureToClipboard,
   openInFileExplorer,
@@ -14,6 +30,7 @@ interface MediaLightboxProps {
   onTogglePin: (id: string, currentPinned: boolean) => void;
   onDelete: (id: string) => void;
   onAddTag: (captureId: string, tag: string) => Promise<void>;
+  onRestoreQueued?: (id: string, alsoPin?: boolean) => void;
 }
 
 export const MediaLightbox: React.FC<MediaLightboxProps> = ({
@@ -22,9 +39,11 @@ export const MediaLightbox: React.FC<MediaLightboxProps> = ({
   onTogglePin,
   onDelete,
   onAddTag,
+  onRestoreQueued,
 }) => {
   const [newTag, setNewTag] = useState("");
   const [copied, setCopied] = useState(false);
+  const [copiedOcr, setCopiedOcr] = useState(false);
 
   const handleAddTag = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -39,6 +58,17 @@ export const MediaLightbox: React.FC<MediaLightboxProps> = ({
     setTimeout(() => setCopied(false), 1500);
   };
 
+  const handleCopyOcrText = async () => {
+    if (!capture.ocrText) return;
+    try {
+      await navigator.clipboard.writeText(capture.ocrText);
+      setCopiedOcr(true);
+      setTimeout(() => setCopiedOcr(false), 1500);
+    } catch {
+      // Ignore if clipboard API blocked
+    }
+  };
+
   const handleOpenExplorer = async () => {
     await openInFileExplorer(capture.filePath);
   };
@@ -49,17 +79,27 @@ export const MediaLightbox: React.FC<MediaLightboxProps> = ({
         className="modal-box max-w-6xl p-0 bg-base-100 border border-base-300 shadow-2xl overflow-hidden flex flex-col lg:flex-row max-h-[90vh]"
         onClick={(e) => e.stopPropagation()}
       >
-        {/* Full-Resolution Image Canvas View */}
+        {/* Full-Resolution Image or Native HTML5 Video Player */}
         <div className="flex-1 bg-base-300 flex items-center justify-center p-4 min-h-[380px] overflow-hidden">
-          <img
-            src={resolveMediaSrc(capture.filePath)}
-            alt={capture.sourceApp || "Capture"}
-            className="max-w-full max-h-[78vh] object-contain rounded-lg shadow-lg"
-          />
+          {capture.mediaType === "video" ? (
+            <video
+              src={resolveMediaSrc(capture.filePath)}
+              poster={resolveMediaSrc(capture.thumbPath)}
+              controls
+              autoPlay
+              className="max-w-full max-h-[78vh] rounded-lg shadow-lg bg-black"
+            />
+          ) : (
+            <img
+              src={resolveMediaSrc(capture.filePath)}
+              alt={capture.sourceApp || "Capture"}
+              className="max-w-full max-h-[78vh] object-contain rounded-lg shadow-lg"
+            />
+          )}
         </div>
 
         {/* Right Details & Actions Sidebar */}
-        <div className="w-full lg:w-84 border-t lg:border-t-0 lg:border-l border-base-300 p-5 flex flex-col justify-between bg-base-200">
+        <div className="w-full lg:w-92 border-t lg:border-t-0 lg:border-l border-base-300 p-5 flex flex-col justify-between bg-base-200 overflow-y-auto">
           <div className="space-y-4">
             <div className="flex items-start justify-between gap-2">
               <div>
@@ -79,6 +119,45 @@ export const MediaLightbox: React.FC<MediaLightboxProps> = ({
               </button>
             </div>
 
+            {/* Queued Deletion 3-Day Grace Period Banner */}
+            {capture.queuedDeleteAt && (
+              <div
+                role="alert"
+                className="alert alert-warning alert-soft border border-warning/40 p-3 flex flex-col items-start gap-2 text-xs"
+              >
+                <div className="flex items-center gap-1.5 font-bold text-warning">
+                  <Clock className="w-4 h-4 shrink-0" />
+                  <span>
+                    Queued for Auto-Deletion (
+                    {formatDeletionCountdown(capture.queuedDeleteAt).countdown})
+                  </span>
+                </div>
+                <p className="text-[11px] text-base-content/80 font-mono">
+                  Deletes: {new Date(capture.queuedDeleteAt).toLocaleString()}
+                </p>
+                {onRestoreQueued && (
+                  <div className="flex items-center gap-1.5 w-full pt-1">
+                    <button
+                      type="button"
+                      onClick={() => onRestoreQueued(capture.id, false)}
+                      className="btn btn-xs btn-success flex-1 gap-1"
+                    >
+                      <RotateCcw className="w-3 h-3" />
+                      Restore
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => onRestoreQueued(capture.id, true)}
+                      className="btn btn-xs btn-warning flex-1 gap-1"
+                    >
+                      <Pin className="w-3 h-3" />
+                      Pin &amp; Restore
+                    </button>
+                  </div>
+                )}
+              </div>
+            )}
+
             {/* Specs Card */}
             <div className="card card-xs bg-base-100 border border-base-300">
               <div className="card-body grid grid-cols-2 gap-2 text-xs">
@@ -92,6 +171,9 @@ export const MediaLightbox: React.FC<MediaLightboxProps> = ({
                   <span className="text-base-content/50 block">File Size</span>
                   <span className="font-mono text-base-content font-semibold">
                     {formatBytes(capture.sizeBytes)}
+                    {capture.mediaType === "video" && capture.durationMs
+                      ? ` • ${formatDurationMs(capture.durationMs)}`
+                      : ""}
                   </span>
                 </div>
                 <div className="col-span-2 pt-2 border-t border-base-300">
@@ -149,6 +231,47 @@ export const MediaLightbox: React.FC<MediaLightboxProps> = ({
                   <Plus className="w-3.5 h-3.5" /> Add
                 </button>
               </form>
+            </div>
+
+            {/* Detected Text (Native OS OCR) Section */}
+            <div>
+              <div className="flex items-center justify-between mb-1.5">
+                <label className="text-xs font-semibold text-base-content/80 flex items-center gap-1.5">
+                  <FileText className="w-3.5 h-3.5 text-info" />
+                  Detected Text (Native OS OCR)
+                </label>
+                {capture.ocrText && (
+                  <button
+                    type="button"
+                    onClick={handleCopyOcrText}
+                    className={`btn btn-xs gap-1 h-6 min-h-0 ${
+                      copiedOcr ? "btn-success" : "btn-ghost text-info"
+                    }`}
+                  >
+                    {copiedOcr ? (
+                      <>
+                        <Check className="w-3 h-3" /> Copied Text
+                      </>
+                    ) : (
+                      <>
+                        <Copy className="w-3 h-3" /> Copy Text
+                      </>
+                    )}
+                  </button>
+                )}
+              </div>
+
+              {capture.ocrText ? (
+                <div className="p-2.5 rounded-lg bg-base-100 border border-base-300 font-mono text-[11px] text-base-content/85 max-h-28 overflow-y-auto whitespace-pre-wrap select-text">
+                  {capture.ocrText}
+                </div>
+              ) : (
+                <div className="p-2 rounded-lg bg-base-100/60 border border-base-300 text-[11px] text-base-content/50 italic">
+                  {capture.ocrStatus === "pending"
+                    ? "Background OCR scan pending..."
+                    : "No text detected in this capture."}
+                </div>
+              )}
             </div>
           </div>
 

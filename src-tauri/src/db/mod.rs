@@ -21,9 +21,11 @@ CREATE TABLE IF NOT EXISTS captures (
     duration_ms     INTEGER DEFAULT NULL,
     source_app      TEXT DEFAULT NULL,
     ocr_text        TEXT DEFAULT '',
+    ocr_status      TEXT NOT NULL DEFAULT 'pending',
     is_pinned       INTEGER NOT NULL DEFAULT 0,
     group_name      TEXT NOT NULL DEFAULT '',
     last_copied_at  TEXT DEFAULT NULL,
+    queued_delete_at TEXT DEFAULT NULL,
     created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
 
@@ -96,6 +98,18 @@ pub fn init_db(db_path: &Path) -> AppResult<Connection> {
         [],
     );
     let _ = conn.execute(
+        "ALTER TABLE captures ADD COLUMN ocr_status TEXT NOT NULL DEFAULT 'pending'",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE captures ADD COLUMN queued_delete_at TEXT DEFAULT NULL",
+        [],
+    );
+    let _ = conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_captures_queued_delete ON captures(queued_delete_at)",
+        [],
+    );
+    let _ = conn.execute(
         "ALTER TABLE clipboard_history ADD COLUMN base_file_path TEXT DEFAULT NULL",
         [],
     );
@@ -103,6 +117,7 @@ pub fn init_db(db_path: &Path) -> AppResult<Connection> {
         "ALTER TABLE clipboard_history ADD COLUMN annotations_json TEXT NOT NULL DEFAULT '[]'",
         [],
     );
+    let _ = conn.execute("DROP TABLE IF EXISTS capture_embeddings", []);
 
     seed_default_settings(&conn)?;
     Ok(conn)
@@ -118,10 +133,30 @@ fn seed_default_settings(conn: &Connection) -> AppResult<()> {
         ("hotkey_save_replay", "\"Alt+C\""),
         ("image_format", "\"webp\""),
         ("copy_to_clipboard_on_save", "true"),
-        ("max_storage_gb", "15"),
-        ("auto_cleanup_days", "30"),
+        ("max_storage_gb", "10"),
+        ("auto_cleanup_days", "0"),
         ("clipboard_max_items", "10"),
         ("clipboard_always_on_top", "true"),
+        (
+            "clipboard_excluded_apps",
+            "[\"1password\",\"bitwarden\",\"keepass\",\"keepassxc\",\"dashlane\",\"lastpass\",\"nordpass\",\"protonpass\",\"enpass\",\"inprivate\",\"incognito\",\"private browsing\",\"tor browser\"]",
+        ),
+        // Milestone 2.0.1 & 2.0.2 Defaults: 60s (1 minute) ring buffer + Auto hardware encoder + dynamic audio
+        ("replay_enabled", "true"),
+        ("replay_buffer_secs", "60"),
+        ("replay_fps", "60"),
+        ("replay_bitrate_mbps", "20"),
+        ("replay_encoder", "\"auto\""),
+        ("ffmpeg_custom_path", "\"\""),
+        ("audio_record_desktop", "true"),
+        ("audio_record_mic", "true"),
+        ("audio_desktop_volume", "1.0"),
+        ("audio_mic_volume", "1.0"),
+        ("audio_app_volumes", "{}"),
+        ("audio_mic_device_id", "\"\""),
+        ("audio_single_mix", "false"),
+        ("audio_muted_apps", "[]"),
+        ("audio_isolated_apps", "[]"),
         ("launch_on_startup", "false"),
     ];
 
@@ -131,5 +166,81 @@ fn seed_default_settings(conn: &Connection) -> AppResult<()> {
             rusqlite::params![key, value],
         )?;
     }
+
+    // One-time migration for existing databases that still had the old Phase 1.0 placeholder defaults (15 GB / 30 days)
+    let already_migrated: bool = conn
+        .query_row(
+            "SELECT 1 FROM settings WHERE key = 'v1_5_3_defaults_migrated'",
+            [],
+            |_| Ok(true),
+        )
+        .unwrap_or(false);
+
+    if !already_migrated {
+        let _ = conn.execute(
+            "UPDATE settings SET value = '10' WHERE key = 'max_storage_gb' AND value = '15'",
+            [],
+        );
+        let _ = conn.execute(
+            "UPDATE settings SET value = '0' WHERE key = 'auto_cleanup_days' AND value = '30'",
+            [],
+        );
+        let _ = conn.execute(
+            "INSERT OR IGNORE INTO settings (key, value) VALUES ('v1_5_3_defaults_migrated', 'true')",
+            [],
+        );
+    }
+
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use uuid::Uuid;
+
+    #[test]
+    fn test_legacy_v1_db_migrates_cleanly_to_v1_5() {
+        let temp_db = std::env::temp_dir().join(format!("rv_legacy_mig_{}.db", Uuid::new_v4()));
+
+        // 1. Simulate a pre-existing v1.0 database without `ocr_status` or `queued_delete_at`
+        {
+            let conn = Connection::open(&temp_db).expect("open legacy db");
+            conn.execute_batch(
+                r#"
+                CREATE TABLE captures (
+                    id              TEXT PRIMARY KEY,
+                    media_type      TEXT NOT NULL CHECK (media_type IN ('screenshot', 'video')),
+                    file_path       TEXT NOT NULL,
+                    thumb_path      TEXT NOT NULL,
+                    width           INTEGER NOT NULL,
+                    height          INTEGER NOT NULL,
+                    size_bytes      INTEGER NOT NULL,
+                    duration_ms     INTEGER DEFAULT NULL,
+                    source_app      TEXT DEFAULT NULL,
+                    ocr_text        TEXT DEFAULT '',
+                    is_pinned       INTEGER NOT NULL DEFAULT 0,
+                    created_at      TEXT NOT NULL
+                );
+                "#,
+            )
+            .expect("create legacy captures table");
+        }
+
+        // 2. Run `init_db` on the existing database — must migrate columns BEFORE creating indexes
+        let migrated_conn = init_db(&temp_db).expect("init_db should migrate legacy v1.0 database");
+
+        // 3. Verify `queued_delete_at` and `ocr_status` columns exist and are queryable
+        let count: i64 = migrated_conn
+            .query_row(
+                "SELECT COUNT(*) FROM captures WHERE queued_delete_at IS NULL AND ocr_status = 'pending'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("query migrated columns");
+        assert_eq!(count, 0);
+
+        drop(migrated_conn);
+        let _ = std::fs::remove_file(&temp_db);
+    }
 }

@@ -2,20 +2,89 @@ pub mod commands;
 pub mod db;
 pub mod error;
 pub mod services;
+pub mod single_instance;
 pub mod state;
 
+use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{atomic::AtomicBool, Mutex, RwLock};
+use std::str::FromStr;
+use std::sync::{
+    atomic::{AtomicBool, AtomicU32, Ordering},
+    Arc, Mutex, RwLock,
+};
 use tauri::{
     http::{header, Response, StatusCode},
     menu::{Menu, MenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
     Emitter, Manager, WindowEvent,
 };
-use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
+use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutState};
 
-use crate::commands::{capture_cmds, clipboard_cmds, gallery_cmds, settings_cmds};
-use crate::state::AppState;
+use crate::commands::{capture_cmds, clipboard_cmds, gallery_cmds, replay_cmds, settings_cmds};
+use crate::state::{ActiveShortcuts, AppState, ReplayRuntimeState};
+
+/// Parses a user-configured shortcut string (e.g. `"Alt+S"`, `"Ctrl+Shift+X"`, `"F9"`, or `""` when unbound)
+/// into a `tauri_plugin_global_shortcut::Shortcut`.
+pub fn parse_user_shortcut(combo: &str) -> Option<Shortcut> {
+    let trimmed = combo.trim();
+    if trimmed.is_empty()
+        || trimmed.eq_ignore_ascii_case("none")
+        || trimmed.eq_ignore_ascii_case("unbound")
+    {
+        return None;
+    }
+
+    let normalized = trimmed
+        .split('+')
+        .map(|part| match part.trim() {
+            " " => "Space".to_string(),
+            "ArrowUp" => "Up".to_string(),
+            "ArrowDown" => "Down".to_string(),
+            "ArrowLeft" => "Left".to_string(),
+            "ArrowRight" => "Right".to_string(),
+            other => other.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join("+");
+
+    Shortcut::from_str(&normalized).ok()
+}
+
+/// Reads the user's configured hotkeys from SQLite `settings`, unregisters all previous OS global shortcuts,
+/// registers only the active (non-empty) shortcuts, and updates `state.active_shortcuts`.
+pub fn sync_global_shortcuts(app: &tauri::AppHandle) {
+    let state: tauri::State<'_, AppState> = app.state();
+    let _ = app.global_shortcut().unregister_all();
+
+    let Ok(cfg) = settings_cmds::get_settings(state.clone()) else {
+        return;
+    };
+
+    let active = ActiveShortcuts {
+        region_capture: parse_user_shortcut(&cfg.hotkey_region_capture),
+        fullscreen_capture: parse_user_shortcut(&cfg.hotkey_fullscreen_capture),
+        open_gallery: parse_user_shortcut(&cfg.hotkey_open_gallery),
+        visual_clipboard: parse_user_shortcut(&cfg.hotkey_visual_clipboard),
+        save_replay: parse_user_shortcut(&cfg.hotkey_save_replay),
+    };
+
+    for sc in [
+        active.region_capture,
+        active.fullscreen_capture,
+        active.open_gallery,
+        active.visual_clipboard,
+        active.save_replay,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        let _ = app.global_shortcut().register(sc);
+    }
+
+    if let Ok(mut guard) = state.active_shortcuts.write() {
+        *guard = active;
+    };
+}
 
 /// Resolves the built-in portable `captures` directory right next to the running `.exe`
 /// (`<exe_dir>/captures` and `<exe_dir>/captures/.thumbs`), falling back to `AppData/Local`
@@ -45,6 +114,12 @@ pub fn resolve_default_captures_dir(app: &tauri::AppHandle) -> (PathBuf, PathBuf
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Enforce a single running instance: if another ReplayViewer instance is already open,
+    // signal it to show & focus the main Gallery window and exit immediately (no duplicate tray icon).
+    let Some(single_instance_listener) = single_instance::acquire_single_instance_listener() else {
+        return;
+    };
+
     tauri::Builder::default()
         .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(
@@ -55,18 +130,22 @@ pub fn run() {
                     }
                     let state: tauri::State<'_, AppState> = app.state();
 
-                    let alt_s = Shortcut::new(Some(Modifiers::ALT), Code::KeyS);
-                    let alt_shift_s =
-                        Shortcut::new(Some(Modifiers::ALT | Modifiers::SHIFT), Code::KeyS);
-                    let alt_g = Shortcut::new(Some(Modifiers::ALT), Code::KeyG);
-                    let alt_v = Shortcut::new(Some(Modifiers::ALT), Code::KeyV);
-                    let alt_c = Shortcut::new(Some(Modifiers::ALT), Code::KeyC);
+                    // Ignore global shortcuts if user is currently recording a keybind in Settings
+                    if state.shortcut_recording.load(Ordering::Relaxed) {
+                        return;
+                    }
 
-                    if shortcut == &alt_s {
+                    let active = state
+                        .active_shortcuts
+                        .read()
+                        .map(|g| g.clone())
+                        .unwrap_or_default();
+
+                    if Some(*shortcut) == active.region_capture {
                         let _ = capture_cmds::trigger_region_capture(app.clone(), state);
-                    } else if shortcut == &alt_shift_s {
+                    } else if Some(*shortcut) == active.fullscreen_capture {
                         let _ = capture_cmds::trigger_fullscreen_capture(app.clone(), state);
-                    } else if shortcut == &alt_g {
+                    } else if Some(*shortcut) == active.open_gallery {
                         if let Some(main_win) = app.get_webview_window("main") {
                             let is_vis = main_win.is_visible().unwrap_or(false);
                             let is_min = main_win.is_minimized().unwrap_or(false);
@@ -78,17 +157,10 @@ pub fn run() {
                                 let _ = main_win.set_focus();
                             }
                         }
-                    } else if shortcut == &alt_v {
+                    } else if Some(*shortcut) == active.visual_clipboard {
                         let _ = clipboard_cmds::toggle_clipboard_drawer(app.clone());
-                    } else if shortcut == &alt_c {
-                        if let Some(main_win) = app.get_webview_window("main") {
-                            let _ = main_win.show();
-                            let _ = main_win.set_focus();
-                            let _ = main_win.emit(
-                                "shortcut:toast",
-                                "Alt + C Save Replay Clip is scheduled for Phase 2.0!",
-                            );
-                        }
+                    } else if Some(*shortcut) == active.save_replay {
+                        replay_cmds::spawn_save_replay_in_background(app.clone());
                     }
                 })
                 .build(),
@@ -152,6 +224,54 @@ pub fn run() {
             let clipboard_cache_dir = local_data_dir.join("clipboard_cache");
             std::fs::create_dir_all(&clipboard_cache_dir)?;
 
+            let replay_bin_dir = local_data_dir.join("bin");
+            let replay_ring_dir = local_data_dir.join("replay_ring");
+            std::fs::create_dir_all(&replay_bin_dir)?;
+            std::fs::create_dir_all(&replay_ring_dir)?;
+
+            // Check initial replay_enabled & audio gain preferences cleanly
+            let initial_replay_enabled: bool = conn
+                .query_row(
+                    "SELECT value FROM settings WHERE key = 'replay_enabled'",
+                    [],
+                    |r| r.get::<_, String>(0),
+                )
+                .ok()
+                .and_then(|v| serde_json::from_str::<bool>(&v).ok())
+                .unwrap_or(true);
+
+            let initial_desktop_gain: f32 = conn
+                .query_row(
+                    "SELECT value FROM settings WHERE key = 'audio_desktop_volume'",
+                    [],
+                    |r| r.get::<_, String>(0),
+                )
+                .ok()
+                .and_then(|v| serde_json::from_str::<f32>(&v).ok())
+                .unwrap_or(1.0)
+                .clamp(0.0, 2.0);
+
+            let initial_mic_gain: f32 = conn
+                .query_row(
+                    "SELECT value FROM settings WHERE key = 'audio_mic_volume'",
+                    [],
+                    |r| r.get::<_, String>(0),
+                )
+                .ok()
+                .and_then(|v| serde_json::from_str::<f32>(&v).ok())
+                .unwrap_or(1.0)
+                .clamp(0.0, 2.0);
+
+            let initial_app_gains: HashMap<String, f32> = conn
+                .query_row(
+                    "SELECT value FROM settings WHERE key = 'audio_app_volumes'",
+                    [],
+                    |r| r.get::<_, String>(0),
+                )
+                .ok()
+                .and_then(|v| serde_json::from_str::<HashMap<String, f32>>(&v).ok())
+                .unwrap_or_default();
+
             // Phase 1.0 Guarantee #4: Reconcile any orphaned DB rows on startup
             let _ = db::captures_repo::reconcile_orphaned_captures(&conn);
 
@@ -161,24 +281,58 @@ pub fn run() {
                 captures_dir: RwLock::new(captures_dir),
                 thumbs_dir: RwLock::new(thumbs_dir),
                 clipboard_cache_dir,
+                replay_bin_dir,
+                replay_ring_dir,
                 clipboard_paused: AtomicBool::new(false),
                 active_clipboard_hash: RwLock::new(None),
+                active_shortcuts: RwLock::new(ActiveShortcuts::default()),
+                shortcut_recording: AtomicBool::new(false),
+                replay_should_run: AtomicBool::new(initial_replay_enabled),
+                replay_restart_requested: AtomicBool::new(false),
+                replay_child_pid: AtomicU32::new(0),
+                replay_runtime: RwLock::new(ReplayRuntimeState::default()),
+                cached_ffmpeg_status: RwLock::new(None),
+                ffmpeg_downloading: AtomicBool::new(false),
+                ffmpeg_download_stage: RwLock::new(String::new()),
+                mic_test_running: Arc::new(AtomicBool::new(false)),
+                mic_test_sidetone: Arc::new(AtomicBool::new(false)),
+                mic_test_peak_bits: Arc::new(AtomicU32::new(0.0f32.to_bits())),
+                mic_test_gain_bits: Arc::new(AtomicU32::new(initial_mic_gain.to_bits())),
+                audio_desktop_gain_bits: Arc::new(AtomicU32::new(initial_desktop_gain.to_bits())),
+                audio_mic_gain_bits: Arc::new(AtomicU32::new(initial_mic_gain.to_bits())),
+                audio_app_gains: Arc::new(RwLock::new(initial_app_gains)),
+                audio_route_gen: Arc::new(std::sync::atomic::AtomicU64::new(1)),
+                audio_route_plan: Arc::new(RwLock::new(
+                    crate::services::audio::LiveAudioRoutePlan::default(),
+                )),
+                replay_stream_slots: RwLock::new(Vec::new()),
+                audio_last_active_ms: Mutex::new(HashMap::new()),
+                slot_had_audio: Arc::new([
+                    AtomicBool::new(false),
+                    AtomicBool::new(false),
+                    AtomicBool::new(false),
+                    AtomicBool::new(false),
+                ]),
             });
+
+            // Listen for subsequent `.exe` launches and bring the existing `main` window to the foreground
+            single_instance::spawn_single_instance_focus_handler(
+                single_instance_listener,
+                app.handle().clone(),
+            );
 
             // Phase 1.5.1: Spawn background OS clipboard image watcher
             services::clipboard::spawn_clipboard_watcher(app.handle().clone());
 
-            // Register Global Shortcuts (Alt+S, Alt+Shift+S, Alt+G, Alt+V, Alt+C)
-            let alt_s = Shortcut::new(Some(Modifiers::ALT), Code::KeyS);
-            let alt_shift_s = Shortcut::new(Some(Modifiers::ALT | Modifiers::SHIFT), Code::KeyS);
-            let alt_g = Shortcut::new(Some(Modifiers::ALT), Code::KeyG);
-            let alt_v = Shortcut::new(Some(Modifiers::ALT), Code::KeyV);
-            let alt_c = Shortcut::new(Some(Modifiers::ALT), Code::KeyC);
-            let _ = app.global_shortcut().register(alt_s);
-            let _ = app.global_shortcut().register(alt_shift_s);
-            let _ = app.global_shortcut().register(alt_g);
-            let _ = app.global_shortcut().register(alt_v);
-            let _ = app.global_shortcut().register(alt_c);
+            // Phase 2.0.1 & 2.0.2: Spawn background segmented hardware replay buffer & dynamic WASAPI audio supervisor
+            services::replay::spawn_replay_supervisor(app.handle().clone());
+
+            // Phase 1.5.3 & 1.5.4: Enforce 3-day storage grace quota & backfill pending native OS OCR
+            let _ = services::storage_cleanup::enforce_storage_policies_now(app.handle());
+            let _ = services::ocr::run_ocr_backfill_batch(app.handle(), 50);
+
+            // Dynamically register user-configured Global Shortcuts from SQLite `settings`
+            sync_global_shortcuts(app.handle());
 
             // System Tray Setup
             let capture_region_i = MenuItem::with_id(
@@ -202,6 +356,27 @@ pub fn run() {
                 true,
                 None::<&str>,
             )?;
+            let save_replay_i = MenuItem::with_id(
+                app,
+                "save_replay",
+                "Save Instant Replay (Alt + C)",
+                true,
+                None::<&str>,
+            )?;
+            let toggle_replay_i = MenuItem::with_id(
+                app,
+                "toggle_replay_buffer",
+                "Start / Pause Replay Buffer",
+                true,
+                None::<&str>,
+            )?;
+            let toggle_pause_clipboard_i = MenuItem::with_id(
+                app,
+                "toggle_pause_clipboard",
+                "Pause / Resume Clipboard History",
+                true,
+                None::<&str>,
+            )?;
             let open_gallery_i = MenuItem::with_id(
                 app,
                 "open_gallery",
@@ -217,6 +392,9 @@ pub fn run() {
                     &capture_region_i,
                     &capture_full_i,
                     &open_clipboard_i,
+                    &save_replay_i,
+                    &toggle_replay_i,
+                    &toggle_pause_clipboard_i,
                     &open_gallery_i,
                     &quit_i,
                 ],
@@ -224,7 +402,7 @@ pub fn run() {
 
             let _tray = TrayIconBuilder::new()
                 .menu(&menu)
-                .tooltip("ReplayViewer — Ready (Alt+S | Alt+V)")
+                .tooltip("ReplayViewer — Ready (Alt+S | Alt+V | Alt+C)")
                 .on_menu_event(|app, event| match event.id.as_ref() {
                     "capture_region" => {
                         let state: tauri::State<'_, AppState> = app.state();
@@ -237,6 +415,42 @@ pub fn run() {
                     "open_clipboard" => {
                         let _ = clipboard_cmds::toggle_clipboard_drawer(app.clone());
                     }
+                    "save_replay" => {
+                        replay_cmds::spawn_save_replay_in_background(app.clone());
+                    }
+                    "toggle_replay_buffer" => {
+                        let state: tauri::State<'_, AppState> = app.state();
+                        let prev = state.replay_should_run.load(Ordering::Relaxed);
+                        let next = !prev;
+                        let _ = replay_cmds::set_replay_buffer_active(app.clone(), state, next);
+                        let _ = app.emit(
+                            "shortcut:toast",
+                            if next {
+                                "Replay Buffer Started"
+                            } else {
+                                "Replay Buffer Paused"
+                            },
+                        );
+                    }
+                    "toggle_pause_clipboard" => {
+                        let state: tauri::State<'_, AppState> = app.state();
+                        let prev = state
+                            .clipboard_paused
+                            .load(std::sync::atomic::Ordering::Relaxed);
+                        let next = !prev;
+                        state
+                            .clipboard_paused
+                            .store(next, std::sync::atomic::Ordering::Relaxed);
+                        let _ = app.emit("clipboard:paused_changed", next);
+                        let _ = app.emit(
+                            "shortcut:toast",
+                            if next {
+                                "Clipboard History Paused (Sensitive copies ignored)"
+                            } else {
+                                "Clipboard History Resumed"
+                            },
+                        );
+                    }
                     "open_gallery" => {
                         if let Some(win) = app.get_webview_window("main") {
                             let _ = win.show();
@@ -244,6 +458,20 @@ pub fn run() {
                         }
                     }
                     "quit" => {
+                        let state: tauri::State<'_, AppState> = app.state();
+                        state.replay_should_run.store(false, Ordering::SeqCst);
+                        state.replay_restart_requested.store(true, Ordering::SeqCst);
+                        let pid = state.replay_child_pid.load(Ordering::Relaxed);
+                        if pid != 0 {
+                            #[cfg(target_os = "windows")]
+                            {
+                                use std::os::windows::process::CommandExt;
+                                let _ = std::process::Command::new("taskkill")
+                                    .args(["/F", "/PID", &pid.to_string()])
+                                    .creation_flags(0x08000000)
+                                    .output();
+                            }
+                        }
                         app.exit(0);
                     }
                     _ => {}
@@ -306,12 +534,49 @@ pub fn run() {
             gallery_cmds::pick_folder_dialog,
             gallery_cmds::open_in_file_explorer,
             gallery_cmds::seed_benchmark_captures,
+            gallery_cmds::restore_queued_captures,
+            gallery_cmds::get_storage_status_preview,
+            gallery_cmds::enforce_storage_policies_now,
+            gallery_cmds::run_ocr_backfill_now,
             gallery_cmds::get_latest_capture_meta,
             gallery_cmds::add_tag_to_capture,
             settings_cmds::get_settings,
             settings_cmds::update_settings,
+            settings_cmds::set_shortcut_recording_mode,
             settings_cmds::get_default_captures_dir,
+            replay_cmds::get_ffmpeg_status,
+            replay_cmds::download_ffmpeg_engine,
+            replay_cmds::get_replay_buffer_snapshot,
+            replay_cmds::set_replay_buffer_active,
+            replay_cmds::save_replay_buffer,
+            replay_cmds::list_active_audio_sessions,
+            replay_cmds::get_live_audio_peaks,
+            replay_cmds::list_audio_input_devices,
+            replay_cmds::start_mic_test,
+            replay_cmds::stop_mic_test,
+            replay_cmds::set_mic_test_sidetone,
+            replay_cmds::set_mic_test_gain,
+            replay_cmds::get_mic_test_level,
+            replay_cmds::set_audio_track_volumes,
+            replay_cmds::pick_ffmpeg_dialog,
+            replay_cmds::update_app_audio_rule,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_user_shortcut_and_unbound() {
+        assert!(parse_user_shortcut("Alt+S").is_some());
+        assert!(parse_user_shortcut("Alt+Shift+S").is_some());
+        assert!(parse_user_shortcut("Ctrl+Shift+X").is_some());
+        assert!(parse_user_shortcut("F9").is_some());
+        assert!(parse_user_shortcut("").is_none());
+        assert!(parse_user_shortcut("None").is_none());
+        assert!(parse_user_shortcut("Unbound").is_none());
+    }
 }

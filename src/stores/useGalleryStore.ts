@@ -15,6 +15,7 @@ import {
   listCaptures,
   moveCapturesToFolder,
   reconcileOrphanedCaptures,
+  restoreQueuedCaptures,
   seedSyntheticBenchmarkItems,
   togglePinCapture,
 } from "../lib/tauri-client";
@@ -24,6 +25,8 @@ interface GalleryState {
   groups: string[];
   totalCount: number;
   totalBytes: number;
+  queuedDeletionCount: number;
+  queuedDeletionBytes: number;
   isLoading: boolean;
 
   // Filters & Sorting
@@ -31,6 +34,7 @@ interface GalleryState {
   mediaTypeFilter: MediaType | undefined;
   onlyPinned: boolean;
   onlyRecentClipboard: boolean;
+  onlyQueuedDeletion: boolean;
   activeGroup: string | undefined;
   activeTag: string | undefined;
   dateRange: DateRangeFilter;
@@ -49,6 +53,7 @@ interface GalleryState {
   setMediaTypeFilter: (mediaType: MediaType | undefined) => Promise<void>;
   setOnlyPinned: (onlyPinned: boolean) => Promise<void>;
   setOnlyRecentClipboard: (onlyRecentClipboard: boolean) => Promise<void>;
+  setOnlyQueuedDeletion: (onlyQueuedDeletion: boolean) => Promise<void>;
   setActiveGroup: (groupName: string | undefined) => Promise<void>;
   setActiveTag: (tag: string | undefined) => Promise<void>;
   setDateRange: (dateRange: DateRangeFilter) => Promise<void>;
@@ -68,6 +73,7 @@ interface GalleryState {
   // Single / Shared Actions
   setSelectedCapture: (capture: CaptureRecord | null) => void;
   togglePin: (id: string, currentPinned: boolean) => Promise<void>;
+  restoreQueued: (ids: string[], alsoPin?: boolean) => Promise<number>;
   removeCaptures: (ids: string[]) => Promise<void>;
   addTag: (captureId: string, tagName: string) => Promise<void>;
   reconcileOrphans: () => Promise<number>;
@@ -79,11 +85,14 @@ export const useGalleryStore = create<GalleryState>((set, get) => ({
   groups: [],
   totalCount: 0,
   totalBytes: 0,
+  queuedDeletionCount: 0,
+  queuedDeletionBytes: 0,
   isLoading: false,
   searchQuery: "",
   mediaTypeFilter: undefined,
   onlyPinned: false,
   onlyRecentClipboard: false,
+  onlyQueuedDeletion: false,
   activeGroup: undefined,
   activeTag: undefined,
   dateRange: "all",
@@ -103,6 +112,7 @@ export const useGalleryStore = create<GalleryState>((set, get) => ({
         mediaType: state.mediaTypeFilter,
         onlyPinned: state.onlyPinned,
         onlyRecentClipboard: state.onlyRecentClipboard,
+        onlyQueuedDeletion: state.onlyQueuedDeletion,
         groupName: state.activeGroup,
         tag: state.activeTag,
         dateRange: state.dateRange === "all" ? undefined : state.dateRange,
@@ -110,13 +120,18 @@ export const useGalleryStore = create<GalleryState>((set, get) => ({
         sortDir: state.sortDir,
       };
       const result = await listCaptures(null, 5000, filter);
-      set({
+      set((prev) => ({
         items: result.items,
         groups: result.groups || [],
         totalCount: result.totalCount,
         totalBytes: result.totalBytes,
+        queuedDeletionCount: result.queuedDeletionCount ?? 0,
+        queuedDeletionBytes: result.queuedDeletionBytes ?? 0,
+        selectedCapture: prev.selectedCapture
+          ? result.items.find((i) => i.id === prev.selectedCapture?.id) ?? prev.selectedCapture
+          : null,
         isLoading: false,
-      });
+      }));
     } catch (err) {
       console.error("Failed to fetch captures:", err);
       set({ isLoading: false });
@@ -129,17 +144,34 @@ export const useGalleryStore = create<GalleryState>((set, get) => ({
   },
 
   setMediaTypeFilter: async (mediaTypeFilter) => {
-    set({ mediaTypeFilter });
+    set({ mediaTypeFilter, onlyQueuedDeletion: false });
     await get().fetchCaptures();
   },
 
   setOnlyPinned: async (onlyPinned) => {
-    set({ onlyPinned });
+    set({
+      onlyPinned,
+      onlyQueuedDeletion: onlyPinned ? false : get().onlyQueuedDeletion,
+    });
     await get().fetchCaptures();
   },
 
   setOnlyRecentClipboard: async (onlyRecentClipboard) => {
-    set({ onlyRecentClipboard });
+    set({
+      onlyRecentClipboard,
+      onlyQueuedDeletion: onlyRecentClipboard ? false : get().onlyQueuedDeletion,
+    });
+    await get().fetchCaptures();
+  },
+
+  setOnlyQueuedDeletion: async (onlyQueuedDeletion) => {
+    set({
+      onlyQueuedDeletion,
+      onlyPinned: onlyQueuedDeletion ? false : get().onlyPinned,
+      onlyRecentClipboard: onlyQueuedDeletion ? false : get().onlyRecentClipboard,
+      mediaTypeFilter: onlyQueuedDeletion ? undefined : get().mediaTypeFilter,
+      selectedIds: [],
+    });
     await get().fetchCaptures();
   },
 
@@ -218,14 +250,45 @@ export const useGalleryStore = create<GalleryState>((set, get) => ({
     const nextPinned = !currentPinned;
     await togglePinCapture(id, nextPinned);
     set((state) => ({
-      items: state.items.map((item) =>
-        item.id === id ? { ...item, isPinned: nextPinned } : item
-      ),
+      items: state.items
+        .map((item) =>
+          item.id === id
+            ? {
+                ...item,
+                isPinned: nextPinned,
+                queuedDeleteAt: nextPinned ? null : item.queuedDeleteAt,
+              }
+            : item
+        )
+        .filter((item) => !(state.onlyQueuedDeletion && item.id === id && nextPinned)),
       selectedCapture:
         state.selectedCapture?.id === id
-          ? { ...state.selectedCapture, isPinned: nextPinned }
+          ? {
+              ...state.selectedCapture,
+              isPinned: nextPinned,
+              queuedDeleteAt: nextPinned ? null : state.selectedCapture.queuedDeleteAt,
+            }
           : state.selectedCapture,
     }));
+    await get().fetchCaptures();
+  },
+
+  restoreQueued: async (ids, alsoPin = false) => {
+    if (ids.length === 0) return 0;
+    const restored = await restoreQueuedCaptures(ids, alsoPin);
+    set((state) => ({
+      selectedIds: state.selectedIds.filter((id) => !ids.includes(id)),
+      selectedCapture:
+        state.selectedCapture && ids.includes(state.selectedCapture.id)
+          ? {
+              ...state.selectedCapture,
+              queuedDeleteAt: null,
+              isPinned: alsoPin ? true : state.selectedCapture.isPinned,
+            }
+          : state.selectedCapture,
+    }));
+    await get().fetchCaptures();
+    return restored;
   },
 
   removeCaptures: async (ids) => {

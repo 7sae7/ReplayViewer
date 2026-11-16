@@ -15,9 +15,11 @@ export interface CaptureRecord {
   durationMs: number | null;
   sourceApp: string | null;
   ocrText: string;
+  ocrStatus?: "pending" | "done" | "failed" | string;
   isPinned: boolean;
   groupName: string;
   lastCopiedAt: string | null;
+  queuedDeleteAt?: string | null;
   tags: string[];
   createdAt: string;
 }
@@ -27,6 +29,7 @@ export interface GalleryFilter {
   mediaType?: MediaType;
   onlyPinned: boolean;
   onlyRecentClipboard?: boolean;
+  onlyQueuedDeletion?: boolean;
   groupName?: string;
   tag?: string;
   dateRange?: DateRangeFilter;
@@ -39,7 +42,34 @@ export interface PaginatedCaptures {
   nextCursor: string | null;
   totalCount: number;
   totalBytes: number;
+  queuedDeletionCount?: number;
+  queuedDeletionBytes?: number;
   groups: string[];
+}
+
+export interface QueuedCandidateSample {
+  id: string;
+  fileName: string;
+  sizeBytes: number;
+  createdAt: string;
+  reason: string;
+}
+
+export interface StorageStatusSummary {
+  activeCount: number;
+  activeBytes: number;
+  pinnedCount: number;
+  pinnedBytes: number;
+  unpinnedCount: number;
+  unpinnedBytes: number;
+  queuedCount: number;
+  queuedBytes: number;
+  nextExpiryAt: string | null;
+  candidateCount: number;
+  candidateBytes: number;
+  candidateSamples: QueuedCandidateSample[];
+  expiredPurgedCount: number;
+  pendingOcrCount: number;
 }
 
 export interface UnindexedScanResult {
@@ -75,6 +105,57 @@ export interface CaptureSessionMeta {
   initialAnnotationsJson?: string | null;
 }
 
+export interface FfmpegStatus {
+  available: boolean;
+  binaryPath: string | null;
+  source: "custom" | "managed" | "system" | "missing" | string;
+  version: string | null;
+  supportsDdagrab: boolean;
+  availableEncoders: string[];
+  recommendedEncoder: string;
+  downloading?: boolean;
+  downloadStage?: string | null;
+}
+
+export interface ReplayRuntimeState {
+  isRecording: boolean;
+  activeEncoder: string;
+  captureMethod: string;
+  segmentCount: number;
+  ringBytes: number;
+  activeTracks: string[];
+  lastError: string | null;
+}
+
+export interface ReplayBufferSnapshot {
+  runtime: ReplayRuntimeState;
+  bufferSecs: number;
+  fps: number;
+  bitrateMbps: number;
+  configuredEncoder: string;
+  ffmpegAvailable: boolean;
+  ffmpegSource: string;
+  availableEncoders: string[];
+  recommendedEncoder: string;
+}
+
+export interface AudioSessionInfo {
+  pid: number;
+  exeName: string;
+  displayName: string;
+  state: "active" | "inactive" | string;
+  peakLevel: number;
+  isEmittingAudio: boolean;
+  isMuted: boolean;
+  isIsolated: boolean;
+}
+
+export interface AudioInputDevice {
+  id: string;
+  name: string;
+  isDefault: boolean;
+}
+
 export interface SettingsPayload {
   hotkeyRegionCapture: string;
   hotkeyFullscreenCapture: string;
@@ -86,6 +167,22 @@ export interface SettingsPayload {
   maxStorageGb: number;
   autoCleanupDays: number;
   clipboardMaxItems: number;
+  clipboardExcludedApps?: string[];
+  replayEnabled?: boolean;
+  replayBufferSecs?: number;
+  replayFps?: number;
+  replayBitrateMbps?: number;
+  replayEncoder?: string;
+  ffmpegCustomPath?: string;
+  audioRecordDesktop?: boolean;
+  audioRecordMic?: boolean;
+  audioDesktopVolume?: number;
+  audioMicVolume?: number;
+  audioAppVolumes?: Record<string, number>;
+  audioMicDeviceId?: string;
+  audioSingleMix?: boolean;
+  audioMutedApps?: string[];
+  audioIsolatedApps?: string[];
   launchOnStartup: boolean;
   capturesDir: string;
 }

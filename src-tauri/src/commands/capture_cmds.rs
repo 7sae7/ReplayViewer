@@ -90,9 +90,11 @@ pub fn trigger_fullscreen_capture(
         duration_ms: None,
         source_app: Some("Fullscreen Capture".to_string()),
         ocr_text: String::new(),
+        ocr_status: "pending".to_string(),
         is_pinned: false,
         group_name: String::new(),
         last_copied_at: Some(now_iso.clone()),
+        queued_delete_at: None,
         tags: vec!["fullscreen".to_string()],
         created_at: now_iso,
     };
@@ -106,12 +108,22 @@ pub fn trigger_fullscreen_capture(
     }
 
     let _ = app.emit("gallery:updated", &record);
+    crate::services::ocr::spawn_background_ocr_and_storage_check(
+        app,
+        record.id.clone(),
+        record.file_path.clone(),
+    );
     Ok(record)
 }
 
 /// Receives the flattened, cropped & annotated PNG/WebP bytes from the `overlay` window,
-/// hides the overlay immediately for instant UX, copies to clipboard, and persists to SQLite
-/// (including optional `base_image_bytes` and `annotations_json` for cross-session Ctrl+Z / Ctrl+Y).
+/// hides the overlay immediately for instant UX, and supports 3 distinct export modes:
+/// 1. `Copy Only` (`copy_to_clipboard = true, save_to_disk = Some(false)` via `Ctrl+C` / `Cmd+C`):
+///    Copies to the OS clipboard and `Alt + V` ring without writing to the PC's Gallery `captures_dir`.
+/// 2. `Save Only` (`copy_to_clipboard = false, save_to_disk = Some(true)`):
+///    Saves to `captures_dir` and SQLite Gallery without overwriting the OS clipboard.
+/// 3. `Copy & Save` (`copy_to_clipboard = true, save_to_disk = Some(true)` via `Enter`):
+///    Copies to the OS clipboard AND saves to `captures_dir` + SQLite Gallery.
 #[tauri::command]
 #[allow(clippy::too_many_arguments)]
 pub fn save_annotated_capture(
@@ -119,6 +131,7 @@ pub fn save_annotated_capture(
     state: State<'_, AppState>,
     image_bytes: Vec<u8>,
     copy_to_clipboard: bool,
+    save_to_disk: Option<bool>,
     image_format: Option<String>,
     source_app: Option<String>,
     base_image_bytes: Option<Vec<u8>>,
@@ -130,22 +143,68 @@ pub fn save_annotated_capture(
         let _ = overlay.hide();
     }
 
+    let should_save_to_disk = save_to_disk.unwrap_or(true);
+    let mut decoded_dims = (0u32, 0u32);
+
     if let Ok(decoded) = image::load_from_memory(&image_bytes) {
         let rgba = decoded.to_rgba8();
-        if copy_to_clipboard || source_clipboard_id.is_some() {
+        decoded_dims = (rgba.width(), rgba.height());
+        if copy_to_clipboard || !should_save_to_disk || source_clipboard_id.is_some() {
             let tauri_img = tauri::image::Image::new(rgba.as_raw(), rgba.width(), rgba.height());
             let _ = app.clipboard().write_image(&tauri_img);
+            let _ = save_or_update_annotated_clipboard_item(
+                &app,
+                rgba.as_raw(),
+                rgba.width(),
+                rgba.height(),
+                base_image_bytes.as_deref(),
+                annotations_json.as_deref(),
+                source_clipboard_id.as_deref(),
+            );
         }
-        // Always update/insert into Alt+V Visual Clipboard with non-destructive vector history!
-        let _ = save_or_update_annotated_clipboard_item(
-            &app,
-            rgba.as_raw(),
-            rgba.width(),
-            rgba.height(),
-            base_image_bytes.as_deref(),
-            annotations_json.as_deref(),
-            source_clipboard_id.as_deref(),
-        );
+    }
+
+    let now_iso = Utc::now().to_rfc3339();
+    let default_source = if source_clipboard_id.is_some() {
+        "Clipboard Annotation (Alt + V)"
+    } else {
+        "Region Capture"
+    };
+
+    // Mode 1: Copy Only (`Ctrl+C` / `Cmd+C` or `Copy` button) — do NOT save a file into `captures_dir`
+    if !should_save_to_disk {
+        if source_clipboard_id.is_some() {
+            if let Some(clip_win) = app.get_webview_window("clipboard") {
+                let _ = clip_win.show();
+                let _ = clip_win.set_focus();
+                let _ = clip_win.emit("clipboard:opened", true);
+            }
+        } else {
+            let _ = app.emit(
+                "shortcut:toast",
+                "Copied to clipboard (Not saved to disk — press Alt+V for clipboard history)",
+            );
+        }
+
+        return Ok(CaptureRecord {
+            id: format!("copied-only-{}", Uuid::new_v4()),
+            media_type: "screenshot".to_string(),
+            file_path: String::new(),
+            thumb_path: String::new(),
+            width: decoded_dims.0,
+            height: decoded_dims.1,
+            size_bytes: image_bytes.len() as u64,
+            duration_ms: None,
+            source_app: source_app.or_else(|| Some(default_source.to_string())),
+            ocr_text: String::new(),
+            ocr_status: "done".to_string(),
+            is_pinned: false,
+            group_name: String::new(),
+            last_copied_at: Some(now_iso.clone()),
+            queued_delete_at: None,
+            tags: Vec::new(),
+            created_at: now_iso,
+        });
     }
 
     let captures_dir = state
@@ -167,13 +226,6 @@ pub fn save_annotated_capture(
         ext,
     )?;
 
-    let now_iso = Utc::now().to_rfc3339();
-    let default_source = if source_clipboard_id.is_some() {
-        "Clipboard Annotation (Alt + V)"
-    } else {
-        "Region Capture"
-    };
-
     let record = CaptureRecord {
         id: Uuid::new_v4().to_string(),
         media_type: "screenshot".to_string(),
@@ -185,6 +237,7 @@ pub fn save_annotated_capture(
         duration_ms: None,
         source_app: source_app.or_else(|| Some(default_source.to_string())),
         ocr_text: String::new(),
+        ocr_status: "pending".to_string(),
         is_pinned: false,
         group_name: String::new(),
         last_copied_at: if copy_to_clipboard || source_clipboard_id.is_some() {
@@ -192,6 +245,7 @@ pub fn save_annotated_capture(
         } else {
             None
         },
+        queued_delete_at: None,
         tags: if source_clipboard_id.is_some() {
             vec!["annotated".to_string(), "clipboard".to_string()]
         } else {
@@ -221,5 +275,10 @@ pub fn save_annotated_capture(
     }
 
     let _ = app.emit("gallery:updated", &record);
+    crate::services::ocr::spawn_background_ocr_and_storage_check(
+        app,
+        record.id.clone(),
+        record.file_path.clone(),
+    );
     Ok(record)
 }

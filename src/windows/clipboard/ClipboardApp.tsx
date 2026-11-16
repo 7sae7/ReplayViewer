@@ -123,6 +123,7 @@ export const ClipboardApp: React.FC<ClipboardAppProps> = ({
     if (!isTauriRuntime()) return;
     let unlistenUpdated: (() => void) | undefined;
     let unlistenOpened: (() => void) | undefined;
+    let unlistenPaused: (() => void) | undefined;
 
     listen("clipboard:updated", () => {
       refreshClipboard();
@@ -137,9 +138,16 @@ export const ClipboardApp: React.FC<ClipboardAppProps> = ({
       unlistenOpened = fn;
     });
 
+    listen<boolean>("clipboard:paused_changed", (ev) => {
+      setPaused(Boolean(ev.payload));
+    }).then((fn) => {
+      unlistenPaused = fn;
+    });
+
     return () => {
       if (unlistenUpdated) unlistenUpdated();
       if (unlistenOpened) unlistenOpened();
+      if (unlistenPaused) unlistenPaused();
     };
   }, [refreshClipboard]);
 

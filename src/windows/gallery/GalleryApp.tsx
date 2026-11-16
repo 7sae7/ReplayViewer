@@ -7,9 +7,11 @@ import {
   Camera,
   CheckSquare,
   ClipboardCheck,
+  Clock,
   Columns,
   Copy,
   Database,
+  Film,
   FolderInput,
   FolderOpen,
   FolderPlus,
@@ -19,7 +21,9 @@ import {
   Monitor,
   Palette,
   Pin,
+  Radio,
   RefreshCw,
+  RotateCcw,
   Search,
   Settings,
   Sparkles,
@@ -34,7 +38,9 @@ import {
   isTauriRuntime,
   openInFileExplorer,
   pickFolderDialog,
+  saveReplayBuffer,
   scanUnindexedMedia,
+  setReplayBufferActive,
   toggleClipboardDrawer,
   triggerFullscreenCapture,
   triggerRegionCapture,
@@ -44,6 +50,7 @@ import { useSettingsStore } from "../../stores/useSettingsStore";
 import type {
   DateRangeFilter,
   MediaType,
+  ReplayRuntimeState,
   SortByField,
   UnindexedScanResult,
 } from "../../types/ipc";
@@ -78,10 +85,13 @@ export const GalleryApp: React.FC<GalleryAppProps> = ({
     groups,
     totalCount,
     totalBytes,
+    queuedDeletionCount,
+    queuedDeletionBytes,
     searchQuery,
     mediaTypeFilter,
     onlyPinned,
     onlyRecentClipboard,
+    onlyQueuedDeletion,
     activeGroup,
     dateRange,
     sortBy,
@@ -95,6 +105,7 @@ export const GalleryApp: React.FC<GalleryAppProps> = ({
     setMediaTypeFilter,
     setOnlyPinned,
     setOnlyRecentClipboard,
+    setOnlyQueuedDeletion,
     setActiveGroup,
     setDateRange,
     setSortBy,
@@ -109,13 +120,23 @@ export const GalleryApp: React.FC<GalleryAppProps> = ({
     batchMoveSelectedToFolder,
     setSelectedCapture,
     togglePin,
+    restoreQueued,
     removeCaptures,
     addTag,
     reconcileOrphans,
     runBenchmarkSeed,
   } = useGalleryStore();
 
-  const { settings, loadSettings } = useSettingsStore();
+  const {
+    settings,
+    ffmpegStatus,
+    replaySnapshot,
+    isDownloadingFfmpeg,
+    loadSettings,
+    refreshReplayStatus,
+    setReplayRuntime,
+    setDownloadProgress,
+  } = useSettingsStore();
 
   const [activeTab, setActiveTab] = useState<"gallery" | "settings">("gallery");
   const [statusToast, setStatusToast] = useState<string | null>(null);
@@ -131,6 +152,9 @@ export const GalleryApp: React.FC<GalleryAppProps> = ({
   const [unindexedPrompt, setUnindexedPrompt] =
     useState<UnindexedScanResult | null>(null);
   const [isImportingExternal, setIsImportingExternal] = useState(false);
+
+  // Replay Buffer Live Status
+  const [isSavingReplay, setIsSavingReplay] = useState(false);
 
   const [theme, setTheme] = useState<string>(() => {
     return localStorage.getItem("rv_daisy_theme") || "night";
@@ -154,9 +178,13 @@ export const GalleryApp: React.FC<GalleryAppProps> = ({
   useEffect(() => {
     fetchCaptures();
     loadSettings();
+    refreshReplayStatus(false);
 
     let unlistenGallery: (() => void) | undefined;
+    let unlistenOcr: (() => void) | undefined;
     let unlistenToast: (() => void) | undefined;
+    let unlistenReplay: (() => void) | undefined;
+    let unlistenDl: (() => void) | undefined;
 
     if (isTauriRuntime()) {
       const win = getCurrentWindow();
@@ -164,9 +192,30 @@ export const GalleryApp: React.FC<GalleryAppProps> = ({
 
       listen("gallery:updated", () => {
         fetchCaptures();
-        showToast("New capture saved to library & copied to clipboard!");
+        showToast("New capture saved to library!");
       }).then((fn) => {
         unlistenGallery = fn;
+      });
+
+      listen("gallery:ocr_updated", () => {
+        fetchCaptures();
+      }).then((fn) => {
+        unlistenOcr = fn;
+      });
+
+      listen<ReplayRuntimeState>("replay:status_changed", (event) => {
+        setReplayRuntime(event.payload);
+      }).then((fn) => {
+        unlistenReplay = fn;
+      });
+
+      listen<{ stage: string; message: string }>(
+        "replay:ffmpeg_download_progress",
+        (ev) => {
+          setDownloadProgress(ev.payload.stage, ev.payload.message);
+        }
+      ).then((fn) => {
+        unlistenDl = fn;
       });
 
       listen<string>("shortcut:toast", (event) => {
@@ -177,9 +226,12 @@ export const GalleryApp: React.FC<GalleryAppProps> = ({
     }
     return () => {
       if (unlistenGallery) unlistenGallery();
+      if (unlistenOcr) unlistenOcr();
       if (unlistenToast) unlistenToast();
+      if (unlistenReplay) unlistenReplay();
+      if (unlistenDl) unlistenDl();
     };
-  }, [fetchCaptures, loadSettings]);
+  }, [fetchCaptures, loadSettings, refreshReplayStatus, setDownloadProgress, setReplayRuntime]);
 
   // Escape key clears active multi-selection
   useEffect(() => {
@@ -256,6 +308,49 @@ export const GalleryApp: React.FC<GalleryAppProps> = ({
     }
   };
 
+  const canToggleReplayBuffer = Boolean(
+    ffmpegStatus?.available &&
+      !isDownloadingFfmpeg &&
+      !(ffmpegStatus.source === "system" && !ffmpegStatus.supportsDdagrab)
+  );
+
+  const handleToggleReplayBuffer = async () => {
+    if (!canToggleReplayBuffer) {
+      setActiveTab("settings");
+      showToast(
+        isDownloadingFfmpeg
+          ? "FFmpeg Engine download/upgrade is in progress — please wait..."
+          : "Download or Upgrade the FFmpeg Engine in Settings before starting Replay Buffer."
+      );
+      return;
+    }
+    const next = !(settings?.replayEnabled ?? replaySnapshot?.runtime.isRecording ?? false);
+    try {
+      await setReplayBufferActive(next);
+      await loadSettings();
+      await new Promise((r) => setTimeout(r, 180));
+      await refreshReplayStatus(false);
+      showToast(next ? "Replay Buffer started!" : "Replay Buffer paused.");
+    } catch (err) {
+      showToast(String(err));
+    }
+  };
+
+  const handleSaveReplayClip = async () => {
+    setIsSavingReplay(true);
+    try {
+      const saved = await saveReplayBuffer();
+      await fetchCaptures();
+      showToast(
+        `Saved ${Math.round((saved.durationMs || 0) / 1000)}s Instant Replay clip!`
+      );
+    } catch (err) {
+      showToast(`Replay Save: ${String(err)}`);
+    } finally {
+      setIsSavingReplay(false);
+    }
+  };
+
   const handleReconcile = async () => {
     const pruned = await reconcileOrphans();
     const scan = await scanUnindexedMedia();
@@ -295,7 +390,28 @@ export const GalleryApp: React.FC<GalleryAppProps> = ({
     }
   };
 
+  const handleRestoreQueued = async (id: string, alsoPin = false) => {
+    const count = await restoreQueued([id], alsoPin);
+    if (count > 0) {
+      showToast(
+        alsoPin
+          ? "Capture pinned & rescued from Queued Deletion!"
+          : "Capture restored from Queued Deletion to active library!"
+      );
+    }
+  };
+
   // Batch Multi-Select Handlers
+  const handleBatchRestoreQueued = async (alsoPin = false) => {
+    if (selectedIds.length === 0) return;
+    const count = await restoreQueued(selectedIds, alsoPin);
+    showToast(
+      alsoPin
+        ? `Pinned & restored ${count} capture(s) from Queued Deletion.`
+        : `Restored ${count} capture(s) from Queued Deletion.`
+    );
+  };
+
   const handleBatchDelete = async () => {
     const count = selectedIds.length;
     if (count === 0) return;
@@ -364,11 +480,11 @@ export const GalleryApp: React.FC<GalleryAppProps> = ({
                 ReplayViewer
               </h1>
               <span className="badge badge-soft badge-primary badge-xs font-mono font-semibold">
-                v1.5.1
+                v1.5
               </span>
             </div>
             <p className="text-[10px] text-base-content/60 font-mono">
-              {totalCount.toLocaleString()} items • {formatBytes(totalBytes)} • SQLite WAL + FTS5
+              {totalCount.toLocaleString()} items • {formatBytes(totalBytes)} • SQLite WAL + FTS5 + Native OCR
             </p>
           </div>
         </div>
@@ -429,6 +545,54 @@ export const GalleryApp: React.FC<GalleryAppProps> = ({
             <ClipboardCheck className="w-3.5 h-3.5 text-info" />
             Clipboard (Alt+V)
           </button>
+
+          {/* Hardware Replay Buffer Status Toggle & Quick Save Clip */}
+          <div className="join">
+            <button
+              type="button"
+              disabled={isDownloadingFfmpeg}
+              onClick={handleToggleReplayBuffer}
+              title={
+                isDownloadingFfmpeg
+                  ? "FFmpeg Engine downloading/upgrading..."
+                  : !canToggleReplayBuffer
+                  ? "Download or Upgrade FFmpeg Engine in Settings to enable"
+                  : replaySnapshot?.runtime.isRecording
+                  ? `Replay Buffer Active (${replaySnapshot.bufferSecs}s • ${replaySnapshot.runtime.activeEncoder}) — Click to pause`
+                  : "Replay Buffer Paused — Click to start"
+              }
+              className={`btn btn-xs join-item h-7 px-2 gap-1 ${
+                replaySnapshot?.runtime.isRecording
+                  ? "btn-soft btn-error"
+                  : "btn-neutral"
+              }`}
+            >
+              <Radio
+                className={`w-3 h-3 ${
+                  replaySnapshot?.runtime.isRecording
+                    ? "text-error animate-pulse"
+                    : "text-base-content/50"
+                }`}
+              />
+              {isDownloadingFfmpeg
+                ? "Upgrading..."
+                : replaySnapshot?.runtime.isRecording
+                ? `REC ${replaySnapshot.bufferSecs}s`
+                : "Buffer Off"}
+            </button>
+            <button
+              type="button"
+              disabled={isSavingReplay}
+              onClick={handleSaveReplayClip}
+              title={`Save Instant Replay Clip (${settings?.hotkeySaveReplay || "Alt+C"})`}
+              className="btn btn-xs btn-neutral join-item h-7 px-2 gap-1"
+            >
+              <Film className="w-3 h-3 text-warning" />
+              {isSavingReplay
+                ? "Saving..."
+                : `Clip (${settings?.hotkeySaveReplay || "Alt+C"})`}
+            </button>
+          </div>
 
           {/* daisyUI Boxed Tabs */}
           <div role="tablist" className="tabs tabs-box tabs-xs bg-base-300 p-0.5 ml-1">
@@ -519,9 +683,10 @@ export const GalleryApp: React.FC<GalleryAppProps> = ({
                 onClick={() => {
                   setOnlyPinned(false);
                   setOnlyRecentClipboard(false);
+                  setOnlyQueuedDeletion(false);
                 }}
                 className={`btn btn-xs join-item ${
-                  !onlyPinned && !onlyRecentClipboard
+                  !onlyPinned && !onlyRecentClipboard && !onlyQueuedDeletion
                     ? "btn-primary"
                     : "btn-ghost bg-base-100"
                 }`}
@@ -548,6 +713,21 @@ export const GalleryApp: React.FC<GalleryAppProps> = ({
               >
                 <ClipboardCheck className="w-3 h-3" />
                 Recently Copied
+              </button>
+              <button
+                type="button"
+                onClick={() => setOnlyQueuedDeletion(!onlyQueuedDeletion)}
+                title="Captures pruned by storage cap or retention policy, held for 3 days before permanent deletion"
+                className={`btn btn-xs join-item gap-1 ${
+                  onlyQueuedDeletion
+                    ? "btn-error"
+                    : queuedDeletionCount > 0
+                    ? "btn-soft btn-warning"
+                    : "btn-ghost bg-base-100"
+                }`}
+              >
+                <Clock className="w-3 h-3" />
+                Queued Deletion ({queuedDeletionCount})
               </button>
             </div>
 
@@ -581,7 +761,7 @@ export const GalleryApp: React.FC<GalleryAppProps> = ({
               <option value="">All Groups ({groups.length})</option>
               {groups.map((g) => (
                 <option key={g} value={g}>
-                  📁 {g}
+                  {g}
                 </option>
               ))}
             </select>
@@ -705,6 +885,75 @@ export const GalleryApp: React.FC<GalleryAppProps> = ({
         </div>
       )}
 
+      {/* Queued Deletion (3-Day Grace Period) Banner */}
+      {activeTab === "gallery" && onlyQueuedDeletion && (
+        <div className="flex flex-wrap items-center justify-between gap-3 px-6 py-2.5 bg-warning/15 border-b border-warning/40 text-xs">
+          <div className="flex items-center gap-2.5">
+            <Clock className="w-4 h-4 text-warning shrink-0" />
+            <div>
+              <span className="font-bold text-base-content">
+                Queued Deletion Buffer (3-Day Grace Period)
+              </span>
+              <span className="text-base-content/75 ml-2">
+                Unpinned captures pruned by your storage cap or retention policy are held here for{" "}
+                <strong className="text-warning">3 days</strong> before permanent deletion from disk.{" "}
+                <strong>Pinned items are never pruned.</strong>
+              </span>
+            </div>
+          </div>
+
+          <div className="flex items-center gap-2">
+            <span className="badge badge-warning badge-sm font-mono">
+              {queuedDeletionCount} queued • {formatBytes(queuedDeletionBytes)}
+            </span>
+            {items.length > 0 && (
+              <>
+                <button
+                  type="button"
+                  onClick={async () => {
+                    const count = await restoreQueued(
+                      items.map((i) => i.id),
+                      false
+                    );
+                    showToast(`Restored all ${count} capture(s) to active library.`);
+                  }}
+                  className="btn btn-xs btn-success gap-1"
+                >
+                  <RotateCcw className="w-3 h-3" />
+                  Restore All ({items.length})
+                </button>
+                <button
+                  type="button"
+                  onClick={async () => {
+                    const count = await restoreQueued(
+                      items.map((i) => i.id),
+                      true
+                    );
+                    showToast(`Pinned & restored all ${count} capture(s).`);
+                  }}
+                  className="btn btn-xs btn-warning gap-1"
+                >
+                  <Pin className="w-3 h-3" />
+                  Pin &amp; Restore All
+                </button>
+                <button
+                  type="button"
+                  onClick={async () => {
+                    const count = items.length;
+                    await removeCaptures(items.map((i) => i.id));
+                    showToast(`Permanently deleted ${count} queued capture(s) from disk.`);
+                  }}
+                  className="btn btn-xs btn-error gap-1"
+                >
+                  <Trash2 className="w-3 h-3" />
+                  Delete All Permanently
+                </button>
+              </>
+            )}
+          </div>
+        </div>
+      )}
+
       {/* Multi-Select Batch Action Toolbar */}
       {activeTab === "gallery" && selectedIds.length > 0 && (
         <div className="flex flex-wrap items-center justify-between gap-2 px-6 py-2 bg-primary/15 border-b border-primary/40 text-xs animate-fade-in">
@@ -730,6 +979,27 @@ export const GalleryApp: React.FC<GalleryAppProps> = ({
           </div>
 
           <div className="flex items-center gap-2">
+            {onlyQueuedDeletion && (
+              <>
+                <button
+                  type="button"
+                  onClick={() => handleBatchRestoreQueued(false)}
+                  className="btn btn-xs btn-success gap-1.5"
+                >
+                  <RotateCcw className="w-3.5 h-3.5" />
+                  Restore Selected
+                </button>
+                <button
+                  type="button"
+                  onClick={() => handleBatchRestoreQueued(true)}
+                  className="btn btn-xs btn-warning gap-1.5"
+                >
+                  <Pin className="w-3.5 h-3.5" />
+                  Pin &amp; Restore Selected
+                </button>
+              </>
+            )}
+
             <button
               type="button"
               onClick={() => {
@@ -996,6 +1266,7 @@ export const GalleryApp: React.FC<GalleryAppProps> = ({
           onSelect={(cap) => setSelectedCapture(cap)}
           onTogglePin={togglePin}
           onDelete={(id) => removeCaptures([id])}
+          onRestoreQueued={handleRestoreQueued}
           onCopied={() => fetchCaptures()}
         />
       ) : (
@@ -1010,6 +1281,7 @@ export const GalleryApp: React.FC<GalleryAppProps> = ({
           onTogglePin={togglePin}
           onDelete={(id) => removeCaptures([id])}
           onAddTag={addTag}
+          onRestoreQueued={handleRestoreQueued}
         />
       )}
     </div>

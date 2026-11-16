@@ -1,0 +1,1005 @@
+use std::fs::{self, File};
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
+use std::time::{Duration, Instant};
+use chrono::Utc;
+use image::{imageops::FilterType, ImageFormat};
+use serde::{Deserialize, Serialize};
+use tauri::{AppHandle, Emitter, Manager};
+use uuid::Uuid;
+
+use crate::db::captures_repo::{insert_capture, CaptureRecord};
+use crate::error::{AppError, AppResult};
+use crate::services::audio::{
+    build_audio_track_plan, spawn_named_pipe_audio_worker, AudioPipeTrack, LiveAudioGains,
+};
+use crate::services::ffmpeg::{get_cached_or_probe_ffmpeg, select_best_encoder};
+use crate::state::{AppState, ReplayRuntimeState};
+
+#[cfg(target_os = "windows")]
+use std::os::windows::process::CommandExt;
+#[cfg(target_os = "windows")]
+const CREATE_NO_WINDOW: u32 = 0x08000000;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReplayBufferSnapshot {
+    pub runtime: ReplayRuntimeState,
+    pub buffer_secs: u32,
+    pub fps: u32,
+    pub bitrate_mbps: u32,
+    pub configured_encoder: String,
+    pub ffmpeg_available: bool,
+    pub ffmpeg_source: String,
+    pub available_encoders: Vec<String>,
+    pub recommended_encoder: String,
+}
+
+/// Cross-platform abstraction for segmented rolling video replay buffers (`ARCHITECTURE.md` §6).
+pub trait ReplayBufferProvider {
+    fn save_clip(&self, app: &AppHandle) -> AppResult<CaptureRecord>;
+}
+
+pub struct FfmpegReplayBufferProvider;
+
+impl ReplayBufferProvider for FfmpegReplayBufferProvider {
+    fn save_clip(&self, app: &AppHandle) -> AppResult<CaptureRecord> {
+        save_replay_clip(app)
+    }
+}
+
+fn new_hidden_command(bin: &str) -> Command {
+    let mut cmd = Command::new(bin);
+    #[cfg(target_os = "windows")]
+    cmd.creation_flags(CREATE_NO_WINDOW);
+    cmd
+}
+
+/// Lists sorted `.ts` ring segment paths and their total disk size in `ring_dir`.
+fn list_sorted_segments(ring_dir: &Path) -> Vec<(u64, PathBuf, u64)> {
+    let Ok(entries) = fs::read_dir(ring_dir) else {
+        return Vec::new();
+    };
+    let mut list = Vec::new();
+    for entry in entries.flatten() {
+        let p = entry.path();
+        if !p.is_file() {
+            continue;
+        }
+        let Some(name) = p.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if !name.starts_with("seg_") || !name.ends_with(".ts") {
+            continue;
+        }
+        let idx_str = name
+            .trim_start_matches("seg_")
+            .trim_end_matches(".ts");
+        if let Ok(idx) = idx_str.parse::<u64>() {
+            let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+            list.push((idx, p, size));
+        }
+    }
+    list.sort_by_key(|(idx, _, _)| *idx);
+    list
+}
+
+/// Prunes only `.ts` segments older than `keep_count` so Alt-Tab & mode switches never wipe history.
+fn prune_old_segments(ring_dir: &Path, keep_count: usize) -> (usize, u64) {
+    let segments = list_sorted_segments(ring_dir);
+    let total = segments.len();
+    if total <= keep_count {
+        let bytes: u64 = segments.iter().map(|(_, _, sz)| *sz).sum();
+        return (total, bytes);
+    }
+
+    let remove_cnt = total - keep_count;
+    for (_, path, _) in segments.iter().take(remove_cnt) {
+        let _ = fs::remove_file(path);
+    }
+
+    let remaining = &segments[remove_cnt..];
+    let bytes: u64 = remaining.iter().map(|(_, _, sz)| *sz).sum();
+    (remaining.len(), bytes)
+}
+
+fn next_segment_start_number(ring_dir: &Path) -> u64 {
+    list_sorted_segments(ring_dir)
+        .last()
+        .map(|(idx, _, _)| idx + 1)
+        .unwrap_or(0)
+}
+
+fn update_runtime_state(
+    app: &AppHandle,
+    is_recording: bool,
+    active_encoder: String,
+    capture_method: String,
+    active_tracks: Vec<String>,
+    last_error: Option<String>,
+) {
+    let state: tauri::State<'_, AppState> = app.state();
+    let segments = list_sorted_segments(&state.replay_ring_dir);
+    let seg_count = segments.len();
+    let ring_bytes: u64 = segments.iter().map(|(_, _, sz)| *sz).sum();
+
+    let next_rt = ReplayRuntimeState {
+        is_recording,
+        active_encoder,
+        capture_method,
+        segment_count: seg_count,
+        ring_bytes,
+        active_tracks,
+        last_error,
+    };
+
+    if let Ok(mut guard) = state.replay_runtime.write() {
+        *guard = next_rt.clone();
+    }
+    let _ = app.emit("replay:status_changed", &next_rt);
+}
+
+fn kill_child_process(child: &mut Child, state: &AppState) {
+    state.replay_child_pid.store(0, Ordering::SeqCst);
+    // Ask FFmpeg to flush & finalize its current .ts segment cleanly via 'q\n' on stdin
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(b"q\n");
+        let _ = stdin.flush();
+    }
+    let deadline = Instant::now() + Duration::from_millis(1200);
+    while Instant::now() < deadline {
+        if let Ok(Some(_)) = child.try_wait() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(40));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// Spawns the background Replay Buffer supervisor loop:
+/// - Resolves FFmpeg and auto-detects the user's best GPU hardware encoder (`NVENC -> AMF -> QSV -> MF -> x264`).
+/// - Runs non-destructive 2-second `.ts` rolling segmentation (`ddagrab` GPU texture capture on Windows with `gdigrab` fallback).
+/// - Survives Alt-Tab & window focus changes cleanly without clearing prior segments.
+pub fn spawn_replay_supervisor(app: AppHandle) {
+    std::thread::spawn(move || {
+        let mut use_ddagrab_if_supported = true;
+        let mut reported_stopped = false;
+        let mut reported_missing_ffmpeg = false;
+
+        loop {
+            let state: tauri::State<'_, AppState> = app.state();
+            if !state.replay_should_run.load(Ordering::Relaxed) {
+                reported_missing_ffmpeg = false;
+                if !reported_stopped {
+                    let _ = fs::create_dir_all(&state.replay_ring_dir);
+                    let cfg = crate::commands::settings_cmds::get_settings(state.clone()).ok();
+                    let custom = cfg.as_ref().map(|c| c.ffmpeg_custom_path.as_str()).unwrap_or("");
+                    let ff_status = get_cached_or_probe_ffmpeg(&state, custom, false);
+                    update_runtime_state(
+                        &app,
+                        false,
+                        ff_status.recommended_encoder,
+                        "Stopped".to_string(),
+                        Vec::new(),
+                        None,
+                    );
+                    reported_stopped = true;
+                }
+                std::thread::sleep(Duration::from_millis(400));
+                continue;
+            }
+            reported_stopped = false;
+
+            state.replay_restart_requested.store(false, Ordering::SeqCst);
+
+            let Ok(cfg) = crate::commands::settings_cmds::get_settings(state.clone()) else {
+                std::thread::sleep(Duration::from_secs(1));
+                continue;
+            };
+
+            if state.ffmpeg_downloading.load(Ordering::Relaxed) {
+                update_runtime_state(
+                    &app,
+                    false,
+                    "auto".to_string(),
+                    "Downloading FFmpeg".to_string(),
+                    Vec::new(),
+                    None,
+                );
+                std::thread::sleep(Duration::from_millis(400));
+                continue;
+            }
+
+            let ff = get_cached_or_probe_ffmpeg(&state, &cfg.ffmpeg_custom_path, false);
+            let needs_windows_upgrade =
+                cfg!(target_os = "windows") && ff.source == "system" && !ff.supports_ddagrab;
+            let Some(bin_str) = ff.binary_path.clone().filter(|_| !needs_windows_upgrade) else {
+                if !reported_missing_ffmpeg {
+                    let msg = if needs_windows_upgrade {
+                        "Legacy system FFmpeg found without ddagrab. Click 'Upgrade Engine' in Settings -> Hardware Replay Buffer."
+                    } else {
+                        "FFmpeg not found in PATH. Click 'Download Engine' in Settings -> Hardware Replay Buffer."
+                    };
+                    update_runtime_state(
+                        &app,
+                        false,
+                        "auto".to_string(),
+                        "Waiting for FFmpeg".to_string(),
+                        Vec::new(),
+                        Some(msg.to_string()),
+                    );
+                    reported_missing_ffmpeg = true;
+                }
+                // Sleep calmly without re-probing OS PATH until user clicks Download Engine, sets Custom Path, or toggles buffer
+                for _ in 0..40 {
+                    if state.replay_restart_requested.load(Ordering::Relaxed)
+                        || !state.replay_should_run.load(Ordering::Relaxed)
+                    {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(250));
+                }
+                continue;
+            };
+            reported_missing_ffmpeg = false;
+
+            let _ = fs::create_dir_all(&state.replay_ring_dir);
+            let encoder = if cfg.replay_encoder.trim().is_empty()
+                || cfg.replay_encoder.trim() == "auto"
+            {
+                ff.recommended_encoder.clone()
+            } else {
+                select_best_encoder(&cfg.replay_encoder, &ff.available_encoders, None)
+            };
+            let fps = cfg.replay_fps.clamp(15, 120);
+            let bitrate_mbps = cfg.replay_bitrate_mbps.clamp(5, 80);
+            let buffer_secs = cfg.replay_buffer_secs.clamp(30, 1200);
+            // Keep +3 headroom segments so we always have full `buffer_secs` even mid-rotation
+            let keep_segments = ((buffer_secs as usize) / 2).saturating_add(3);
+
+            // Reset audio activity flags for this epoch
+            for flag in state.slot_had_audio.iter() {
+                flag.store(false, Ordering::Relaxed);
+            }
+
+            // Build dynamic audio track plan (Desktop Remainder + Isolated Active Apps + Mic)
+            let audio_tracks: Vec<AudioPipeTrack> = if cfg!(target_os = "windows") {
+                build_audio_track_plan(
+                    &app,
+                    cfg.audio_record_desktop,
+                    cfg.audio_record_mic,
+                    cfg.audio_desktop_volume,
+                    cfg.audio_mic_volume,
+                    &cfg.audio_app_volumes,
+                    &cfg.audio_mic_device_id,
+                    &cfg.audio_muted_apps,
+                    &cfg.audio_isolated_apps,
+                )
+            } else {
+                Vec::new()
+            };
+
+            let pipe_stop = Arc::new(AtomicBool::new(false));
+            let live_gains = LiveAudioGains {
+                desktop_bits: state.audio_desktop_gain_bits.clone(),
+                mic_bits: state.audio_mic_gain_bits.clone(),
+                app_gains: state.audio_app_gains.clone(),
+                route_gen: state.audio_route_gen.clone(),
+                route_plan: state.audio_route_plan.clone(),
+                slot_had_audio: state.slot_had_audio.clone(),
+            };
+            let mut audio_workers = Vec::new();
+            for track in &audio_tracks {
+                let had_flag = if let crate::services::audio::AudioSourceKind::ProcessSlot { slot_idx } = track.kind {
+                    if let Ok(plan_g) = state.audio_route_plan.read() {
+                        if plan_g.isolated_slots.get(slot_idx).and_then(|o| o.as_ref()).is_some() {
+                            state.slot_had_audio[slot_idx].store(true, Ordering::Relaxed);
+                        }
+                    }
+                    Arc::new(AtomicBool::new(false))
+                } else {
+                    Arc::new(AtomicBool::new(false))
+                };
+                audio_workers.push(spawn_named_pipe_audio_worker(
+                    track.clone(),
+                    pipe_stop.clone(),
+                    had_flag,
+                    live_gains.clone(),
+                ));
+            }
+            // Allow named pipe servers a brief moment to bind before FFmpeg connects
+            if !audio_tracks.is_empty() {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+
+            let start_num = next_segment_start_number(&state.replay_ring_dir);
+            let seg_pattern = state
+                .replay_ring_dir
+                .join("seg_%06d.ts")
+                .to_string_lossy()
+                .to_string();
+
+            let use_ddagrab = cfg!(target_os = "windows") && ff.supports_ddagrab && use_ddagrab_if_supported;
+            let capture_method_label = if use_ddagrab {
+                "DXGI Desktop Duplication (ddagrab)".to_string()
+            } else if cfg!(target_os = "windows") {
+                "Windows Desktop GDI (gdigrab)".to_string()
+            } else if cfg!(target_os = "macos") {
+                "macOS AVFoundation".to_string()
+            } else {
+                "Linux X11 / PipeWire".to_string()
+            };
+
+            let mut cmd = new_hidden_command(&bin_str);
+            cmd.args(["-hide_banner", "-loglevel", "error"]);
+
+            // Input 0: Video source
+            #[cfg(target_os = "windows")]
+            {
+                if use_ddagrab {
+                    cmd.args([
+                        "-f",
+                        "lavfi",
+                        "-i",
+                        &format!(
+                            "ddagrab=framerate={}:draw_mouse=1,hwdownload,format=bgra,format=yuv420p",
+                            fps
+                        ),
+                    ]);
+                } else {
+                    cmd.args([
+                        "-f",
+                        "gdigrab",
+                        "-framerate",
+                        &fps.to_string(),
+                        "-draw_mouse",
+                        "1",
+                        "-i",
+                        "desktop",
+                    ]);
+                }
+            }
+
+            #[cfg(target_os = "macos")]
+            {
+                cmd.args([
+                    "-f",
+                    "avfoundation",
+                    "-framerate",
+                    &fps.to_string(),
+                    "-capture_cursor",
+                    "1",
+                    "-i",
+                    "1:none",
+                ]);
+            }
+
+            #[cfg(target_os = "linux")]
+            {
+                cmd.args([
+                    "-f",
+                    "x11grab",
+                    "-framerate",
+                    &fps.to_string(),
+                    "-i",
+                    ":0.0",
+                ]);
+            }
+
+            // Inputs 1..K: Windows WASAPI Named Pipes (48 kHz Stereo s16le)
+            for track in &audio_tracks {
+                cmd.args([
+                    "-f",
+                    "s16le",
+                    "-ar",
+                    "48000",
+                    "-ac",
+                    "2",
+                    "-i",
+                    &track.pipe_path,
+                ]);
+            }
+
+            // Stream mapping & Audio mix:
+            // - Stream 0 (a:0) is ALWAYS Master Mix (when 2+ sources are active) so HTML5 <video>,
+            //   MediaLightbox, and Discord play BOTH Desktop + Microphone by default.
+            // - When Single Mix is OFF, discrete tracks (Desktop, Isolated Apps, Microphone) are
+            //   additionally preserved as a:1..a:K for NLE multi-track editing!
+            cmd.args(["-map", "0:v"]);
+            let audio_map_args = build_audio_mapping_args(&audio_tracks, cfg.audio_single_mix);
+            cmd.args(&audio_map_args);
+
+            // Record stream slot metadata so `save_replay_clip` strips unused dynamic slots cleanly
+            if let Ok(mut sl_guard) = state.replay_stream_slots.write() {
+                sl_guard.clear();
+                if !audio_tracks.is_empty() {
+                    if cfg.audio_single_mix || audio_tracks.len() == 1 {
+                        sl_guard.push((None, audio_tracks[0].title.clone()));
+                    } else {
+                        sl_guard.push((None, "Master Mix".to_string()));
+                        for t in &audio_tracks {
+                            let slot = match t.kind {
+                                crate::services::audio::AudioSourceKind::ProcessSlot { slot_idx } => {
+                                    Some(slot_idx)
+                                }
+                                _ => None,
+                            };
+                            sl_guard.push((slot, t.title.clone()));
+                        }
+                    }
+                }
+            }
+
+            // Video hardware encoder settings with clean GOP = 2s keyframes (`g = fps * 2`) so `-f segment -segment_time 2` cuts cleanly!
+            let gop = (fps * 2).to_string();
+            let br_str = format!("{}M", bitrate_mbps);
+            let maxrate_str = format!("{}M", (bitrate_mbps * 3) / 2);
+            let bufsize_str = format!("{}M", bitrate_mbps * 2);
+
+            cmd.args([
+                "-r",
+                &fps.to_string(),
+                "-pix_fmt",
+                "yuv420p",
+                "-c:v",
+                &encoder,
+                "-b:v",
+                &br_str,
+                "-maxrate",
+                &maxrate_str,
+                "-bufsize",
+                &bufsize_str,
+                "-g",
+                &gop,
+                "-force_key_frames",
+                "expr:gte(t,n_forced*2)",
+            ]);
+            if encoder == "h264_nvenc" {
+                cmd.args(["-preset", "p4", "-tune", "ll"]);
+            } else if encoder == "libx264" {
+                cmd.args(["-preset", "veryfast", "-tune", "zerolatency"]);
+            }
+
+            cmd.args([
+                "-max_muxing_queue_size",
+                "1024",
+                "-f",
+                "segment",
+                "-segment_time",
+                "2",
+                "-segment_format",
+                "mpegts",
+                "-reset_timestamps",
+                "1",
+                "-segment_start_number",
+                &start_num.to_string(),
+                &seg_pattern,
+            ]);
+
+            cmd.stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped());
+
+            let started_at = Instant::now();
+            let track_titles: Vec<String> = audio_tracks.iter().map(|t| t.title.clone()).collect();
+
+            match cmd.spawn() {
+                Ok(mut child) => {
+                    state.replay_child_pid.store(child.id(), Ordering::SeqCst);
+                    update_runtime_state(
+                        &app,
+                        true,
+                        encoder.clone(),
+                        capture_method_label.clone(),
+                        track_titles.clone(),
+                        None,
+                    );
+
+                    let mut tick = 0u32;
+                    loop {
+                        std::thread::sleep(Duration::from_millis(50));
+                        tick += 1;
+
+                        if !state.replay_should_run.load(Ordering::Relaxed)
+                            || state.replay_restart_requested.load(Ordering::Relaxed)
+                        {
+                            kill_child_process(&mut child, &state);
+                            break;
+                        }
+
+                        // Every 1s (20 * 50ms) prune expired segments and broadcast ring size/count
+                        if tick % 20 == 0 {
+                            let _ = prune_old_segments(&state.replay_ring_dir, keep_segments);
+                            update_runtime_state(
+                                &app,
+                                true,
+                                encoder.clone(),
+                                capture_method_label.clone(),
+                                track_titles.clone(),
+                                None,
+                            );
+                        }
+
+                        if let Ok(Some(exit_status)) = child.try_wait() {
+                            state.replay_child_pid.store(0, Ordering::SeqCst);
+                            let runtime_ms = started_at.elapsed().as_millis();
+                            let err_msg = child
+                                .stderr
+                                .take()
+                                .and_then(|mut s| {
+                                    use std::io::Read;
+                                    let mut buf = String::new();
+                                    let _ = s.read_to_string(&mut buf);
+                                    Some(buf.trim().to_string())
+                                })
+                                .filter(|s| !s.is_empty())
+                                .unwrap_or_else(|| format!("FFmpeg exited with {}", exit_status));
+
+                            // If `ddagrab` failed quickly (e.g., hybrid GPU adapter / headless VM), auto-fallback to `gdigrab`!
+                            if use_ddagrab && runtime_ms < 2500 {
+                                use_ddagrab_if_supported = false;
+                            }
+
+                            update_runtime_state(
+                                &app,
+                                false,
+                                encoder.clone(),
+                                capture_method_label.clone(),
+                                track_titles.clone(),
+                                Some(err_msg),
+                            );
+                            break;
+                        }
+                    }
+                }
+                Err(err) => {
+                    update_runtime_state(
+                        &app,
+                        false,
+                        encoder,
+                        capture_method_label,
+                        track_titles,
+                        Some(format!("Failed to start FFmpeg: {}", err)),
+                    );
+                }
+            }
+
+            pipe_stop.store(true, Ordering::SeqCst);
+            // Wake any pipe worker still waiting in ConnectNamedPipe before joining threads
+            for track in &audio_tracks {
+                let _ = std::fs::OpenOptions::new().read(true).open(&track.pipe_path);
+            }
+            for w in audio_workers {
+                let _ = w.join();
+            }
+
+            if !state.replay_restart_requested.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_millis(250));
+            }
+        }
+    });
+}
+
+/// Builds FFmpeg `-filter_complex` + `-map` + `-metadata` audio track arguments.
+/// `Master Mix` (`a:0`) blends ONLY base tracks (`Desktop Audio` + `Microphone`) so isolated app
+/// slots (`ProcessSlot`) never double-sum with Desktop Audio and cause comb-filtering/robotic audio.
+pub fn build_audio_mapping_args(audio_tracks: &[AudioPipeTrack], single_mix: bool) -> Vec<String> {
+    let mut args = Vec::new();
+    if audio_tracks.is_empty() {
+        return args;
+    }
+
+    let base_indices: Vec<usize> = audio_tracks
+        .iter()
+        .enumerate()
+        .filter(|(_, t)| !matches!(t.kind, crate::services::audio::AudioSourceKind::ProcessSlot { .. }))
+        .map(|(idx, _)| idx + 1)
+        .collect();
+
+    if single_mix || audio_tracks.len() == 1 {
+        if base_indices.len() <= 1 {
+            let single_input = base_indices.first().copied().unwrap_or(1);
+            let title = audio_tracks
+                .get(single_input - 1)
+                .map(|t| t.title.as_str())
+                .unwrap_or("Master Mix");
+            args.extend([
+                "-map".to_string(),
+                format!("{}:a", single_input),
+                "-metadata:s:a:0".to_string(),
+                format!("title={}", title),
+            ]);
+        } else {
+            let inputs: String = base_indices.iter().map(|i| format!("[{}:a]", i)).collect();
+            let mix_cnt = base_indices.len();
+            args.extend([
+                "-filter_complex".to_string(),
+                format!(
+                    "{}amix=inputs={}:duration=longest:dropout_transition=0,volume={}[aout]",
+                    inputs, mix_cnt, mix_cnt
+                ),
+                "-map".to_string(),
+                "[aout]".to_string(),
+                "-metadata:s:a:0".to_string(),
+                "title=Master Mix".to_string(),
+            ]);
+        }
+        args.extend([
+            "-c:a".to_string(),
+            "aac".to_string(),
+            "-b:a".to_string(),
+            "192k".to_string(),
+        ]);
+        return args;
+    }
+
+    // Multi-track: Stream a:0 = Master Mix (Desktop + Mic only), Streams a:1.. = discrete tracks
+    if base_indices.len() >= 2 {
+        let mut filter_parts: Vec<String> = Vec::with_capacity(base_indices.len() + 1);
+        let mut mix_inputs = String::new();
+        for &in_num in &base_indices {
+            filter_parts.push(format!("[{}:a]asplit=2[mix{}][disc{}]", in_num, in_num, in_num));
+            mix_inputs.push_str(&format!("[mix{}]", in_num));
+        }
+        let mix_cnt = base_indices.len();
+        filter_parts.push(format!(
+            "{}amix=inputs={}:duration=longest:dropout_transition=0,volume={}[master]",
+            mix_inputs, mix_cnt, mix_cnt
+        ));
+
+        args.extend([
+            "-filter_complex".to_string(),
+            filter_parts.join("; "),
+            "-map".to_string(),
+            "[master]".to_string(),
+            "-metadata:s:a:0".to_string(),
+            "title=Master Mix".to_string(),
+        ]);
+
+        for (idx, track) in audio_tracks.iter().enumerate() {
+            let input_num = idx + 1;
+            let out_stream_idx = idx + 1;
+            let map_label = if base_indices.contains(&input_num) {
+                format!("[disc{}]", input_num)
+            } else {
+                format!("{}:a", input_num)
+            };
+            args.extend([
+                "-map".to_string(),
+                map_label,
+                format!("-metadata:s:a:{}", out_stream_idx),
+                format!("title={}", track.title),
+            ]);
+        }
+    } else {
+        // Only 1 base track + ProcessSlots: direct stream mapping
+        let base_in = base_indices.first().copied().unwrap_or(1);
+        args.extend([
+            "-map".to_string(),
+            format!("{}:a", base_in),
+            "-metadata:s:a:0".to_string(),
+            "title=Master Mix".to_string(),
+        ]);
+        for (idx, track) in audio_tracks.iter().enumerate() {
+            let input_num = idx + 1;
+            let out_stream_idx = idx + 1;
+            args.extend([
+                "-map".to_string(),
+                format!("{}:a", input_num),
+                format!("-metadata:s:a:{}", out_stream_idx),
+                format!("title={}", track.title),
+            ]);
+        }
+    }
+
+    args.extend([
+        "-c:a".to_string(),
+        "aac".to_string(),
+        "-b:a".to_string(),
+        "192k".to_string(),
+    ]);
+    args
+}
+
+/// Immediately stitches the last `replay_buffer_secs` of 2-second `.ts` segments into a fast-start `.mp4`
+/// inside `captures_dir` via lossless FFmpeg `-f concat -c copy` (zero video re-encoding),
+/// generates a 320px WebP thumbnail, and indexes into SQLite + FTS5.
+pub fn save_replay_clip(app: &AppHandle) -> AppResult<CaptureRecord> {
+    let state: tauri::State<'_, AppState> = app.state();
+    let cfg = crate::commands::settings_cmds::get_settings(state.clone())?;
+    let ff = get_cached_or_probe_ffmpeg(&state, &cfg.ffmpeg_custom_path, false);
+    let bin_str = ff.binary_path.ok_or_else(|| {
+        AppError::General("FFmpeg is not installed. Click 'Download Replay Engine' in Settings first.".to_string())
+    })?;
+
+    let all_segments = list_sorted_segments(&state.replay_ring_dir);
+    if all_segments.is_empty() {
+        return Err(AppError::General(
+            "Replay buffer currently has 0 recorded segments. Ensure Replay Buffer is running and wait ~2 seconds.".to_string(),
+        ));
+    }
+
+    let wanted_segs = ((cfg.replay_buffer_secs.clamp(30, 1200) as usize) / 2).max(1);
+    // Include the live trailing MPEG-TS segment whenever it already contains valid packets (>= 8 KB),
+    // and add +1 segment when available so a partially written tail segment never trims the clip 2s short!
+    let trailing_is_tiny = all_segments
+        .last()
+        .map(|(_, _, sz)| *sz < 8192)
+        .unwrap_or(false);
+    let safe_end = if all_segments.len() > 1 && trailing_is_tiny {
+        all_segments.len() - 1
+    } else {
+        all_segments.len()
+    };
+    let take_segs = if safe_end > wanted_segs && !trailing_is_tiny {
+        wanted_segs + 1
+    } else {
+        wanted_segs
+    };
+    let safe_start = safe_end.saturating_sub(take_segs);
+    let chosen: Vec<&(u64, PathBuf, u64)> = all_segments[safe_start..safe_end].iter().collect();
+
+    if chosen.is_empty() {
+        return Err(AppError::General("No finalized replay segments available yet.".to_string()));
+    }
+
+    let concat_list_path = state
+        .replay_ring_dir
+        .join(format!("concat_{}.txt", Uuid::new_v4()));
+    {
+        let mut f = File::create(&concat_list_path)?;
+        for (_, seg_path, _) in &chosen {
+            let escaped = seg_path
+                .to_string_lossy()
+                .replace('\\', "/")
+                .replace('\'', "'\\''");
+            writeln!(f, "file '{}'", escaped)?;
+        }
+    }
+
+    let captures_dir = state
+        .captures_dir
+        .read()
+        .map_err(|_| AppError::General("Failed to lock captures_dir".to_string()))?
+        .clone();
+    let thumbs_dir = state
+        .thumbs_dir
+        .read()
+        .map_err(|_| AppError::General("Failed to lock thumbs_dir".to_string()))?
+        .clone();
+    fs::create_dir_all(&captures_dir)?;
+    fs::create_dir_all(&thumbs_dir)?;
+
+    let id = Uuid::new_v4().to_string();
+    let stamp = Utc::now().format("%Y%m%d_%H%M%S");
+    let mp4_path = captures_dir.join(format!("Replay_{}_{}.mp4", stamp, &id[..6]));
+    let thumb_path = thumbs_dir.join(format!("{}_thumb.webp", id));
+    let temp_png_thumb = state.replay_ring_dir.join(format!("thumb_{}.png", id));
+
+    let mut concat_args: Vec<String> = vec![
+        "-y".to_string(),
+        "-hide_banner".to_string(),
+        "-loglevel".to_string(),
+        "error".to_string(),
+        "-f".to_string(),
+        "concat".to_string(),
+        "-safe".to_string(),
+        "0".to_string(),
+        "-i".to_string(),
+        concat_list_path.to_string_lossy().to_string(),
+        "-map".to_string(),
+        "0:v".to_string(),
+    ];
+
+    let stream_slots = state
+        .replay_stream_slots
+        .read()
+        .map(|g| g.clone())
+        .unwrap_or_default();
+
+    if stream_slots.is_empty() {
+        concat_args.extend(["-map".to_string(), "0:a?".to_string()]);
+    } else {
+        for (stream_idx, (slot_opt, _)) in stream_slots.iter().enumerate() {
+            let keep = match slot_opt {
+                None => true,
+                Some(slot_idx) => state
+                    .slot_had_audio
+                    .get(*slot_idx)
+                    .map(|b| b.load(Ordering::Relaxed))
+                    .unwrap_or(false),
+            };
+            if keep {
+                concat_args.extend(["-map".to_string(), format!("0:a:{}?", stream_idx)]);
+            }
+        }
+    }
+
+    concat_args.extend([
+        "-c:v".to_string(),
+        "copy".to_string(),
+        "-c:a".to_string(),
+        "copy".to_string(),
+        "-movflags".to_string(),
+        "+faststart".to_string(),
+        mp4_path.to_string_lossy().to_string(),
+    ]);
+
+    let concat_out = new_hidden_command(&bin_str).args(&concat_args).output()?;
+
+    let _ = fs::remove_file(&concat_list_path);
+
+    if !concat_out.status.success() || !mp4_path.exists() {
+        let stderr = String::from_utf8_lossy(&concat_out.stderr);
+        return Err(AppError::General(format!(
+            "Failed to stitch replay segments: {}",
+            stderr.trim()
+        )));
+    }
+
+    // Extract 1 crisp frame for a 320px WebP gallery thumbnail
+    let _ = new_hidden_command(&bin_str)
+        .args([
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-i",
+            &mp4_path.to_string_lossy(),
+            "-frames:v",
+            "1",
+            "-vf",
+            "scale=320:-2",
+            &temp_png_thumb.to_string_lossy(),
+        ])
+        .output();
+
+    let (mut width, mut height) = (1920u32, 1080u32);
+    if temp_png_thumb.exists() {
+        if let Ok(decoded) = image::open(&temp_png_thumb) {
+            let thumb = decoded.resize(320, 320, FilterType::Triangle);
+            let _ = thumb.save_with_format(&thumb_path, ImageFormat::WebP);
+        }
+        let _ = fs::remove_file(&temp_png_thumb);
+    }
+
+    // Probe actual video dimensions & duration via ffprobe if alongside ffmpeg
+    let ffprobe_bin = bin_str.replace("ffmpeg", "ffprobe");
+    let mut probed_duration_ms: Option<u64> = None;
+    if let Ok(probe) = new_hidden_command(&ffprobe_bin)
+        .args([
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=width,height:format=duration",
+            "-of",
+            "default=noprint_wrappers=1",
+            &mp4_path.to_string_lossy(),
+        ])
+        .output()
+    {
+        let txt = String::from_utf8_lossy(&probe.stdout);
+        for line in txt.lines() {
+            if let Some(v) = line.strip_prefix("width=") {
+                if let Ok(w) = v.trim().parse::<u32>() {
+                    width = w;
+                }
+            } else if let Some(v) = line.strip_prefix("height=") {
+                if let Ok(h) = v.trim().parse::<u32>() {
+                    height = h;
+                }
+            } else if let Some(v) = line.strip_prefix("duration=") {
+                if let Ok(secs) = v.trim().parse::<f64>() {
+                    if secs > 0.0 {
+                        probed_duration_ms = Some((secs * 1000.0).round() as u64);
+                    }
+                }
+            }
+        }
+    }
+
+    let size_bytes = fs::metadata(&mp4_path)?.len();
+    let duration_ms = probed_duration_ms.unwrap_or_else(|| (chosen.len() as u64) * 2000);
+    let now_iso = Utc::now().to_rfc3339();
+    let dur_tag = format!("{}s", duration_ms / 1000);
+
+    let record = CaptureRecord {
+        id: id.clone(),
+        media_type: "video".to_string(),
+        file_path: mp4_path.to_string_lossy().to_string(),
+        thumb_path: thumb_path.to_string_lossy().to_string(),
+        width,
+        height,
+        size_bytes,
+        duration_ms: Some(duration_ms),
+        source_app: Some(format!(
+            "Instant Replay ({}s)",
+            duration_ms / 1000
+        )),
+        ocr_text: String::new(),
+        ocr_status: "done".to_string(),
+        is_pinned: false,
+        group_name: "Replays".to_string(),
+        last_copied_at: None,
+        queued_delete_at: None,
+        tags: vec!["replay".to_string(), dur_tag],
+        created_at: now_iso,
+    };
+
+    {
+        let conn = state
+            .db
+            .lock()
+            .map_err(|_| AppError::General("Failed to lock database".to_string()))?;
+        insert_capture(&conn, &record)?;
+    }
+
+    let _ = crate::services::storage_cleanup::enforce_storage_policies_now(app);
+    let _ = app.emit("gallery:updated", &record);
+    let _ = app.emit(
+        "shortcut:toast",
+        format!(
+            "Saved {}s Instant Replay clip ({:.1} MB)!",
+            duration_ms / 1000,
+            size_bytes as f64 / (1024.0 * 1024.0)
+        ),
+    );
+
+    Ok(record)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::services::audio::AudioSourceKind;
+
+    #[test]
+    fn test_audio_mapping_puts_master_mix_at_stream_zero() {
+        let tracks = vec![
+            AudioPipeTrack {
+                slot_index: 0,
+                title: "Desktop Audio".to_string(),
+                pipe_path: r"\\.\pipe\test0".to_string(),
+                kind: AudioSourceKind::DesktopLoopback { exclude_pid: None },
+                volume_gain: 1.0,
+            },
+            AudioPipeTrack {
+                slot_index: 1,
+                title: "Isolated App 1".to_string(),
+                pipe_path: r"\\.\pipe\test1".to_string(),
+                kind: AudioSourceKind::ProcessSlot { slot_idx: 0 },
+                volume_gain: 1.0,
+            },
+            AudioPipeTrack {
+                slot_index: 2,
+                title: "Microphone".to_string(),
+                pipe_path: r"\\.\pipe\test2".to_string(),
+                kind: AudioSourceKind::Microphone {
+                    device_id: String::new(),
+                },
+                volume_gain: 1.0,
+            },
+        ];
+
+        let multi = build_audio_mapping_args(&tracks, false);
+        assert!(multi.contains(&"title=Master Mix".to_string()));
+        assert!(multi.contains(&"-metadata:s:a:0".to_string()));
+        assert!(multi.contains(&"title=Desktop Audio".to_string()));
+        assert!(multi.contains(&"title=Isolated App 1".to_string()));
+        assert!(multi.contains(&"title=Microphone".to_string()));
+        // Master Mix must mix ONLY Desktop (1:a) + Mic (3:a) and never double-mix Isolated App (2:a)
+        assert!(multi.iter().any(|a| a.contains("[mix1][mix3]amix=inputs=2") && !a.contains("[mix2]")));
+
+        let single = build_audio_mapping_args(&tracks, true);
+        assert!(single.contains(&"title=Master Mix".to_string()));
+        assert!(!single.contains(&"title=Microphone".to_string()));
+    }
+}
