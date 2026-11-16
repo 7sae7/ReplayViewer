@@ -297,6 +297,17 @@ export const MediaLightbox: React.FC<MediaLightboxProps> = ({
               Open in File Explorer / Finder
             </button>
 
+            {!capture.queuedDeleteAt && onFindSimilar && (
+              <button
+                type="button"
+                onClick={() => onFindSimilar(capture)}
+                className="btn btn-sm btn-soft btn-accent w-full gap-2"
+              >
+                <Sparkles className="w-4 h-4" />
+                Find Visually Similar (512-d AI)
+              </button>
+            )}
+
             <div className="grid grid-cols-2 gap-2">
               <button
                 type="button"

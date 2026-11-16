@@ -286,6 +286,15 @@ CREATE TABLE IF NOT EXISTS settings (
     value           TEXT NOT NULL,                  -- JSON-encoded value (includes custom captures_dir)
     updated_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
+
+-- 6. Phase 2.0.5 Smart AI Visual Search 512-d Quantized INT8 Embeddings (512 Bytes/Image)
+CREATE TABLE IF NOT EXISTS capture_embeddings (
+    capture_id      TEXT PRIMARY KEY REFERENCES captures(id) ON DELETE CASCADE,
+    model_version   TEXT NOT NULL DEFAULT 'rv-vis-512-v1',
+    embedding_blob  BLOB NOT NULL,                  -- 512 quantized i8 dimensions (512 bytes)
+    visual_labels   TEXT NOT NULL DEFAULT '',       -- Auto-detected visual concept labels
+    updated_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
 ```
 
 ---

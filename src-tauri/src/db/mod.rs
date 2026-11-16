@@ -74,6 +74,14 @@ CREATE TABLE IF NOT EXISTS settings (
     value           TEXT NOT NULL,
     updated_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
+
+CREATE TABLE IF NOT EXISTS capture_embeddings (
+    capture_id      TEXT PRIMARY KEY REFERENCES captures(id) ON DELETE CASCADE,
+    model_version   TEXT NOT NULL DEFAULT 'rv-vis-512-v1',
+    embedding_blob  BLOB NOT NULL,
+    visual_labels   TEXT NOT NULL DEFAULT '',
+    updated_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
 "#;
 
 pub fn init_db(db_path: &Path) -> AppResult<Connection> {

@@ -12,6 +12,7 @@ import type {
   SettingsPayload,
   StorageStatusSummary,
   UnindexedScanResult,
+  VisualSearchStatus,
 } from "../types/ipc";
 
 export function isTauriRuntime(): boolean {
@@ -909,6 +910,141 @@ export async function updateAppAudioRule(
         }
       : s
   );
+}
+
+export async function restoreQueuedCaptures(
+  ids: string[],
+  alsoPin = false
+): Promise<number> {
+  if (isTauriRuntime()) {
+    return invoke<number>("restore_queued_captures", { ids, alsoPin });
+  }
+  ensureMockSeed();
+  let restored = 0;
+  mockCaptures = mockCaptures.map((c) => {
+    if (!ids.includes(c.id)) return c;
+    restored++;
+    return {
+      ...c,
+      queuedDeleteAt: null,
+      isPinned: alsoPin ? true : c.isPinned,
+    };
+  });
+  return restored;
+}
+
+export async function getStorageStatusPreview(
+  maxStorageGb?: number,
+  autoCleanupDays?: number
+): Promise<StorageStatusSummary> {
+  if (isTauriRuntime()) {
+    return invoke<StorageStatusSummary>("get_storage_status_preview", {
+      maxStorageGb: maxStorageGb ?? null,
+      autoCleanupDays: autoCleanupDays ?? null,
+    });
+  }
+  ensureMockSeed();
+  const active = mockCaptures.filter((c) => !c.queuedDeleteAt);
+  const pinned = active.filter((c) => c.isPinned);
+  const unpinned = active.filter((c) => !c.isPinned);
+  const queued = mockCaptures.filter((c) => Boolean(c.queuedDeleteAt) && !c.isPinned);
+  return {
+    activeCount: active.length,
+    activeBytes: active.reduce((acc, c) => acc + c.sizeBytes, 0),
+    pinnedCount: pinned.length,
+    pinnedBytes: pinned.reduce((acc, c) => acc + c.sizeBytes, 0),
+    unpinnedCount: unpinned.length,
+    unpinnedBytes: unpinned.reduce((acc, c) => acc + c.sizeBytes, 0),
+    queuedCount: queued.length,
+    queuedBytes: queued.reduce((acc, c) => acc + c.sizeBytes, 0),
+    nextExpiryAt: queued[0]?.queuedDeleteAt ?? null,
+    candidateCount: 0,
+    candidateBytes: 0,
+    candidateSamples: [],
+    expiredPurgedCount: 0,
+    pendingOcrCount: mockCaptures.filter((c) => c.ocrStatus === "pending").length,
+  };
+}
+
+export async function enforceStoragePoliciesNow(): Promise<StorageStatusSummary> {
+  if (isTauriRuntime()) {
+    return invoke<StorageStatusSummary>("enforce_storage_policies_now");
+  }
+  return getStorageStatusPreview();
+}
+
+export async function runOcrBackfillNow(): Promise<number> {
+  if (isTauriRuntime()) {
+    return invoke<number>("run_ocr_backfill_now");
+  }
+  return 0;
+}
+
+export async function semanticVisualSearch(
+  query: string,
+  limit = 200
+): Promise<CaptureRecord[]> {
+  if (isTauriRuntime()) {
+    return invoke<CaptureRecord[]>("semantic_visual_search", { query, limit });
+  }
+  ensureMockSeed();
+  const q = query.trim().toLowerCase();
+  if (!q) return [];
+  return mockCaptures
+    .filter((c) => {
+      if (c.queuedDeleteAt) return false;
+      const hay = `${c.sourceApp || ""} ${c.ocrText} ${c.tags.join(" ")} ${c.groupName}`.toLowerCase();
+      return hay.includes(q) || q.includes("dark") || q.includes("neon") || q.includes("ui");
+    })
+    .slice(0, limit);
+}
+
+export async function findSimilarCaptures(
+  captureId: string,
+  limit = 50
+): Promise<CaptureRecord[]> {
+  if (isTauriRuntime()) {
+    return invoke<CaptureRecord[]>("find_similar_captures", { captureId, limit });
+  }
+  ensureMockSeed();
+  const active = mockCaptures.filter((c) => !c.queuedDeleteAt);
+  const target = active.find((c) => c.id === captureId);
+  if (!target) return active.slice(0, limit);
+  return [target, ...active.filter((c) => c.id !== captureId)].slice(0, limit);
+}
+
+export async function getVisualSearchStatus(): Promise<VisualSearchStatus> {
+  if (isTauriRuntime()) {
+    return invoke<VisualSearchStatus>("get_visual_search_status");
+  }
+  ensureMockSeed();
+  const activeCount = mockCaptures.filter((c) => !c.queuedDeleteAt).length;
+  return {
+    enabled: mockSettings.aiVisualSearchEnabled ?? true,
+    modelVersion: "rv-vis-512-v1",
+    embeddingDim: 512,
+    bytesPerImage: 512,
+    indexedCount: activeCount,
+    unindexedCount: 0,
+    totalEmbeddingBytes: activeCount * 512,
+    modelLoadedInRam: false,
+    idleUnloadSeconds: 60,
+    secondsUntilUnload: null,
+  };
+}
+
+export async function runVisualIndexingNow(): Promise<number> {
+  if (isTauriRuntime()) {
+    return invoke<number>("run_visual_indexing_now");
+  }
+  ensureMockSeed();
+  return mockCaptures.length;
+}
+
+export async function unloadVisualModelNow(): Promise<void> {
+  if (isTauriRuntime()) {
+    return invoke<void>("unload_visual_model_now");
+  }
 }
 
 export async function deleteCaptures(ids: string[]): Promise<number> {
