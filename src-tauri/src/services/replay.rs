@@ -1532,12 +1532,35 @@ pub fn compute_pcm_waveform_peaks(pcm_bytes: &[u8], bucket_count: usize) -> Vec<
     out
 }
 
-/// Builds single-pass FFmpeg arguments that demux each audio stream to `.m4a` and mono 2 kHz `s16le` `.pcm`
-/// for instant track auditioning and waveform generation.
+/// Returns the raw `s16le` PCM payload inside a standard RIFF WAVE byte slice (skipping RIFF/LIST headers safely).
+pub fn extract_wav_pcm_slice(wav_bytes: &[u8]) -> &[u8] {
+    if wav_bytes.len() >= 12 && &wav_bytes[0..4] == b"RIFF" && &wav_bytes[8..12] == b"WAVE" {
+        let mut pos = 12usize;
+        while pos + 8 <= wav_bytes.len() {
+            let chunk_id = &wav_bytes[pos..pos + 4];
+            let chunk_len = u32::from_le_bytes([
+                wav_bytes[pos + 4],
+                wav_bytes[pos + 5],
+                wav_bytes[pos + 6],
+                wav_bytes[pos + 7],
+            ]) as usize;
+            let data_start = pos + 8;
+            if chunk_id == b"data" {
+                let data_end = data_start.saturating_add(chunk_len).min(wav_bytes.len());
+                return &wav_bytes[data_start..data_end];
+            }
+            pos = data_start.saturating_add(chunk_len + (chunk_len % 2));
+        }
+    }
+    wav_bytes.get(44..).unwrap_or(&[])
+}
+
+/// Builds single-pass FFmpeg arguments that decode and timestamp-align each audio stream to `.wav`
+/// (`aresample=async=1:first_pts=0`) for 100% reliable WebView2 Solo/Mute playback and waveform peaks.
 pub fn build_preview_demux_ffmpeg_args(
     src_path: &str,
-    targets: &[(usize, PathBuf, PathBuf)],
-    transcode_aac: bool,
+    targets: &[(usize, PathBuf)],
+    sample_rate_hz: u32,
 ) -> Vec<String> {
     let mut args = vec![
         "-y".to_string(),
@@ -1548,31 +1571,23 @@ pub fn build_preview_demux_ffmpeg_args(
         src_path.to_string(),
     ];
 
-    for (stream_idx, m4a_path, pcm_path) in targets {
+    let sr_str = sample_rate_hz.clamp(8000, 48000).to_string();
+    for (stream_idx, wav_path) in targets {
         args.extend([
             "-map".to_string(),
             format!("0:a:{}?", stream_idx),
             "-vn".to_string(),
-        ]);
-        if transcode_aac {
-            args.extend(["-c:a".to_string(), "aac".to_string(), "-b:a".to_string(), "160k".to_string()]);
-        } else {
-            args.extend(["-c:a".to_string(), "copy".to_string()]);
-        }
-        args.extend([
-            "-movflags".to_string(),
-            "+faststart".to_string(),
-            m4a_path.to_string_lossy().to_string(),
-            "-map".to_string(),
-            format!("0:a:{}?", stream_idx),
-            "-vn".to_string(),
+            "-af".to_string(),
+            "aresample=async=1:first_pts=0".to_string(),
+            "-c:a".to_string(),
+            "pcm_s16le".to_string(),
             "-ac".to_string(),
-            "1".to_string(),
+            "2".to_string(),
             "-ar".to_string(),
-            "2000".to_string(),
+            sr_str.clone(),
             "-f".to_string(),
-            "s16le".to_string(),
-            pcm_path.to_string_lossy().to_string(),
+            "wav".to_string(),
+            wav_path.to_string_lossy().to_string(),
         ]);
     }
     args
@@ -1620,12 +1635,13 @@ pub fn cleanup_video_track_previews(id: Option<&str>) {
     }
 }
 
-/// Extracts per-track `.m4a` streams and downsampled waveform peaks in a single FFmpeg pass
+/// Extracts per-track `.wav` streams and downsampled waveform peaks in a single FFmpeg pass
 /// for lazy Lightbox Solo/Mute auditioning (`v2.0.3`).
 pub fn prepare_video_track_previews(
     app: &AppHandle,
     capture_id: &str,
     bucket_count: usize,
+    force_refresh: bool,
 ) -> AppResult<Vec<VideoAudioTrackPreview>> {
     cleanup_stale_preview_dirs(Some(capture_id));
 
@@ -1656,14 +1672,19 @@ pub fn prepare_video_track_previews(
     }
 
     let preview_dir = preview_root_dir().join(capture_id);
+    if force_refresh && preview_dir.exists() {
+        let _ = fs::remove_dir_all(&preview_dir);
+    }
     fs::create_dir_all(&preview_dir)?;
     let peaks_cache_path = preview_dir.join("peaks_cache.json");
 
-    if peaks_cache_path.exists() {
+    if !force_refresh && peaks_cache_path.exists() {
         if let Ok(json_str) = fs::read_to_string(&peaks_cache_path) {
             if let Ok(cached) = serde_json::from_str::<Vec<VideoAudioTrackPreview>>(&json_str) {
                 let all_present = cached.len() == probe.audio_tracks.len()
-                    && cached.iter().all(|p| Path::new(&p.audio_path).exists());
+                    && cached
+                        .iter()
+                        .all(|p| p.audio_path.ends_with(".wav") && Path::new(&p.audio_path).exists());
                 if all_present {
                     return Ok(cached);
                 }
@@ -1671,37 +1692,34 @@ pub fn prepare_video_track_previews(
         }
     }
 
+    let sample_rate_hz = if probe.duration_ms > 600_000 {
+        12_000
+    } else if probe.duration_ms > 180_000 {
+        16_000
+    } else {
+        24_000
+    };
+
     let src_str = src_path.to_string_lossy().to_string();
-    let targets: Vec<(usize, PathBuf, PathBuf)> = probe
+    let targets: Vec<(usize, PathBuf)> = probe
         .audio_tracks
         .iter()
         .map(|t| {
             (
                 t.stream_index,
-                preview_dir.join(format!("track_{}.m4a", t.stream_index)),
-                preview_dir.join(format!("track_{}.pcm", t.stream_index)),
+                preview_dir.join(format!("track_{}.wav", t.stream_index)),
             )
         })
         .collect();
 
-    let run_demux = |transcode_aac: bool| -> std::io::Result<std::process::Output> {
-        let args = build_preview_demux_ffmpeg_args(&src_str, &targets, transcode_aac);
-        new_hidden_command(&bin_str)
-            .args(&args)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .output()
-    };
+    let args = build_preview_demux_ffmpeg_args(&src_str, &targets, sample_rate_hz);
+    let output = new_hidden_command(&bin_str)
+        .args(&args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()?;
 
-    let mut output = run_demux(false)?;
-    let needs_fallback = !output.status.success()
-        || targets
-            .iter()
-            .any(|(_, m4a, _)| !m4a.exists() || fs::metadata(m4a).map(|m| m.len() == 0).unwrap_or(true));
-    if needs_fallback {
-        output = run_demux(true)?;
-    }
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(AppError::General(format!(
@@ -1712,16 +1730,15 @@ pub fn prepare_video_track_previews(
 
     let buckets = bucket_count.clamp(32, 320);
     let mut previews = Vec::with_capacity(probe.audio_tracks.len());
-    for (track, (_, m4a_path, pcm_path)) in probe.audio_tracks.iter().zip(targets.iter()) {
-        let peaks = match fs::read(pcm_path) {
-            Ok(bytes) => compute_pcm_waveform_peaks(&bytes, buckets),
+    for (track, (_, wav_path)) in probe.audio_tracks.iter().zip(targets.iter()) {
+        let peaks = match fs::read(wav_path) {
+            Ok(bytes) => compute_pcm_waveform_peaks(extract_wav_pcm_slice(&bytes), buckets),
             Err(_) => vec![0.0; buckets],
         };
-        let _ = fs::remove_file(pcm_path);
         previews.push(VideoAudioTrackPreview {
             stream_index: track.stream_index,
             title: track.title.clone(),
-            audio_path: m4a_path.to_string_lossy().to_string(),
+            audio_path: wav_path.to_string_lossy().to_string(),
             peaks,
         });
     }
@@ -1867,21 +1884,31 @@ mod tests {
     #[test]
     fn test_preview_demux_ffmpeg_args_and_pcm_peaks() {
         let targets = vec![
-            (0usize, PathBuf::from("t0.m4a"), PathBuf::from("t0.pcm")),
-            (1usize, PathBuf::from("t1.m4a"), PathBuf::from("t1.pcm")),
+            (0usize, PathBuf::from("t0.wav")),
+            (1usize, PathBuf::from("t1.wav")),
         ];
-        let copy_args = build_preview_demux_ffmpeg_args("clip.mp4", &targets, false);
-        assert!(copy_args.contains(&"0:a:0?".to_string()));
-        assert!(copy_args.contains(&"0:a:1?".to_string()));
-        assert!(copy_args.windows(2).any(|w| w == ["-c:a", "copy"]));
-        assert!(copy_args.windows(2).any(|w| w == ["-f", "s16le"]));
+        let wav_args = build_preview_demux_ffmpeg_args("clip.mp4", &targets, 24_000);
+        assert!(wav_args.contains(&"0:a:0?".to_string()));
+        assert!(wav_args.contains(&"0:a:1?".to_string()));
+        assert!(wav_args.windows(2).any(|w| w == ["-c:a", "pcm_s16le"]));
+        assert!(wav_args.windows(2).any(|w| w == ["-f", "wav"]));
+        assert!(wav_args.iter().any(|a| a.contains("aresample=async=1:first_pts=0")));
 
+        // Build minimal RIFF WAVE bytes with a 44-byte header + 4 s16le samples
         let samples: [i16; 4] = [0, 16384, 0, -32768];
-        let mut bytes = Vec::with_capacity(8);
+        let mut wav = Vec::with_capacity(44 + 8);
+        wav.extend_from_slice(b"RIFF");
+        wav.extend_from_slice(&(36u32 + 8).to_le_bytes());
+        wav.extend_from_slice(b"WAVE");
+        wav.extend_from_slice(b"fmt ");
+        wav.extend_from_slice(&16u32.to_le_bytes());
+        wav.extend_from_slice(&[1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 16, 0]);
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(&8u32.to_le_bytes());
         for s in samples {
-            bytes.extend_from_slice(&s.to_le_bytes());
+            wav.extend_from_slice(&s.to_le_bytes());
         }
-        let peaks = compute_pcm_waveform_peaks(&bytes, 32);
+        let peaks = compute_pcm_waveform_peaks(extract_wav_pcm_slice(&wav), 32);
         assert_eq!(peaks.len(), 32);
         assert!(peaks.iter().any(|&p| (p - 1.0).abs() < 0.01));
         assert!(peaks.iter().any(|&p| p > 0.5 && p < 0.9));

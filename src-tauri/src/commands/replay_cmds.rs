@@ -175,10 +175,12 @@ pub async fn prepare_video_track_previews_cmd(
     app: AppHandle,
     id: String,
     buckets: Option<usize>,
+    force_refresh: Option<bool>,
 ) -> AppResult<Vec<VideoAudioTrackPreview>> {
     let bucket_count = buckets.unwrap_or(180);
+    let force = force_refresh.unwrap_or(false);
     tauri::async_runtime::spawn_blocking(move || {
-        prepare_video_track_previews(&app, &id, bucket_count)
+        prepare_video_track_previews(&app, &id, bucket_count, force)
     })
     .await
     .map_err(|e| AppError::General(e.to_string()))?

@@ -945,12 +945,14 @@ export async function probeVideoAudioTracks(id: string): Promise<VideoProbeInfo>
 
 export async function prepareVideoTrackPreviews(
   id: string,
-  buckets = 180
+  buckets = 180,
+  forceRefresh = false
 ): Promise<VideoAudioTrackPreview[]> {
   if (isTauriRuntime()) {
     return invoke<VideoAudioTrackPreview[]>("prepare_video_track_previews_cmd", {
       id,
       buckets,
+      forceRefresh,
     });
   }
   const makePeaks = (seed: number) =>

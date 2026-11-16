@@ -9,6 +9,7 @@ import {
   Loader2,
   Pause,
   Play,
+  RefreshCw,
   RotateCcw,
   Scissors,
   Volume2,
@@ -61,12 +62,16 @@ export const VideoTrimmerPanel: React.FC<VideoTrimmerPanelProps> = ({
 }) => {
   const trackBarRef = useRef<HTMLDivElement>(null);
   const audioRefs = useRef<Record<number, HTMLAudioElement | null>>({});
+  // Preserves the user's pre-monitor video.muted flag without ever mutating video.volume
+  const preMonitorVideoMutedRef = useRef<boolean | null>(null);
 
   const [probeInfo, setProbeInfo] = useState<VideoProbeInfo | null>(null);
   const [previews, setPreviews] = useState<VideoAudioTrackPreview[]>([]);
   const [probing, setProbing] = useState(false);
   const [loadingWaveforms, setLoadingWaveforms] = useState(false);
   const [probeError, setProbeError] = useState<string | null>(null);
+  const [failedTracks, setFailedTracks] = useState<Record<number, string>>({});
+  const [previewNonce, setPreviewNonce] = useState(0);
 
   const effectiveDurationMs = useMemo(() => {
     const candidate = durationMs || probeInfo?.durationMs || capture.durationMs || 0;
@@ -76,8 +81,14 @@ export const VideoTrimmerPanel: React.FC<VideoTrimmerPanelProps> = ({
   const [startMs, setStartMs] = useState(0);
   const [endMs, setEndMs] = useState(effectiveDurationMs);
   const [exportTracks, setExportTracks] = useState<number[]>([0]);
+
+  // Auditioning state:
+  // - `soloTrackIdx === null && customAuditionTracks === null` => Native <video> audio plays untouched.
+  // - Clicking `S` solos a track via synchronized WAV <audio> monitor.
+  // - Clicking Mute/Speaker toggles custom multi-track monitoring cleanly.
   const [soloTrackIdx, setSoloTrackIdx] = useState<number | null>(null);
-  const [auditionMutedTracks, setAuditionMutedTracks] = useState<number[]>([]);
+  const [customAuditionTracks, setCustomAuditionTracks] = useState<number[] | null>(null);
+
   const [mixSelectedAudio, setMixSelectedAudio] = useState(false);
   const [targetMaxMb, setTargetMaxMb] = useState<number | null>(null);
   const [replaceOriginal, setReplaceOriginal] = useState(false);
@@ -86,32 +97,24 @@ export const VideoTrimmerPanel: React.FC<VideoTrimmerPanelProps> = ({
   const [draggingHandle, setDraggingHandle] = useState<"start" | "end" | null>(null);
   const [loopSelection, setLoopSelection] = useState(false);
 
-  // Probe embedded tracks + lazily generate per-track waveforms & demuxed preview streams
+  // Probe embedded tracks once per capture
   useEffect(() => {
     let cancelled = false;
     setErrorMsg(null);
     setProbeError(null);
     setProbing(true);
-    setLoadingWaveforms(true);
-    setPreviews([]);
     setSoloTrackIdx(null);
+    setCustomAuditionTracks(null);
+    setPreviewNonce(0);
 
     probeVideoAudioTracks(capture.id)
       .then((info) => {
         if (cancelled) return;
         setProbeInfo(info);
         if (info.audioTracks.length > 0) {
-          const firstIdx = info.audioTracks[0].streamIndex;
-          setExportTracks([firstIdx]);
-          // Default auditioning to Track 0 only so Master Mix doesn't double-play over Desktop/Mic
-          setAuditionMutedTracks(
-            info.audioTracks
-              .filter((t) => t.streamIndex !== firstIdx)
-              .map((t) => t.streamIndex)
-          );
+          setExportTracks([info.audioTracks[0].streamIndex]);
         } else {
           setExportTracks([]);
-          setAuditionMutedTracks([]);
         }
         setMixSelectedAudio(false);
       })
@@ -120,13 +123,24 @@ export const VideoTrimmerPanel: React.FC<VideoTrimmerPanelProps> = ({
         setProbeInfo(null);
         setProbeError(err instanceof Error ? err.message : String(err));
         setExportTracks([0]);
-        setAuditionMutedTracks([]);
       })
       .finally(() => {
         if (!cancelled) setProbing(false);
       });
 
-    prepareVideoTrackPreviews(capture.id, WAVEFORM_BUCKETS)
+    return () => {
+      cancelled = true;
+    };
+  }, [capture.id]);
+
+  // Extract WAV track previews + waveform peaks (supports Retry via previewNonce)
+  useEffect(() => {
+    let cancelled = false;
+    setFailedTracks({});
+    setLoadingWaveforms(true);
+    setPreviews([]);
+
+    prepareVideoTrackPreviews(capture.id, WAVEFORM_BUCKETS, previewNonce > 0)
       .then((items) => {
         if (!cancelled) setPreviews(items);
       })
@@ -143,7 +157,7 @@ export const VideoTrimmerPanel: React.FC<VideoTrimmerPanelProps> = ({
     return () => {
       cancelled = true;
     };
-  }, [capture.id]);
+  }, [capture.id, previewNonce]);
 
   // Reset trim range whenever capture changes or metadata duration loads
   useEffect(() => {
@@ -152,90 +166,142 @@ export const VideoTrimmerPanel: React.FC<VideoTrimmerPanelProps> = ({
     setLoopSelection(false);
   }, [capture.id, effectiveDurationMs]);
 
-  const hasLiveAudioStreams = useMemo(
-    () => previews.some((p) => Boolean(p.audioPath)),
-    [previews]
+  const playablePreviews = useMemo(
+    () =>
+      previews.filter(
+        (p) => Boolean(p.audioPath) && failedTracks[p.streamIndex] === undefined
+      ),
+    [previews, failedTracks]
   );
+
+  const hasLiveAudioStreams = playablePreviews.length > 0;
+  const monitorRequested = soloTrackIdx !== null || customAuditionTracks !== null;
 
   const isTrackAudibleInPreview = useCallback(
     (streamIndex: number): boolean => {
       if (soloTrackIdx !== null) {
         return streamIndex === soloTrackIdx;
       }
-      return !auditionMutedTracks.includes(streamIndex);
+      if (customAuditionTracks !== null) {
+        return customAuditionTracks.includes(streamIndex);
+      }
+      return streamIndex === (probeInfo?.audioTracks[0]?.streamIndex ?? 0);
     },
-    [soloTrackIdx, auditionMutedTracks]
+    [soloTrackIdx, customAuditionTracks, probeInfo]
   );
 
-  // Mute native <video> track while demuxed preview <audio> streams are active
-  useEffect(() => {
-    const video = videoRef.current;
-    if (!video || !hasLiveAudioStreams) return;
-    const prevMuted = video.muted;
-    video.muted = true;
-    return () => {
-      video.muted = prevMuted;
-    };
-  }, [videoRef, hasLiveAudioStreams]);
+  const anyAudibleTargetPlayable = useMemo(
+    () => playablePreviews.some((p) => isTrackAudibleInPreview(p.streamIndex)),
+    [playablePreviews, isTrackAudibleInPreview]
+  );
 
-  // Update <audio> mute/volume states whenever Solo/Mute toggles mid-playback
+  // Only mute <video> while monitoring is requested AND at least one monitor target is decodable
+  // (or user explicitly muted all monitor tracks cleanly via customAuditionTracks = []).
+  const monitorActive =
+    monitorRequested &&
+    hasLiveAudioStreams &&
+    (anyAudibleTargetPlayable || (customAuditionTracks !== null && customAuditionTracks.length === 0));
+
   useEffect(() => {
     const video = videoRef.current;
-    if (!hasLiveAudioStreams) return;
-    const vol = video?.volume ?? 1;
+    if (!video) return;
+
+    if (monitorActive) {
+      if (preMonitorVideoMutedRef.current === null) {
+        preMonitorVideoMutedRef.current = video.muted;
+      }
+      video.muted = true;
+    } else if (preMonitorVideoMutedRef.current !== null) {
+      video.muted = preMonitorVideoMutedRef.current;
+      preMonitorVideoMutedRef.current = null;
+    }
+  }, [videoRef, monitorActive]);
+
+  // Always restore pre-monitor video.muted state when Trimmer closes/unmounts
+  useEffect(() => {
+    const video = videoRef.current;
+    return () => {
+      if (video && preMonitorVideoMutedRef.current !== null) {
+        video.muted = preMonitorVideoMutedRef.current;
+        preMonitorVideoMutedRef.current = null;
+      }
+    };
+  }, [videoRef]);
+
+  const syncSingleAudio = useCallback(
+    (
+      el: HTMLAudioElement,
+      streamIndex: number,
+      activeOverride?: boolean,
+      soloOverride?: number | null,
+      customOverride?: number[] | null
+    ) => {
+      const video = videoRef.current;
+      if (!video) return;
+
+      const isActive = activeOverride ?? monitorActive;
+      const audible =
+        soloOverride !== undefined
+          ? soloOverride !== null
+            ? streamIndex === soloOverride
+            : customOverride !== undefined && customOverride !== null
+            ? customOverride.includes(streamIndex)
+            : false
+          : isActive && isTrackAudibleInPreview(streamIndex);
+
+      el.muted = !audible;
+      el.volume = video.volume;
+      el.playbackRate = video.playbackRate || 1;
+      if (el.readyState >= 1 && Math.abs(el.currentTime - video.currentTime) > 0.08) {
+        try {
+          el.currentTime = video.currentTime;
+        } catch {
+          // Ignore seek before metadata ready
+        }
+      }
+
+      if (isActive && !video.paused && audible && el.readyState >= 2) {
+        el.play().catch((err) => {
+          setFailedTracks((prev) => ({
+            ...prev,
+            [streamIndex]: err instanceof Error ? err.message : String(err),
+          }));
+        });
+      } else {
+        el.pause();
+      }
+    },
+    [videoRef, monitorActive, isTrackAudibleInPreview]
+  );
+
+  // Keep <audio> monitor elements synchronized with <video> transport & volume (one-way)
+  useEffect(() => {
     for (const preview of previews) {
       const el = audioRefs.current[preview.streamIndex];
       if (!el) continue;
-      el.muted = !isTrackAudibleInPreview(preview.streamIndex);
-      el.volume = vol;
+      syncSingleAudio(el, preview.streamIndex);
     }
-  }, [videoRef, hasLiveAudioStreams, previews, isTrackAudibleInPreview]);
+  }, [previews, syncSingleAudio]);
 
-  // Lockstep sync between <video> transport and all demuxed <audio> preview elements
   useEffect(() => {
     const video = videoRef.current;
-    if (!video || !hasLiveAudioStreams) return;
+    if (!video || !monitorActive) return;
 
-    const getElements = () =>
-      Object.values(audioRefs.current).filter((el): el is HTMLAudioElement => Boolean(el));
-
-    const syncTimeAndRate = () => {
-      const targetTime = video.currentTime;
-      for (const el of getElements()) {
-        el.playbackRate = video.playbackRate || 1;
-        if (Math.abs(el.currentTime - targetTime) > 0.08) {
-          try {
-            el.currentTime = targetTime;
-          } catch {
-            // Ignore seek before metadata loaded
-          }
-        }
+    const syncAll = () => {
+      for (const preview of previews) {
+        const el = audioRefs.current[preview.streamIndex];
+        if (!el) continue;
+        syncSingleAudio(el, preview.streamIndex);
       }
-    };
-
-    const handlePlay = () => {
-      syncTimeAndRate();
-      for (const el of getElements()) {
-        el.play().catch(() => undefined);
-      }
-    };
-
-    const handlePause = () => {
-      for (const el of getElements()) {
-        el.pause();
-      }
-      syncTimeAndRate();
-    };
-
-    const handleSeek = () => {
-      syncTimeAndRate();
     };
 
     const handleTimeUpdate = () => {
       if (video.paused) return;
       const targetTime = video.currentTime;
-      for (const el of getElements()) {
-        if (Math.abs(el.currentTime - targetTime) > 0.14) {
+      for (const preview of previews) {
+        const el = audioRefs.current[preview.streamIndex];
+        if (!el || !isTrackAudibleInPreview(preview.streamIndex)) continue;
+        if (el.readyState >= 2 && Math.abs(el.currentTime - targetTime) > 0.14) {
           try {
             el.currentTime = targetTime;
           } catch {
@@ -245,39 +311,29 @@ export const VideoTrimmerPanel: React.FC<VideoTrimmerPanelProps> = ({
       }
     };
 
-    const handleVolumeChange = () => {
-      for (const el of getElements()) {
-        el.volume = video.volume;
-      }
-    };
+    syncAll();
 
-    if (!video.paused) {
-      handlePlay();
-    } else {
-      syncTimeAndRate();
-    }
-
-    video.addEventListener("play", handlePlay);
-    video.addEventListener("pause", handlePause);
-    video.addEventListener("seeking", handleSeek);
-    video.addEventListener("seeked", handleSeek);
-    video.addEventListener("ratechange", syncTimeAndRate);
+    video.addEventListener("play", syncAll);
+    video.addEventListener("pause", syncAll);
+    video.addEventListener("seeking", syncAll);
+    video.addEventListener("seeked", syncAll);
+    video.addEventListener("ratechange", syncAll);
+    video.addEventListener("volumechange", syncAll);
     video.addEventListener("timeupdate", handleTimeUpdate);
-    video.addEventListener("volumechange", handleVolumeChange);
 
     return () => {
-      video.removeEventListener("play", handlePlay);
-      video.removeEventListener("pause", handlePause);
-      video.removeEventListener("seeking", handleSeek);
-      video.removeEventListener("seeked", handleSeek);
-      video.removeEventListener("ratechange", syncTimeAndRate);
+      video.removeEventListener("play", syncAll);
+      video.removeEventListener("pause", syncAll);
+      video.removeEventListener("seeking", syncAll);
+      video.removeEventListener("seeked", syncAll);
+      video.removeEventListener("ratechange", syncAll);
+      video.removeEventListener("volumechange", syncAll);
       video.removeEventListener("timeupdate", handleTimeUpdate);
-      video.removeEventListener("volumechange", handleVolumeChange);
-      for (const el of getElements()) {
-        el.pause();
+      for (const el of Object.values(audioRefs.current)) {
+        el?.pause();
       }
     };
-  }, [videoRef, hasLiveAudioStreams, previews]);
+  }, [videoRef, monitorActive, previews, syncSingleAudio, isTrackAudibleInPreview]);
 
   // Keep loop-selection playback constrained between In and Out points
   useEffect(() => {
@@ -299,7 +355,7 @@ export const VideoTrimmerPanel: React.FC<VideoTrimmerPanelProps> = ({
         video.currentTime = clampedSec;
       }
       for (const el of Object.values(audioRefs.current)) {
-        if (!el) continue;
+        if (!el || el.readyState < 1) continue;
         try {
           el.currentTime = clampedSec;
         } catch {
@@ -365,6 +421,8 @@ export const VideoTrimmerPanel: React.FC<VideoTrimmerPanelProps> = ({
     return `est. ~${formatBytes(proportionalBytes)}`;
   }, [probeInfo?.sizeBytes, capture.sizeBytes, selectedSpanMs, effectiveDurationMs, targetMaxMb]);
 
+  const tracks = probeInfo?.audioTracks ?? [];
+
   const toggleExportTrack = (streamIndex: number) => {
     setExportTracks((prev) =>
       prev.includes(streamIndex)
@@ -373,23 +431,67 @@ export const VideoTrimmerPanel: React.FC<VideoTrimmerPanelProps> = ({
     );
   };
 
-  const toggleSoloTrack = (streamIndex: number) => {
-    setSoloTrackIdx((prev) => (prev === streamIndex ? null : streamIndex));
+  // Trigger audio element playback synchronously on user click so WebView2 autoplay policies allow it cleanly
+  const triggerMonitorPlayOnGesture = (
+    nextSolo: number | null,
+    nextCustom: number[] | null
+  ) => {
+    const active = nextSolo !== null || nextCustom !== null;
+    for (const preview of previews) {
+      const el = audioRefs.current[preview.streamIndex];
+      if (!el) continue;
+      syncSingleAudio(el, preview.streamIndex, active, nextSolo, nextCustom);
+    }
   };
 
-  const toggleAuditionMute = (streamIndex: number) => {
+  const toggleSoloTrack = (streamIndex: number) => {
+    const nextSolo = soloTrackIdx === streamIndex ? null : streamIndex;
+    setSoloTrackIdx(nextSolo);
+    if (nextSolo !== null) {
+      setCustomAuditionTracks(null);
+    }
+    triggerMonitorPlayOnGesture(nextSolo, nextSolo !== null ? null : customAuditionTracks);
+  };
+
+  const toggleAuditionTrack = (streamIndex: number) => {
     if (soloTrackIdx !== null) {
+      const nextCustom = streamIndex === soloTrackIdx ? null : [streamIndex];
       setSoloTrackIdx(null);
-      setAuditionMutedTracks(
-        tracks.filter((t) => t.streamIndex !== streamIndex).map((t) => t.streamIndex)
-      );
+      setCustomAuditionTracks(nextCustom);
+      triggerMonitorPlayOnGesture(null, nextCustom);
       return;
     }
-    setAuditionMutedTracks((prev) =>
-      prev.includes(streamIndex)
-        ? prev.filter((idx) => idx !== streamIndex)
-        : [...prev, streamIndex]
-    );
+
+    if (customAuditionTracks === null) {
+      const firstTrackIdx = tracks[0]?.streamIndex ?? 0;
+      const nextCustom =
+        streamIndex === firstTrackIdx
+          ? tracks.filter((t) => t.streamIndex !== firstTrackIdx).map((t) => t.streamIndex)
+          : [streamIndex];
+      setCustomAuditionTracks(nextCustom);
+      triggerMonitorPlayOnGesture(null, nextCustom);
+      return;
+    }
+
+    const exists = customAuditionTracks.includes(streamIndex);
+    const nextCustom = exists
+      ? customAuditionTracks.filter((idx) => idx !== streamIndex)
+      : [...customAuditionTracks, streamIndex].sort((a, b) => a - b);
+    setCustomAuditionTracks(nextCustom);
+    triggerMonitorPlayOnGesture(null, nextCustom);
+  };
+
+  const resetMonitorToDefault = () => {
+    setSoloTrackIdx(null);
+    setCustomAuditionTracks(null);
+    triggerMonitorPlayOnGesture(null, null);
+  };
+
+  const handleRetryPreviews = () => {
+    resetMonitorToDefault();
+    setProbeError(null);
+    setFailedTracks({});
+    setPreviewNonce((n) => n + 1);
   };
 
   const handleTogglePlaySelection = () => {
@@ -428,7 +530,6 @@ export const VideoTrimmerPanel: React.FC<VideoTrimmerPanelProps> = ({
     }
   };
 
-  const tracks = probeInfo?.audioTracks ?? [];
   const previewMap = useMemo(() => {
     const map = new Map<number, VideoAudioTrackPreview>();
     for (const p of previews) {
@@ -442,19 +543,28 @@ export const VideoTrimmerPanel: React.FC<VideoTrimmerPanelProps> = ({
     exportTracks.length > 1 &&
     tracks.some((t) => t.streamIndex === 0 && t.title.toLowerCase().includes("master"));
 
+  const failedEntries = Object.entries(failedTracks);
+
   return (
-    <div className="w-full max-w-5xl mt-3 rounded-xl bg-base-200/95 border border-base-300 p-3.5 shadow-lg space-y-3">
-      {/* Hidden synchronized <audio> elements for zero-glitches per-track Solo/Mute auditioning */}
+    <div className="w-full max-w-5xl mt-3 rounded-xl bg-base-200/95 border border-base-300 p-4 shadow-lg space-y-3">
+      {/* Hidden synchronized <audio> elements for per-track Solo/Mute auditioning */}
       {previews
         .filter((p) => Boolean(p.audioPath))
         .map((p) => (
           <audio
-            key={`${capture.id}-audio-${p.streamIndex}`}
+            key={`${capture.id}-audio-${previewNonce}-${p.streamIndex}`}
             ref={(el) => {
               audioRefs.current[p.streamIndex] = el;
             }}
             src={resolveMediaSrc(p.audioPath)}
             preload="auto"
+            onCanPlay={(e) => syncSingleAudio(e.currentTarget, p.streamIndex)}
+            onError={() => {
+              setFailedTracks((prev) => ({
+                ...prev,
+                [p.streamIndex]: p.title,
+              }));
+            }}
           />
         ))}
 
@@ -462,60 +572,80 @@ export const VideoTrimmerPanel: React.FC<VideoTrimmerPanelProps> = ({
       <div className="flex flex-wrap items-center justify-between gap-2">
         <div className="flex flex-wrap items-center gap-2">
           <Scissors className="w-4 h-4 text-primary" />
-          <span className="text-xs font-semibold tracking-tight">
+          <span className="text-sm font-semibold tracking-tight">
             Trim &amp; Multi-Track Audio Mixer
           </span>
-          <span className="badge badge-xs badge-ghost font-mono">
+          <span className="badge badge-sm badge-ghost font-mono text-xs">
             {formatPreciseMs(selectedSpanMs)} selected
           </span>
-          <span className="text-[11px] opacity-65 font-mono">{estimatedSizeLabel}</span>
-          {hasLiveAudioStreams && (
-            <span className="badge badge-xs badge-primary/80 gap-1">
-              <Headphones className="w-2.5 h-2.5" />
+          <span className="text-xs opacity-70 font-mono">{estimatedSizeLabel}</span>
+          {monitorActive && (
+            <button
+              type="button"
+              onClick={resetMonitorToDefault}
+              title="Return player audio back to default Master Mix"
+              className="badge badge-sm badge-warning gap-1 cursor-pointer hover:opacity-90 text-xs"
+            >
+              <Headphones className="w-3 h-3" />
               {soloTrackIdx !== null
-                ? `Solo: ${tracks.find((t) => t.streamIndex === soloTrackIdx)?.title ?? `#${soloTrackIdx + 1}`}`
-                : "Track Monitor Active"}
-            </span>
+                ? `Solo: ${tracks.find((t) => t.streamIndex === soloTrackIdx)?.title ?? `Track ${soloTrackIdx + 1}`}`
+                : `Monitoring ${customAuditionTracks?.length ?? 0} track(s)`}
+              {" • Reset"}
+            </button>
           )}
         </div>
 
         <div className="flex items-center gap-1.5">
+          {(failedEntries.length > 0 || probeError) && (
+            <button
+              type="button"
+              disabled={loadingWaveforms}
+              onClick={handleRetryPreviews}
+              className="btn btn-xs btn-outline btn-warning gap-1 text-xs"
+              title="Regenerate track audio previews & waveforms"
+            >
+              <RefreshCw className={`w-3.5 h-3.5 ${loadingWaveforms ? "animate-spin" : ""}`} />
+              Retry Previews
+            </button>
+          )}
           <button
             type="button"
-            className="btn btn-xs btn-ghost gap-1"
+            className="btn btn-xs btn-ghost gap-1 text-xs"
             title="Set Start (In) to current playhead"
             onClick={() => {
               const next = Math.min(Math.round(currentTimeMs), endMs - MIN_SPAN_MS);
               setStartMs(Math.max(0, next));
             }}
           >
-            <ArrowRightFromLine className="w-3 h-3" />
+            <ArrowRightFromLine className="w-3.5 h-3.5" />
             Set In
           </button>
           <button
             type="button"
-            className="btn btn-xs btn-ghost gap-1"
+            className="btn btn-xs btn-ghost gap-1 text-xs"
             title="Set End (Out) to current playhead"
             onClick={() => {
               const next = Math.max(Math.round(currentTimeMs), startMs + MIN_SPAN_MS);
               setEndMs(Math.min(effectiveDurationMs, next));
             }}
           >
-            <ArrowLeftToLine className="w-3 h-3" />
+            <ArrowLeftToLine className="w-3.5 h-3.5" />
             Set Out
           </button>
           <button
             type="button"
-            className={`btn btn-xs gap-1 ${loopSelection && isPlaying ? "btn-primary" : "btn-outline"}`}
+            className={`btn btn-xs gap-1 text-xs ${
+              loopSelection && isPlaying ? "btn-primary" : "btn-outline"
+            }`}
             onClick={handleTogglePlaySelection}
           >
             {loopSelection && isPlaying ? (
               <>
-                <Pause className="w-3 h-3" /> Pause Loop
+                <Pause className="w-3.5 h-3.5" /> Pause Loop
               </>
             ) : (
               <>
-                <Play className="w-3 h-3" /> Play Selection
+                <Play className="w-3.5 h-3.5" /> Play Selection
               </>
             )}
           </button>
@@ -529,20 +659,20 @@ export const VideoTrimmerPanel: React.FC<VideoTrimmerPanelProps> = ({
               setLoopSelection(false);
             }}
           >
-            <RotateCcw className="w-3 h-3" />
+            <RotateCcw className="w-3.5 h-3.5" />
           </button>
         </div>
       </div>
 
       {/* Unified Multi-Lane Timeline (Aligned Playhead Across Video + Audio Waveforms) */}
-      <div className="rounded-lg bg-base-300/60 border border-base-300 p-2 space-y-1.5">
+      <div className="rounded-lg bg-base-300/60 border border-base-300 p-2.5 space-y-2">
         {/* Video Scrubber Lane */}
-        <div className="flex items-center gap-2.5">
-          <div className="w-48 sm:w-56 shrink-0 flex items-center justify-between pr-1">
-            <span className="text-[11px] font-semibold uppercase tracking-wider opacity-75">
+        <div className="flex items-center gap-3">
+          <div className="w-56 sm:w-64 shrink-0 flex items-center justify-between pr-1">
+            <span className="text-xs font-semibold uppercase tracking-wider opacity-80">
               Video Clip
             </span>
-            <span className="text-[10px] font-mono opacity-70">
+            <span className="text-xs font-mono opacity-75">
               {formatPreciseMs(startMs)} – {formatPreciseMs(endMs)}
             </span>
           </div>
@@ -553,7 +683,7 @@ export const VideoTrimmerPanel: React.FC<VideoTrimmerPanelProps> = ({
               if ((e.target as HTMLElement).dataset.handle) return;
               seekVideoToMs(clientXToMs(e.clientX));
             }}
-            className="relative flex-1 h-7 rounded-md bg-base-300 border border-base-content/10 cursor-pointer select-none touch-none overflow-hidden"
+            className="relative flex-1 h-8 rounded-md bg-base-300 border border-base-content/15 cursor-pointer select-none touch-none overflow-hidden"
           >
             <div
               className="absolute inset-y-0 left-0 bg-base-100/60 pointer-events-none"
@@ -585,7 +715,7 @@ export const VideoTrimmerPanel: React.FC<VideoTrimmerPanelProps> = ({
               className="absolute inset-y-0 -translate-x-1/2 w-3.5 bg-primary hover:bg-primary/90 text-primary-content flex items-center justify-center cursor-ew-resize z-20 rounded-sm shadow"
               style={{ left: `${startPct}%` }}
             >
-              <span className="w-0.5 h-3.5 bg-primary-content/80 rounded-full pointer-events-none" />
+              <span className="w-0.5 h-4 bg-primary-content/85 rounded-full pointer-events-none" />
             </button>
             <button
               type="button"
@@ -598,80 +728,99 @@ export const VideoTrimmerPanel: React.FC<VideoTrimmerPanelProps> = ({
               className="absolute inset-y-0 -translate-x-1/2 w-3.5 bg-primary hover:bg-primary/90 text-primary-content flex items-center justify-center cursor-ew-resize z-20 rounded-sm shadow"
               style={{ left: `${endPct}%` }}
             >
-              <span className="w-0.5 h-3.5 bg-primary-content/80 rounded-full pointer-events-none" />
+              <span className="w-0.5 h-4 bg-primary-content/85 rounded-full pointer-events-none" />
             </button>
           </div>
         </div>
 
         {/* Per-Track Audio Waveform Lanes */}
         {probing ? (
-          <div className="flex items-center gap-2 text-xs opacity-65 py-1.5 px-1">
-            <Loader2 className="w-3.5 h-3.5 animate-spin" />
+          <div className="flex items-center gap-2 text-xs opacity-70 py-1.5 px-1">
+            <Loader2 className="w-4 h-4 animate-spin" />
             Inspecting embedded audio streams...
           </div>
         ) : probeError ? (
-          <div className="text-xs text-error py-1.5 px-1">
-            Audio track probe failed: {probeError}
+          <div className="flex items-center justify-between gap-2 text-xs text-error py-1.5 px-1">
+            <span>Audio track probe failed: {probeError}</span>
+            <button
+              type="button"
+              onClick={handleRetryPreviews}
+              className="btn btn-xs btn-outline btn-error gap-1"
+            >
+              <RefreshCw className="w-3 h-3" />
+              Retry
+            </button>
           </div>
         ) : tracks.length === 0 ? (
-          <div className="text-xs opacity-60 py-1 px-1">
+          <div className="text-xs opacity-65 py-1 px-1">
             No embedded audio streams detected (video-only export).
           </div>
         ) : (
-          <div className="space-y-1">
+          <div className="space-y-1.5">
             {tracks.map((track) => {
               const preview = previewMap.get(track.streamIndex);
               const peaks = preview?.peaks ?? [];
+              const trackFailed = failedTracks[track.streamIndex] !== undefined;
+              const trackPlayable = Boolean(preview?.audioPath) && !trackFailed;
               const included = exportTracks.includes(track.streamIndex);
               const isSolo = soloTrackIdx === track.streamIndex;
               const isAudible = isTrackAudibleInPreview(track.streamIndex);
 
               return (
-                <div key={track.streamIndex} className="flex items-center gap-2.5">
+                <div key={track.streamIndex} className="flex items-center gap-3">
                   {/* Track Label + Solo / Monitor Mute / Export Controls */}
-                  <div className="w-48 sm:w-56 shrink-0 flex items-center justify-between gap-1.5 bg-base-200/80 border border-base-300 rounded-md px-2 py-1">
+                  <div className="w-56 sm:w-64 shrink-0 flex items-center justify-between gap-2 bg-base-200/85 border border-base-300 rounded-md px-2.5 py-1.5">
                     <div className="min-w-0 flex-1">
-                      <div className="text-[11px] font-medium truncate" title={track.title}>
+                      <div className="text-xs font-semibold truncate" title={track.title}>
                         {track.title}
                       </div>
-                      <div className="text-[9px] font-mono opacity-55">
+                      <div className="text-[11px] font-mono opacity-65">
                         Track {track.streamIndex + 1} • {track.codec}
+                        {trackFailed ? " • retry needed" : ""}
                       </div>
                     </div>
 
                     <div className="flex items-center gap-1 shrink-0">
                       <button
                         type="button"
-                        disabled={!hasLiveAudioStreams}
-                        title={isSolo ? "Disable Solo" : "Solo this track in player"}
+                        disabled={!trackPlayable}
+                        title={
+                          !trackPlayable
+                            ? "Preview stream unavailable (click Retry Previews)"
+                            : isSolo
+                            ? "Disable Solo"
+                            : "Solo this track in player"
+                        }
                         onClick={() => toggleSoloTrack(track.streamIndex)}
-                        className={`btn btn-xs h-5 min-h-0 px-1.5 font-mono text-[10px] ${
+                        className={`btn btn-xs h-6 min-h-0 px-2 font-mono text-xs ${
                           isSolo
                             ? "btn-warning text-warning-content"
-                            : "btn-ghost opacity-70 hover:opacity-100"
+                            : "btn-ghost opacity-75 hover:opacity-100"
                         }`}
                       >
                         S
                       </button>
                       <button
                         type="button"
-                        disabled={!hasLiveAudioStreams}
+                        disabled={!trackPlayable}
                         title={
-                          isAudible
+                          !trackPlayable
+                            ? "Preview stream unavailable (click Retry Previews)"
+                            : isAudible
                             ? "Mute track in Lightbox preview"
                             : "Listen to track in Lightbox preview"
                         }
-                        onClick={() => toggleAuditionMute(track.streamIndex)}
-                        className={`btn btn-xs h-5 min-h-0 px-1.5 ${
+                        onClick={() => toggleAuditionTrack(track.streamIndex)}
+                        className={`btn btn-xs h-6 min-h-0 px-2 ${
                           isAudible
                             ? "btn-ghost text-info"
-                            : "btn-ghost opacity-45 hover:opacity-85"
+                            : "btn-ghost opacity-45 hover:opacity-90"
                         }`}
                       >
                         {isAudible ? (
-                          <Volume2 className="w-3 h-3" />
+                          <Volume2 className="w-3.5 h-3.5" />
                         ) : (
-                          <VolumeX className="w-3 h-3" />
+                          <VolumeX className="w-3.5 h-3.5" />
                         )}
                       </button>
                       <button
@@ -682,11 +831,11 @@ export const VideoTrimmerPanel: React.FC<VideoTrimmerPanelProps> = ({
                             : "Excluded from export (click to include)"
                         }
                         onClick={() => toggleExportTrack(track.streamIndex)}
-                        className={`btn btn-xs h-5 min-h-0 px-1.5 gap-0.5 text-[10px] ${
-                          included ? "btn-primary" : "btn-outline opacity-55"
+                        className={`btn btn-xs h-6 min-h-0 px-2 gap-1 text-xs ${
+                          included ? "btn-primary" : "btn-outline opacity-60"
                         }`}
                       >
-                        {included && <Check className="w-2.5 h-2.5" />}
+                        {included && <Check className="w-3 h-3" />}
                         Exp
                       </button>
                     </div>
@@ -700,18 +849,18 @@ export const VideoTrimmerPanel: React.FC<VideoTrimmerPanelProps> = ({
                       const ratio = Math.min(1, Math.max(0, (e.clientX - rect.left) / rect.width));
                       seekVideoToMs(Math.round(ratio * effectiveDurationMs));
                     }}
-                    className={`relative flex-1 h-9 rounded-md bg-base-200/75 border cursor-pointer overflow-hidden flex items-center px-0.5 transition-opacity ${
-                      included ? "border-base-content/15" : "border-base-300 opacity-45"
+                    className={`relative flex-1 h-10 rounded-md bg-base-200/80 border cursor-pointer overflow-hidden flex items-center px-0.5 transition-opacity ${
+                      included ? "border-base-content/15" : "border-base-300 opacity-50"
                     }`}
                   >
                     {loadingWaveforms && peaks.length === 0 ? (
-                      <div className="w-full text-center text-[10px] opacity-50 font-mono">
+                      <div className="w-full text-center text-xs opacity-60 font-mono">
                         Generating waveform...
                       </div>
                     ) : peaks.length === 0 ? (
                       <div className="w-full h-px bg-base-content/15" />
                     ) : (
-                      <div className="w-full h-7 flex items-center gap-[1px] pointer-events-none">
+                      <div className="w-full h-8 flex items-center gap-[1px] pointer-events-none">
                         {peaks.map((amp, i) => {
                           const barPct = ((i + 0.5) / peaks.length) * 100;
                           const inSelection = barPct >= startPct && barPct <= endPct;
@@ -755,7 +904,7 @@ export const VideoTrimmerPanel: React.FC<VideoTrimmerPanelProps> = ({
           </div>
         )}
 
-        <div className="flex items-center justify-between text-[11px] font-mono opacity-75 pt-0.5">
+        <div className="flex items-center justify-between text-xs font-mono opacity-75 pt-0.5">
           <span>In: {formatPreciseMs(startMs)}</span>
           <span>Playhead: {formatPreciseMs(currentTimeMs)}</span>
           <span>Out: {formatPreciseMs(endMs)} / {formatPreciseMs(effectiveDurationMs)}</span>
@@ -763,8 +912,8 @@ export const VideoTrimmerPanel: React.FC<VideoTrimmerPanelProps> = ({
       </div>
 
       {/* Mix Options + Target Size Presets + Export Submit */}
-      <div className="flex flex-wrap items-center justify-between gap-3 pt-1 border-t border-base-300">
-        <div className="space-y-1">
+      <div className="flex flex-wrap items-center justify-between gap-3 pt-1.5 border-t border-base-300">
+        <div className="space-y-1.5">
           <div className="flex flex-wrap items-center gap-1.5">
             {SIZE_PRESETS.map((preset) => {
               const active = targetMaxMb === preset.value;
@@ -772,7 +921,7 @@ export const VideoTrimmerPanel: React.FC<VideoTrimmerPanelProps> = ({
                 <button
                   key={preset.label}
                   type="button"
-                  className={`btn btn-xs ${active ? "btn-primary" : "btn-outline"}`}
+                  className={`btn btn-xs text-xs ${active ? "btn-primary" : "btn-outline"}`}
                   onClick={() => setTargetMaxMb(preset.value)}
                 >
                   {preset.label}
@@ -781,7 +930,7 @@ export const VideoTrimmerPanel: React.FC<VideoTrimmerPanelProps> = ({
             })}
           </div>
 
-          <div className="flex flex-wrap items-center gap-3 text-[11px]">
+          <div className="flex flex-wrap items-center gap-3 text-xs">
             {exportTracks.length > 1 && (
               <label className="flex items-center gap-1.5 cursor-pointer">
                 <input
@@ -794,8 +943,8 @@ export const VideoTrimmerPanel: React.FC<VideoTrimmerPanelProps> = ({
               </label>
             )}
             {exportTracks.length > 1 && !mixSelectedAudio && (
-              <span className="opacity-65 flex items-center gap-1">
-                <Layers className="w-3 h-3" />
+              <span className="opacity-70 flex items-center gap-1">
+                <Layers className="w-3.5 h-3.5" />
                 Multi-track `.mp4` ({exportTracks.length} streams)
               </span>
             )}
@@ -820,7 +969,7 @@ export const VideoTrimmerPanel: React.FC<VideoTrimmerPanelProps> = ({
 
           <button
             type="button"
-            className="btn btn-sm btn-primary gap-1.5"
+            className="btn btn-sm btn-primary gap-1.5 text-xs"
             disabled={trimming || selectedSpanMs < MIN_SPAN_MS}
             onClick={handleTrimSubmit}
           >
@@ -839,10 +988,28 @@ export const VideoTrimmerPanel: React.FC<VideoTrimmerPanelProps> = ({
         </div>
       </div>
 
-      {errorMsg && (
-        <div className="alert alert-error py-2 px-3 text-xs">
-          <AlertCircle className="w-4 h-4 shrink-0" />
-          <span>{errorMsg}</span>
+      {(errorMsg || failedEntries.length > 0) && (
+        <div className="alert alert-error py-2 px-3 text-xs flex items-center justify-between gap-2">
+          <div className="flex items-center gap-2">
+            <AlertCircle className="w-4 h-4 shrink-0" />
+            <span>
+              {errorMsg ||
+                `Failed to decode preview stream for ${failedEntries
+                  .map(([idx, title]) => title || `Track ${Number(idx) + 1}`)
+                  .join(", ")}. Original video audio stays available.`}
+            </span>
+          </div>
+          {failedEntries.length > 0 && (
+            <button
+              type="button"
+              disabled={loadingWaveforms}
+              onClick={handleRetryPreviews}
+              className="btn btn-xs btn-ghost border border-current/30 gap-1 shrink-0"
+            >
+              <RefreshCw className={`w-3 h-3 ${loadingWaveforms ? "animate-spin" : ""}`} />
+              Retry
+            </button>
+          )}
         </div>
       )}
     </div>

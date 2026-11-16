@@ -54,6 +54,17 @@ export const MediaLightbox: React.FC<MediaLightboxProps> = ({
   const [videoDurationMs, setVideoDurationMs] = useState(capture.durationMs ?? 0);
   const [isPlaying, setIsPlaying] = useState(false);
   const videoRef = useRef<HTMLVideoElement | null>(null);
+  const backdropMouseDownRef = useRef(false);
+
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        onClose();
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [onClose]);
 
   useEffect(() => {
     setCurrentTimeMs(0);
@@ -96,13 +107,28 @@ export const MediaLightbox: React.FC<MediaLightboxProps> = ({
   };
 
   return (
-    <dialog className="modal modal-open" onClick={onClose}>
+    <div
+      role="dialog"
+      aria-modal="true"
+      onMouseDown={(e) => {
+        backdropMouseDownRef.current = e.target === e.currentTarget;
+      }}
+      onClick={(e) => {
+        // Ignore drags that began inside the Lightbox and released over the backdrop
+        if (backdropMouseDownRef.current && e.target === e.currentTarget) {
+          onClose();
+        }
+        backdropMouseDownRef.current = false;
+      }}
+      className="absolute inset-0 z-30 bg-black/70 backdrop-blur-xs flex items-center justify-center p-3 sm:p-5 overflow-hidden"
+    >
       <div
-        className="modal-box max-w-6xl p-0 bg-base-100 border border-base-300 shadow-2xl overflow-hidden flex flex-col lg:flex-row max-h-[90vh]"
+        className="w-full max-w-6xl h-full max-h-full rounded-2xl p-0 bg-base-100 border border-base-300 shadow-2xl overflow-hidden flex flex-col lg:flex-row"
         onClick={(e) => e.stopPropagation()}
       >
         {/* Full-Resolution Image or Native HTML5 Video Player */}
-        <div className="flex-1 bg-base-300 flex flex-col items-center justify-center p-4 min-h-[380px] overflow-y-auto">
+        <div className="flex-1 bg-base-300 flex flex-col items-center p-4 min-h-0 overflow-y-auto">
+          <div className="w-full my-auto flex flex-col items-center">
           {capture.mediaType === "video" ? (
             <>
               <video
@@ -148,6 +174,7 @@ export const MediaLightbox: React.FC<MediaLightboxProps> = ({
               className="max-w-full max-h-[78vh] object-contain rounded-lg shadow-lg"
             />
           )}
+          </div>
         </div>
 
         {/* Right Details & Actions Sidebar */}
@@ -388,6 +415,6 @@ export const MediaLightbox: React.FC<MediaLightboxProps> = ({
           </div>
         </div>
       </div>
-    </dialog>
+    </div>
   );
 };

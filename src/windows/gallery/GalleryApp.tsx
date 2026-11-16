@@ -672,6 +672,8 @@ export const GalleryApp: React.FC<GalleryAppProps> = ({
         </div>
       </header>
 
+      {/* Main Workspace Container (keeps topbar always draggable, resizable, and interactive) */}
+      <div className="relative flex-1 min-h-0 flex flex-col overflow-hidden">
       {/* Secondary Filter, B-Tree Sort, Column Resizer & Maintenance Toolbar */}
       {activeTab === "gallery" && (
         <div className="flex flex-wrap items-center justify-between gap-2 px-5 py-2 bg-base-200/60 border-b border-base-300 text-xs">
@@ -1273,7 +1275,7 @@ export const GalleryApp: React.FC<GalleryAppProps> = ({
         <SettingsPanel />
       )}
 
-      {/* Full-Resolution Lightbox Modal */}
+      {/* In-Workspace Lightbox Overlay (Leaves Topbar Uncovered) */}
       {selectedCapture && (
         <MediaLightbox
           capture={selectedCapture}
@@ -1293,6 +1295,7 @@ export const GalleryApp: React.FC<GalleryAppProps> = ({
           }}
         />
       )}
+      </div>
     </div>
   );
 };
