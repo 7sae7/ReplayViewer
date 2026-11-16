@@ -8,8 +8,9 @@ use crate::services::ffmpeg::{
     download_minimal_ffmpeg_to_dir, get_cached_or_probe_ffmpeg, FfmpegStatus,
 };
 use crate::services::replay::{
-    probe_capture_video_info, save_replay_clip, trim_video_clip, FfmpegReplayBufferProvider,
-    ReplayBufferProvider, ReplayBufferSnapshot, VideoProbeInfo,
+    cleanup_video_track_previews, prepare_video_track_previews, probe_capture_video_info,
+    save_replay_clip, trim_video_clip, FfmpegReplayBufferProvider, ReplayBufferProvider,
+    ReplayBufferSnapshot, VideoAudioTrackPreview, VideoProbeInfo,
 };
 use crate::state::{AppState, ReplayRuntimeState};
 
@@ -167,6 +168,25 @@ pub async fn probe_video_audio_tracks(
     tauri::async_runtime::spawn_blocking(move || probe_capture_video_info(&app, &id))
         .await
         .map_err(|e| AppError::General(e.to_string()))?
+}
+
+#[tauri::command]
+pub async fn prepare_video_track_previews_cmd(
+    app: AppHandle,
+    id: String,
+    buckets: Option<usize>,
+) -> AppResult<Vec<VideoAudioTrackPreview>> {
+    let bucket_count = buckets.unwrap_or(180);
+    tauri::async_runtime::spawn_blocking(move || {
+        prepare_video_track_previews(&app, &id, bucket_count)
+    })
+    .await
+    .map_err(|e| AppError::General(e.to_string()))?
+}
+
+#[tauri::command]
+pub fn cleanup_video_track_previews_cmd(id: Option<String>) {
+    cleanup_video_track_previews(id.as_deref());
 }
 
 #[tauri::command]

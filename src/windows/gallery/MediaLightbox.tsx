@@ -21,6 +21,7 @@ import {
   formatDurationMs,
 } from "../../lib/dpi";
 import {
+  cleanupVideoTrackPreviews,
   copyCaptureToClipboard,
   openInFileExplorer,
   resolveMediaSrc,
@@ -58,7 +59,13 @@ export const MediaLightbox: React.FC<MediaLightboxProps> = ({
     setCurrentTimeMs(0);
     setVideoDurationMs(capture.durationMs ?? 0);
     setIsPlaying(false);
-  }, [capture.id, capture.durationMs]);
+    const prevId = capture.id;
+    return () => {
+      if (capture.mediaType === "video") {
+        cleanupVideoTrackPreviews(prevId).catch(() => undefined);
+      }
+    };
+  }, [capture.id, capture.durationMs, capture.mediaType]);
 
   const handleAddTag = async (e: React.FormEvent) => {
     e.preventDefault();

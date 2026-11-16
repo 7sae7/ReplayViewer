@@ -12,12 +12,14 @@ import {
   listCaptures,
   listClipboardHistory,
   pasteClipboardItem,
+  prepareVideoTrackPreviews,
   probeVideoAudioTracks,
   promoteClipboardToGallery,
   saveAnnotatedCapture,
   setClipboardAlwaysOnTop,
   togglePinClipboardItem,
   trimVideoClip,
+  cleanupVideoTrackPreviews,
 } from "../lib/tauri-client";
 import { useEditorStore } from "../stores/useEditorStore";
 import type { ArrowAnnotation, PixelateAnnotation } from "../types/ipc";
@@ -244,6 +246,11 @@ describe("Phase 1.5.1 Visual Clipboard Drawer (Alt + V) Operations", () => {
 
     const probe = await probeVideoAudioTracks(target.id);
     expect(probe.audioTracks.length).toBeGreaterThanOrEqual(1);
+
+    const previews = await prepareVideoTrackPreviews(target.id, 64);
+    expect(previews.length).toBe(probe.audioTracks.length);
+    expect(previews[0].peaks.length).toBe(64);
+    await cleanupVideoTrackPreviews(target.id);
 
     // 1. Non-destructive trim with 10 MB Discord target adds a new capture
     const keptCopy = await trimVideoClip({

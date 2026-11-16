@@ -171,6 +171,13 @@ export interface VideoProbeInfo {
   audioTracks: VideoAudioTrack[];
 }
 
+export interface VideoAudioTrackPreview {
+  streamIndex: number;
+  title: string;
+  audioPath: string;
+  peaks: number[];
+}
+
 export interface SettingsPayload {
   hotkeyRegionCapture: string;
   hotkeyFullscreenCapture: string;

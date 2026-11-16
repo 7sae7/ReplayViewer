@@ -12,6 +12,7 @@ import type {
   SettingsPayload,
   StorageStatusSummary,
   UnindexedScanResult,
+  VideoAudioTrackPreview,
   VideoProbeInfo,
 } from "../types/ipc";
 
@@ -940,6 +941,35 @@ export async function probeVideoAudioTracks(id: string): Promise<VideoProbeInfo>
       { streamIndex: 3, title: "Microphone", channels: 2, codec: "aac" },
     ],
   };
+}
+
+export async function prepareVideoTrackPreviews(
+  id: string,
+  buckets = 180
+): Promise<VideoAudioTrackPreview[]> {
+  if (isTauriRuntime()) {
+    return invoke<VideoAudioTrackPreview[]>("prepare_video_track_previews_cmd", {
+      id,
+      buckets,
+    });
+  }
+  const makePeaks = (seed: number) =>
+    Array.from({ length: Math.min(240, Math.max(32, buckets)) }, (_, i) => {
+      const wave = Math.abs(Math.sin((i + seed * 7) * 0.23) * Math.cos((i + seed) * 0.09));
+      return Number(Math.min(1, Math.max(0.06, wave * (seed === 3 ? 0.75 : 0.95))).toFixed(3));
+    });
+  return [
+    { streamIndex: 0, title: "Master Mix", audioPath: "", peaks: makePeaks(0) },
+    { streamIndex: 1, title: "Desktop Audio", audioPath: "", peaks: makePeaks(1) },
+    { streamIndex: 2, title: "Spotify.exe", audioPath: "", peaks: makePeaks(2) },
+    { streamIndex: 3, title: "Microphone", audioPath: "", peaks: makePeaks(3) },
+  ];
+}
+
+export async function cleanupVideoTrackPreviews(id?: string): Promise<void> {
+  if (isTauriRuntime()) {
+    await invoke("cleanup_video_track_previews_cmd", { id: id ?? null });
+  }
 }
 
 export async function trimVideoClip(

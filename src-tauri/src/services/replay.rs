@@ -48,6 +48,15 @@ pub struct VideoProbeInfo {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct VideoAudioTrackPreview {
+    pub stream_index: usize,
+    pub title: String,
+    pub audio_path: String,
+    pub peaks: Vec<f32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ReplayBufferSnapshot {
     pub runtime: ReplayRuntimeState,
     pub buffer_secs: u32,
@@ -956,6 +965,114 @@ fn generate_video_thumbnail_and_probe(
     (info.width, info.height, dur)
 }
 
+/// Resolves `ffprobe` next to the resolved `ffmpeg` binary without mutating parent folder names
+/// such as `ffmpeg-master-latest-win64-lgpl`.
+pub fn resolve_ffprobe_binary(ffmpeg_bin: &str) -> PathBuf {
+    let p = Path::new(ffmpeg_bin);
+    let target_name = match p.file_name().and_then(|n| n.to_str()) {
+        Some(name) if name.to_ascii_lowercase().ends_with(".exe") => {
+            if name.to_ascii_lowercase().contains("ffmpeg") {
+                name.replacen("ffmpeg", "ffprobe", 1)
+            } else {
+                "ffprobe.exe".to_string()
+            }
+        }
+        Some(name) if name.to_ascii_lowercase().contains("ffmpeg") => {
+            name.replacen("ffmpeg", "ffprobe", 1)
+        }
+        _ => {
+            if cfg!(target_os = "windows") {
+                "ffprobe.exe".to_string()
+            } else {
+                "ffprobe".to_string()
+            }
+        }
+    };
+    p.with_file_name(target_name)
+}
+
+/// Parses `ffmpeg -hide_banner -i <video>` stderr output for duration, resolution, and audio streams.
+pub fn parse_ffmpeg_stderr_probe(stderr: &str) -> (u64, u32, u32, Vec<VideoAudioTrack>) {
+    let mut duration_ms = 0u64;
+    let mut width = 1920u32;
+    let mut height = 1080u32;
+    let mut audio_tracks: Vec<VideoAudioTrack> = Vec::new();
+    let mut in_audio_stream = false;
+
+    for line in stderr.lines() {
+        let trimmed = line.trim();
+        if let Some(dur_part) = trimmed.strip_prefix("Duration:") {
+            if let Some(hms) = dur_part.split(',').next() {
+                let parts: Vec<&str> = hms.trim().split(':').collect();
+                if parts.len() == 3 {
+                    if let (Ok(h), Ok(m), Ok(s)) = (
+                        parts[0].parse::<f64>(),
+                        parts[1].parse::<f64>(),
+                        parts[2].parse::<f64>(),
+                    ) {
+                        duration_ms = ((h * 3600.0 + m * 60.0 + s) * 1000.0).round() as u64;
+                    }
+                }
+            }
+        }
+
+        if trimmed.starts_with("Stream #") && trimmed.contains("Video:") {
+            in_audio_stream = false;
+            for token in trimmed.split([',', ' ']) {
+                if let Some((w_s, h_s)) = token.split_once('x') {
+                    if let (Ok(w), Ok(h)) = (w_s.parse::<u32>(), h_s.parse::<u32>()) {
+                        if w >= 64 && h >= 64 {
+                            width = w;
+                            height = h;
+                            break;
+                        }
+                    }
+                }
+            }
+        } else if trimmed.starts_with("Stream #") && trimmed.contains("Audio:") {
+            in_audio_stream = true;
+            let idx = audio_tracks.len();
+            let codec = trimmed
+                .split_once("Audio:")
+                .and_then(|(_, rest)| rest.trim().split([' ', ',', '(']).next())
+                .map(|c| c.trim().to_string())
+                .filter(|c| !c.is_empty())
+                .unwrap_or_else(|| "aac".to_string());
+            audio_tracks.push(VideoAudioTrack {
+                stream_index: idx,
+                title: format!("Audio Track {}", idx + 1),
+                channels: if trimmed.contains("mono") { 1 } else { 2 },
+                codec,
+            });
+        } else if in_audio_stream && trimmed.starts_with("title") {
+            if let Some((_, val)) = trimmed.split_once(':') {
+                if let Some(last) = audio_tracks.last_mut() {
+                    let t = val.trim();
+                    if !t.is_empty() {
+                        last.title = t.to_string();
+                    }
+                }
+            }
+        } else if in_audio_stream && trimmed.starts_with("handler_name") {
+            if let Some((_, val)) = trimmed.split_once(':') {
+                if let Some(last) = audio_tracks.last_mut() {
+                    let t = val.trim();
+                    if !t.is_empty()
+                        && t != "SoundHandler"
+                        && last.title.starts_with("Audio Track ")
+                    {
+                        last.title = t.to_string();
+                    }
+                }
+            }
+        } else if trimmed.starts_with("Stream #") || trimmed.starts_with("Input #") {
+            in_audio_stream = false;
+        }
+    }
+
+    (duration_ms, width, height, audio_tracks)
+}
+
 /// Probes video dimensions, duration, size, and every discrete audio stream (`ffprobe` JSON with `ffmpeg -i` fallback).
 pub fn probe_video_file_info(bin_str: &str, video_path: &Path) -> VideoProbeInfo {
     let size_bytes = fs::metadata(video_path).map(|m| m.len()).unwrap_or(0);
@@ -964,13 +1081,14 @@ pub fn probe_video_file_info(bin_str: &str, video_path: &Path) -> VideoProbeInfo
     let mut duration_ms = 0u64;
     let mut audio_tracks: Vec<VideoAudioTrack> = Vec::new();
 
-    let ffprobe_bin = bin_str.replace("ffmpeg", "ffprobe");
-    if let Ok(out) = new_hidden_command(&ffprobe_bin)
+    let ffprobe_bin = resolve_ffprobe_binary(bin_str);
+    let ffprobe_str = ffprobe_bin.to_string_lossy().to_string();
+    if let Ok(out) = new_hidden_command(&ffprobe_str)
         .args([
             "-v",
             "error",
             "-show_entries",
-            "format=duration:stream=index,codec_type,codec_name,channels,width,height:stream_tags=title",
+            "format=duration:stream=index,codec_type,codec_name,channels,width,height:stream_tags=title,handler_name",
             "-of",
             "json",
             &video_path.to_string_lossy(),
@@ -1007,12 +1125,18 @@ pub fn probe_video_file_info(bin_str: &str, video_path: &Path) -> VideoProbeInfo
                                 .unwrap_or("aac")
                                 .to_string();
                             let channels = st.get("channels").and_then(|v| v.as_u64()).unwrap_or(2) as u32;
-                            let title = st
-                                .get("tags")
+                            let tags = st.get("tags");
+                            let title = tags
                                 .and_then(|t| t.get("title"))
                                 .and_then(|v| v.as_str())
                                 .map(|s| s.trim().to_string())
                                 .filter(|s| !s.is_empty())
+                                .or_else(|| {
+                                    tags.and_then(|t| t.get("handler_name"))
+                                        .and_then(|v| v.as_str())
+                                        .map(|s| s.trim().to_string())
+                                        .filter(|s| !s.is_empty() && s != "SoundHandler")
+                                })
                                 .unwrap_or_else(|| format!("Track {}", audio_ordinal + 1));
                             audio_tracks.push(VideoAudioTrack {
                                 stream_index: audio_ordinal,
@@ -1024,61 +1148,35 @@ pub fn probe_video_file_info(bin_str: &str, video_path: &Path) -> VideoProbeInfo
                         }
                     }
                 }
-                return VideoProbeInfo {
-                    duration_ms,
-                    size_bytes,
-                    width,
-                    height,
-                    audio_tracks,
-                };
+                if !audio_tracks.is_empty() {
+                    return VideoProbeInfo {
+                        duration_ms,
+                        size_bytes,
+                        width,
+                        height,
+                        audio_tracks,
+                    };
+                }
             }
         }
     }
 
-    // Fallback: parse `ffmpeg -hide_banner -i <video>` stderr if ffprobe binary is absent
+    // Fallback: parse `ffmpeg -hide_banner -i <video>` stderr if ffprobe binary is absent or found 0 audio streams
     if let Ok(out) = new_hidden_command(bin_str)
         .args(["-hide_banner", "-i", &video_path.to_string_lossy()])
         .output()
     {
         let stderr = String::from_utf8_lossy(&out.stderr);
-        let mut in_audio_stream = false;
-        for line in stderr.lines() {
-            let trimmed = line.trim();
-            if let Some(dur_part) = trimmed.strip_prefix("Duration:") {
-                if let Some(hms) = dur_part.split(',').next() {
-                    let parts: Vec<&str> = hms.trim().split(':').collect();
-                    if parts.len() == 3 {
-                        if let (Ok(h), Ok(m), Ok(s)) = (
-                            parts[0].parse::<f64>(),
-                            parts[1].parse::<f64>(),
-                            parts[2].parse::<f64>(),
-                        ) {
-                            duration_ms = ((h * 3600.0 + m * 60.0 + s) * 1000.0).round() as u64;
-                        }
-                    }
-                }
-            }
-            if trimmed.starts_with("Stream #") && trimmed.contains("Audio:") {
-                in_audio_stream = true;
-                let idx = audio_tracks.len();
-                audio_tracks.push(VideoAudioTrack {
-                    stream_index: idx,
-                    title: format!("Audio Track {}", idx + 1),
-                    channels: if trimmed.contains("mono") { 1 } else { 2 },
-                    codec: "aac".to_string(),
-                });
-            } else if in_audio_stream && trimmed.starts_with("title") {
-                if let Some((_, val)) = trimmed.split_once(':') {
-                    if let Some(last) = audio_tracks.last_mut() {
-                        let t = val.trim();
-                        if !t.is_empty() {
-                            last.title = t.to_string();
-                        }
-                    }
-                }
-            } else if trimmed.starts_with("Stream #") {
-                in_audio_stream = false;
-            }
+        let (fb_dur, fb_w, fb_h, fb_tracks) = parse_ffmpeg_stderr_probe(&stderr);
+        if duration_ms == 0 && fb_dur > 0 {
+            duration_ms = fb_dur;
+        }
+        if fb_w > 0 && fb_h > 0 {
+            width = fb_w;
+            height = fb_h;
+        }
+        if audio_tracks.is_empty() && !fb_tracks.is_empty() {
+            audio_tracks = fb_tracks;
         }
     }
 
@@ -1378,7 +1476,8 @@ pub fn trim_video_clip(
             .map_err(|_| AppError::General("Failed to lock database".to_string()))?;
         insert_capture(&conn, &trimmed_record)?;
         if replace_original {
-            let _ = delete_captures(&conn, &[id]);
+            let _ = delete_captures(&conn, &[id.clone()]);
+            cleanup_video_track_previews(Some(&id));
         }
     }
 
@@ -1395,6 +1494,243 @@ pub fn trim_video_clip(
     );
 
     Ok(trimmed_record)
+}
+
+fn preview_root_dir() -> PathBuf {
+    std::env::temp_dir().join("replayviewer_track_preview")
+}
+
+/// Computes `bucket_count` normalized amplitude peaks (`0.0..=1.0`) from a mono `s16le` PCM buffer.
+pub fn compute_pcm_waveform_peaks(pcm_bytes: &[u8], bucket_count: usize) -> Vec<f32> {
+    let buckets = bucket_count.clamp(32, 320);
+    let sample_count = pcm_bytes.len() / 2;
+    if sample_count == 0 {
+        return vec![0.0; buckets];
+    }
+
+    let mut out = Vec::with_capacity(buckets);
+    for b in 0..buckets {
+        let start = (b * sample_count) / buckets;
+        let end = (((b + 1) * sample_count) / buckets).max(start + 1).min(sample_count);
+        let mut max_abs: f32 = 0.0;
+        for s in start..end {
+            let lo = pcm_bytes[s * 2];
+            let hi = pcm_bytes[s * 2 + 1];
+            let val = i16::from_le_bytes([lo, hi]);
+            let norm = (val as i32).abs() as f32 / 32768.0;
+            if norm > max_abs {
+                max_abs = norm;
+            }
+        }
+        let curved = if max_abs > 0.0 {
+            max_abs.clamp(0.0, 1.0).powf(0.65)
+        } else {
+            0.0
+        };
+        out.push((curved * 1000.0).round() / 1000.0);
+    }
+    out
+}
+
+/// Builds single-pass FFmpeg arguments that demux each audio stream to `.m4a` and mono 2 kHz `s16le` `.pcm`
+/// for instant track auditioning and waveform generation.
+pub fn build_preview_demux_ffmpeg_args(
+    src_path: &str,
+    targets: &[(usize, PathBuf, PathBuf)],
+    transcode_aac: bool,
+) -> Vec<String> {
+    let mut args = vec![
+        "-y".to_string(),
+        "-hide_banner".to_string(),
+        "-loglevel".to_string(),
+        "error".to_string(),
+        "-i".to_string(),
+        src_path.to_string(),
+    ];
+
+    for (stream_idx, m4a_path, pcm_path) in targets {
+        args.extend([
+            "-map".to_string(),
+            format!("0:a:{}?", stream_idx),
+            "-vn".to_string(),
+        ]);
+        if transcode_aac {
+            args.extend(["-c:a".to_string(), "aac".to_string(), "-b:a".to_string(), "160k".to_string()]);
+        } else {
+            args.extend(["-c:a".to_string(), "copy".to_string()]);
+        }
+        args.extend([
+            "-movflags".to_string(),
+            "+faststart".to_string(),
+            m4a_path.to_string_lossy().to_string(),
+            "-map".to_string(),
+            format!("0:a:{}?", stream_idx),
+            "-vn".to_string(),
+            "-ac".to_string(),
+            "1".to_string(),
+            "-ar".to_string(),
+            "2000".to_string(),
+            "-f".to_string(),
+            "s16le".to_string(),
+            pcm_path.to_string_lossy().to_string(),
+        ]);
+    }
+    args
+}
+
+fn cleanup_stale_preview_dirs(keep_id: Option<&str>) {
+    let root = preview_root_dir();
+    let Ok(entries) = fs::read_dir(&root) else {
+        return;
+    };
+    let now = std::time::SystemTime::now();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        if let Some(keep) = keep_id {
+            if path.file_name().and_then(|n| n.to_str()) == Some(keep) {
+                continue;
+            }
+        }
+        let is_old = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|m| now.duration_since(m).ok())
+            .map(|age| age > Duration::from_secs(7200))
+            .unwrap_or(false);
+        if is_old {
+            let _ = fs::remove_dir_all(&path);
+        }
+    }
+}
+
+/// Removes temporary demuxed track preview files for one capture (or all previews when `id` is `None`).
+pub fn cleanup_video_track_previews(id: Option<&str>) {
+    let root = preview_root_dir();
+    if let Some(capture_id) = id {
+        let dir = root.join(capture_id);
+        if dir.exists() {
+            let _ = fs::remove_dir_all(dir);
+        }
+    } else if root.exists() {
+        let _ = fs::remove_dir_all(root);
+    }
+}
+
+/// Extracts per-track `.m4a` streams and downsampled waveform peaks in a single FFmpeg pass
+/// for lazy Lightbox Solo/Mute auditioning (`v2.0.3`).
+pub fn prepare_video_track_previews(
+    app: &AppHandle,
+    capture_id: &str,
+    bucket_count: usize,
+) -> AppResult<Vec<VideoAudioTrackPreview>> {
+    cleanup_stale_preview_dirs(Some(capture_id));
+
+    let state: tauri::State<'_, AppState> = app.state();
+    let cfg = crate::commands::settings_cmds::get_settings(state.clone())?;
+    let ff = get_cached_or_probe_ffmpeg(&state, &cfg.ffmpeg_custom_path, false);
+    let bin_str = ff.binary_path.ok_or_else(|| {
+        AppError::General("FFmpeg is required to generate audio track waveforms.".to_string())
+    })?;
+
+    let rec = {
+        let conn = state
+            .db
+            .lock()
+            .map_err(|_| AppError::General("Failed to lock database".to_string()))?;
+        get_capture_by_id(&conn, capture_id)?
+    }
+    .ok_or_else(|| AppError::General("Video capture not found.".to_string()))?;
+
+    let src_path = PathBuf::from(&rec.file_path);
+    if !src_path.exists() {
+        return Err(AppError::General("Video file is missing from disk.".to_string()));
+    }
+
+    let probe = probe_video_file_info(&bin_str, &src_path);
+    if probe.audio_tracks.is_empty() {
+        return Ok(vec![]);
+    }
+
+    let preview_dir = preview_root_dir().join(capture_id);
+    fs::create_dir_all(&preview_dir)?;
+    let peaks_cache_path = preview_dir.join("peaks_cache.json");
+
+    if peaks_cache_path.exists() {
+        if let Ok(json_str) = fs::read_to_string(&peaks_cache_path) {
+            if let Ok(cached) = serde_json::from_str::<Vec<VideoAudioTrackPreview>>(&json_str) {
+                let all_present = cached.len() == probe.audio_tracks.len()
+                    && cached.iter().all(|p| Path::new(&p.audio_path).exists());
+                if all_present {
+                    return Ok(cached);
+                }
+            }
+        }
+    }
+
+    let src_str = src_path.to_string_lossy().to_string();
+    let targets: Vec<(usize, PathBuf, PathBuf)> = probe
+        .audio_tracks
+        .iter()
+        .map(|t| {
+            (
+                t.stream_index,
+                preview_dir.join(format!("track_{}.m4a", t.stream_index)),
+                preview_dir.join(format!("track_{}.pcm", t.stream_index)),
+            )
+        })
+        .collect();
+
+    let run_demux = |transcode_aac: bool| -> std::io::Result<std::process::Output> {
+        let args = build_preview_demux_ffmpeg_args(&src_str, &targets, transcode_aac);
+        new_hidden_command(&bin_str)
+            .args(&args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .output()
+    };
+
+    let mut output = run_demux(false)?;
+    let needs_fallback = !output.status.success()
+        || targets
+            .iter()
+            .any(|(_, m4a, _)| !m4a.exists() || fs::metadata(m4a).map(|m| m.len() == 0).unwrap_or(true));
+    if needs_fallback {
+        output = run_demux(true)?;
+    }
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(AppError::General(format!(
+            "FFmpeg track preview extraction failed: {}",
+            stderr.trim()
+        )));
+    }
+
+    let buckets = bucket_count.clamp(32, 320);
+    let mut previews = Vec::with_capacity(probe.audio_tracks.len());
+    for (track, (_, m4a_path, pcm_path)) in probe.audio_tracks.iter().zip(targets.iter()) {
+        let peaks = match fs::read(pcm_path) {
+            Ok(bytes) => compute_pcm_waveform_peaks(&bytes, buckets),
+            Err(_) => vec![0.0; buckets],
+        };
+        let _ = fs::remove_file(pcm_path);
+        previews.push(VideoAudioTrackPreview {
+            stream_index: track.stream_index,
+            title: track.title.clone(),
+            audio_path: m4a_path.to_string_lossy().to_string(),
+            peaks,
+        });
+    }
+
+    if let Ok(json_str) = serde_json::to_string(&previews) {
+        let _ = fs::write(&peaks_cache_path, json_str);
+    }
+
+    Ok(previews)
 }
 
 #[cfg(test)]
@@ -1493,5 +1829,62 @@ mod tests {
         assert!(discord_10.windows(2).any(|w| w == ["-c:v", "h264_nvenc"]));
         assert!(discord_10.windows(2).any(|w| w == ["-c:a", "aac"]));
         assert!(discord_10.contains(&"-b:v".to_string()));
+    }
+
+    #[test]
+    fn test_resolve_ffprobe_and_parse_stderr_four_tracks() {
+        let managed_ffmpeg = r"C:\Users\user\AppData\Local\com.replayviewer.app\bin\ffmpeg-master-latest-win64-lgpl\bin\ffmpeg.exe";
+        let resolved = resolve_ffprobe_binary(managed_ffmpeg);
+        let resolved_str = resolved.to_string_lossy();
+        assert!(resolved_str.contains("ffmpeg-master-latest-win64-lgpl"));
+        assert!(resolved_str.ends_with("ffprobe.exe"));
+
+        let sample_stderr = r#"
+  Duration: 00:00:30.50, start: 0.000000, bitrate: 15000 kb/s
+    Stream #0:0(und): Video: h264 (Main), yuv420p, 1920x1080 [SAR 1:1 DAR 16:9], 60 fps
+    Stream #0:1(und): Audio: aac (LC) (mp4a / 0x6134706D), 48000 Hz, stereo, fltp, 192 kb/s
+      Metadata:
+        title           : Master Mix
+    Stream #0:2(und): Audio: aac (LC), 48000 Hz, stereo, fltp, 192 kb/s
+      Metadata:
+        title           : Desktop Audio
+    Stream #0:3(und): Audio: aac (LC), 48000 Hz, stereo, fltp, 192 kb/s
+      Metadata:
+        title           : msedge.exe
+    Stream #0:4(und): Audio: aac (LC), 48000 Hz, stereo, fltp, 192 kb/s
+      Metadata:
+        title           : Microphone
+"#;
+        let (dur, w, h, tracks) = parse_ffmpeg_stderr_probe(sample_stderr);
+        assert_eq!(dur, 30_500);
+        assert_eq!((w, h), (1920, 1080));
+        assert_eq!(tracks.len(), 4);
+        assert_eq!(tracks[0].title, "Master Mix");
+        assert_eq!(tracks[2].title, "msedge.exe");
+        assert_eq!(tracks[3].title, "Microphone");
+    }
+
+    #[test]
+    fn test_preview_demux_ffmpeg_args_and_pcm_peaks() {
+        let targets = vec![
+            (0usize, PathBuf::from("t0.m4a"), PathBuf::from("t0.pcm")),
+            (1usize, PathBuf::from("t1.m4a"), PathBuf::from("t1.pcm")),
+        ];
+        let copy_args = build_preview_demux_ffmpeg_args("clip.mp4", &targets, false);
+        assert!(copy_args.contains(&"0:a:0?".to_string()));
+        assert!(copy_args.contains(&"0:a:1?".to_string()));
+        assert!(copy_args.windows(2).any(|w| w == ["-c:a", "copy"]));
+        assert!(copy_args.windows(2).any(|w| w == ["-f", "s16le"]));
+
+        let samples: [i16; 4] = [0, 16384, 0, -32768];
+        let mut bytes = Vec::with_capacity(8);
+        for s in samples {
+            bytes.extend_from_slice(&s.to_le_bytes());
+        }
+        let peaks = compute_pcm_waveform_peaks(&bytes, 32);
+        assert_eq!(peaks.len(), 32);
+        assert!(peaks.iter().any(|&p| (p - 1.0).abs() < 0.01));
+        assert!(peaks.iter().any(|&p| p > 0.5 && p < 0.9));
+        assert!(peaks[0] == 0.0);
     }
 }
