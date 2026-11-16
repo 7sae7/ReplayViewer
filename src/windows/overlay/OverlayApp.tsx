@@ -430,99 +430,110 @@ export const OverlayApp: React.FC<OverlayAppProps> = ({
         )
       : 100;
 
-  const handleSaveCapture = useCallback(async () => {
-    const activeRect = cropRect || imageBounds;
-    if (
-      !stageRef.current ||
-      !activeRect ||
-      activeRect.width < 1 ||
-      activeRect.height < 1
-    ) {
-      return;
-    }
+  const handleExportCapture = useCallback(
+    async (mode: "copy" | "save" | "copy_and_save" = "copy_and_save") => {
+      const activeRect = cropRect || imageBounds;
+      if (
+        !stageRef.current ||
+        !activeRect ||
+        activeRect.width < 1 ||
+        activeRect.height < 1
+      ) {
+        return;
+      }
 
-    const {
-      outputWidth: targetOutW,
-      outputHeight: targetOutH,
-      exportPixelRatio: targetRatio,
-    } = computeExportMetrics();
+      const {
+        outputWidth: targetOutW,
+        outputHeight: targetOutH,
+        exportPixelRatio: targetRatio,
+      } = computeExportMetrics();
 
-    const exportConfig = {
-      x: activeRect.x,
-      y: activeRect.y,
-      width: Math.max(1, activeRect.width),
-      height: Math.max(1, activeRect.height),
-      pixelRatio: targetRatio,
-      mimeType: "image/png",
-    };
+      const exportConfig = {
+        x: activeRect.x,
+        y: activeRect.y,
+        width: Math.max(1, activeRect.width),
+        height: Math.max(1, activeRect.height),
+        pixelRatio: targetRatio,
+        mimeType: "image/png",
+      };
 
-    // 1. Export flattened image (with all annotations visible) at target output resolution
-    const flattenedDataUrl = stageRef.current.toDataURL(exportConfig);
-    const flattenedBytes = dataUrlToUint8Array(flattenedDataUrl);
+      // 1. Export flattened image (with all annotations visible) at target output resolution
+      const flattenedDataUrl = stageRef.current.toDataURL(exportConfig);
+      const flattenedBytes = dataUrlToUint8Array(flattenedDataUrl);
 
-    // 2. Export clean base image (with only destructive Pixelate redactions visible)
-    //    + serialize non-destructive vector annotations in canonical (0..targetOutW, 0..targetOutH) space!
-    const canonicalOutputRect: CropRect = {
-      x: 0,
-      y: 0,
-      width: targetOutW,
-      height: targetOutH,
-    };
-    const nonDestructiveShapes = annotations
-      .filter((a) => a.tool !== "pixelate")
-      .map((a) => transformShapeToNewBounds(a, activeRect, canonicalOutputRect));
-    const annotationsJson = JSON.stringify(nonDestructiveShapes);
-
-    let baseImageBytes: Uint8Array | undefined;
-    if (nonDestructiveGroupRef.current) {
-      nonDestructiveGroupRef.current.visible(false);
-      stageRef.current.batchDraw();
-      const baseDataUrl = stageRef.current.toDataURL(exportConfig);
-      nonDestructiveGroupRef.current.visible(true);
-      stageRef.current.batchDraw();
-      baseImageBytes = dataUrlToUint8Array(baseDataUrl);
-    }
-
-    await saveAnnotatedCapture(
-      flattenedBytes,
-      settings?.copyToClipboardOnSave ?? true,
-      settings?.imageFormat ?? "webp",
-      flattenedDataUrl,
-      {
+      // 2. Export clean base image (with only destructive Pixelate redactions visible)
+      //    + serialize non-destructive vector annotations in canonical (0..targetOutW, 0..targetOutH) space!
+      const canonicalOutputRect: CropRect = {
+        x: 0,
+        y: 0,
         width: targetOutW,
         height: targetOutH,
-      },
-      {
-        baseImageBytes,
-        annotationsJson,
-        sourceClipboardId: sessionMeta.sourceClipboardId,
+      };
+      const nonDestructiveShapes = annotations
+        .filter((a) => a.tool !== "pixelate")
+        .map((a) =>
+          transformShapeToNewBounds(a, activeRect, canonicalOutputRect)
+        );
+      const annotationsJson = JSON.stringify(nonDestructiveShapes);
+
+      let baseImageBytes: Uint8Array | undefined;
+      if (nonDestructiveGroupRef.current) {
+        nonDestructiveGroupRef.current.visible(false);
+        stageRef.current.batchDraw();
+        const baseDataUrl = stageRef.current.toDataURL(exportConfig);
+        nonDestructiveGroupRef.current.visible(true);
+        stageRef.current.batchDraw();
+        baseImageBytes = dataUrlToUint8Array(baseDataUrl);
       }
-    );
 
-    if (!isTauriRuntime() && onCloseInBrowserPreview) {
-      onCloseInBrowserPreview();
-    }
-  }, [
-    annotations,
-    computeExportMetrics,
-    cropRect,
-    imageBounds,
-    onCloseInBrowserPreview,
-    sessionMeta.sourceClipboardId,
-    settings?.copyToClipboardOnSave,
-    settings?.imageFormat,
-  ]);
+      const copyToClipboard = mode === "copy" || mode === "copy_and_save";
+      const saveToDisk = mode === "save" || mode === "copy_and_save";
 
-  // Keyboard shortcuts: Escape, Enter, Ctrl+Z, Ctrl+Y
+      await saveAnnotatedCapture(
+        flattenedBytes,
+        copyToClipboard,
+        settings?.imageFormat ?? "webp",
+        flattenedDataUrl,
+        {
+          width: targetOutW,
+          height: targetOutH,
+        },
+        {
+          saveToDisk,
+          baseImageBytes,
+          annotationsJson,
+          sourceClipboardId: sessionMeta.sourceClipboardId,
+        }
+      );
+
+      if (!isTauriRuntime() && onCloseInBrowserPreview) {
+        onCloseInBrowserPreview();
+      }
+    },
+    [
+      annotations,
+      computeExportMetrics,
+      cropRect,
+      imageBounds,
+      onCloseInBrowserPreview,
+      sessionMeta.sourceClipboardId,
+      settings?.imageFormat,
+    ]
+  );
+
+  // Keyboard shortcuts: Escape, Ctrl+C / Cmd+C (Copy Only), Enter (Copy & Save), Ctrl+Z, Ctrl+Y
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
       if (textPromptPos) return;
       if (e.key === "Escape") {
         e.preventDefault();
         handleCloseOverlay();
+      } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "c") {
+        e.preventDefault();
+        handleExportCapture("copy");
       } else if (e.key === "Enter") {
         e.preventDefault();
-        handleSaveCapture();
+        handleExportCapture("copy_and_save");
       } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "z") {
         e.preventDefault();
         if (e.shiftKey) {
@@ -537,7 +548,7 @@ export const OverlayApp: React.FC<OverlayAppProps> = ({
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [handleCloseOverlay, handleSaveCapture, redo, textPromptPos, undo]);
+  }, [handleCloseOverlay, handleExportCapture, redo, textPromptPos, undo]);
 
   const handleStageMouseDown = (e: Konva.KonvaEventObject<MouseEvent>) => {
     const pos = e.target.getStage()?.getPointerPosition();
@@ -782,8 +793,12 @@ export const OverlayApp: React.FC<OverlayAppProps> = ({
               </>
             )}
             <span className="opacity-40">|</span>
+            <span className="flex items-center gap-1 text-primary font-medium">
+              <kbd className="kbd kbd-xs">Ctrl+C</kbd> Copy Only
+            </span>
+            <span className="opacity-40">|</span>
             <span className="flex items-center gap-1 text-success font-medium">
-              <kbd className="kbd kbd-xs">Enter</kbd> Save & Copy
+              <kbd className="kbd kbd-xs">Enter</kbd> Copy &amp; Save
             </span>
           </>
         ) : (
@@ -1052,9 +1067,11 @@ export const OverlayApp: React.FC<OverlayAppProps> = ({
           }
           left={Math.min(
             Math.max(12, effectiveRect.x),
-            Math.max(12, viewport.width - 720)
+            Math.max(12, viewport.width - 840)
           )}
-          onSave={handleSaveCapture}
+          onCopyOnly={() => handleExportCapture("copy")}
+          onSaveOnly={() => handleExportCapture("save")}
+          onCopyAndSave={() => handleExportCapture("copy_and_save")}
           onCancel={handleCloseOverlay}
         />
       )}

@@ -1,10 +1,14 @@
 import { invoke, convertFileSrc } from "@tauri-apps/api/core";
 import type {
+  AudioInputDevice,
+  AudioSessionInfo,
   CaptureRecord,
   CaptureSessionMeta,
   ClipboardItem,
+  FfmpegStatus,
   GalleryFilter,
   PaginatedCaptures,
+  ReplayBufferSnapshot,
   SettingsPayload,
   StorageStatusSummary,
   UnindexedScanResult,
@@ -202,7 +206,17 @@ let mockSettings: SettingsPayload = {
     "private browsing",
     "tor browser",
   ],
-  aiVisualSearchEnabled: true,
+  replayEnabled: true,
+  replayBufferSecs: 60,
+  replayFps: 60,
+  replayBitrateMbps: 20,
+  replayEncoder: "auto",
+  ffmpegCustomPath: "",
+  audioRecordDesktop: true,
+  audioRecordMic: true,
+  audioSingleMix: false,
+  audioMutedApps: [],
+  audioIsolatedApps: [],
   launchOnStartup: false,
   capturesDir: "C:\\Users\\shawp\\Desktop\\ReplayViewer\\captures",
 };
@@ -301,15 +315,18 @@ export async function saveAnnotatedCapture(
   dataUrlFallback?: string,
   dimensions?: { width: number; height: number },
   options?: {
+    saveToDisk?: boolean;
     baseImageBytes?: Uint8Array;
     annotationsJson?: string;
     sourceClipboardId?: string | null;
   }
 ): Promise<CaptureRecord> {
+  const shouldSaveToDisk = options?.saveToDisk ?? true;
   if (isTauriRuntime()) {
     return invoke<CaptureRecord>("save_annotated_capture", {
       imageBytes: Array.from(imageBytes),
       copyToClipboard,
+      saveToDisk: shouldSaveToDisk,
       imageFormat,
       sourceApp: options?.sourceClipboardId
         ? "Clipboard Annotation (Alt + V)"
@@ -328,10 +345,10 @@ export async function saveAnnotatedCapture(
     createMockSvgDataUrl("Annotated_Region.webp", "Region Capture", "#3b82f6");
   const nowIso = new Date().toISOString();
   const record: CaptureRecord = {
-    id: `cap-${Date.now()}`,
+    id: shouldSaveToDisk ? `cap-${Date.now()}` : `copied-only-${Date.now()}`,
     mediaType: "screenshot",
-    filePath: url,
-    thumbPath: url,
+    filePath: shouldSaveToDisk ? url : "",
+    thumbPath: shouldSaveToDisk ? url : "",
     width: dimensions?.width ?? 1280,
     height: dimensions?.height ?? 720,
     sizeBytes: imageBytes.byteLength || 195_000,
@@ -343,30 +360,54 @@ export async function saveAnnotatedCapture(
     ocrStatus: "done",
     isPinned: false,
     groupName: "",
-    lastCopiedAt: copyToClipboard ? nowIso : null,
+    lastCopiedAt: copyToClipboard || !shouldSaveToDisk ? nowIso : null,
     queuedDeleteAt: null,
     tags: options?.sourceClipboardId
       ? ["annotated", "clipboard"]
       : ["annotated"],
     createdAt: nowIso,
   };
-  mockCaptures = [record, ...mockCaptures];
 
-  if (options?.sourceClipboardId) {
-    mockClipboardItems = mockClipboardItems.map((c) =>
-      c.id === options.sourceClipboardId
-        ? {
-            ...c,
-            filePath: url,
-            thumbPath: url,
-            annotationsJson: options.annotationsJson ?? "[]",
-            width: record.width,
-            height: record.height,
-            copiedAt: nowIso,
-            isCurrentlyCopied: true,
-          }
-        : { ...c, isCurrentlyCopied: false }
-    );
+  if (shouldSaveToDisk) {
+    mockCaptures = [record, ...mockCaptures];
+  }
+
+  if (copyToClipboard || !shouldSaveToDisk || options?.sourceClipboardId) {
+    if (options?.sourceClipboardId) {
+      mockClipboardItems = mockClipboardItems.map((c) =>
+        c.id === options.sourceClipboardId
+          ? {
+              ...c,
+              filePath: url,
+              thumbPath: url,
+              annotationsJson: options.annotationsJson ?? "[]",
+              width: record.width,
+              height: record.height,
+              copiedAt: nowIso,
+              isCurrentlyCopied: true,
+            }
+          : { ...c, isCurrentlyCopied: false }
+      );
+    } else {
+      const newClip: ClipboardItem = {
+        id: `clip-${Date.now()}`,
+        blake3Hash: `hash-${Date.now()}`,
+        filePath: url,
+        thumbPath: url,
+        baseFilePath: url,
+        annotationsJson: options?.annotationsJson ?? "[]",
+        width: record.width,
+        height: record.height,
+        sizeBytes: record.sizeBytes,
+        isPinned: false,
+        isCurrentlyCopied: true,
+        copiedAt: nowIso,
+      };
+      mockClipboardItems = [
+        newClip,
+        ...mockClipboardItems.map((c) => ({ ...c, isCurrentlyCopied: false })),
+      ];
+    }
   }
   return record;
 }
@@ -475,6 +516,399 @@ export async function togglePinCapture(id: string, pinned: boolean): Promise<voi
     c.id === id
       ? { ...c, isPinned: pinned, queuedDeleteAt: pinned ? null : c.queuedDeleteAt }
       : c
+  );
+}
+
+export async function restoreQueuedCaptures(
+  ids: string[],
+  alsoPin = false
+): Promise<number> {
+  if (isTauriRuntime()) {
+    return invoke<number>("restore_queued_captures", { ids, alsoPin });
+  }
+  ensureMockSeed();
+  let restored = 0;
+  mockCaptures = mockCaptures.map((c) => {
+    if (!ids.includes(c.id)) return c;
+    restored++;
+    return {
+      ...c,
+      queuedDeleteAt: null,
+      isPinned: alsoPin ? true : c.isPinned,
+    };
+  });
+  return restored;
+}
+
+export async function getStorageStatusPreview(
+  maxStorageGb?: number,
+  autoCleanupDays?: number
+): Promise<StorageStatusSummary> {
+  if (isTauriRuntime()) {
+    return invoke<StorageStatusSummary>("get_storage_status_preview", {
+      maxStorageGb: maxStorageGb ?? null,
+      autoCleanupDays: autoCleanupDays ?? null,
+    });
+  }
+  ensureMockSeed();
+  const active = mockCaptures.filter((c) => !c.queuedDeleteAt);
+  const pinned = active.filter((c) => c.isPinned);
+  const unpinned = active.filter((c) => !c.isPinned);
+  const queued = mockCaptures.filter((c) => Boolean(c.queuedDeleteAt) && !c.isPinned);
+  return {
+    activeCount: active.length,
+    activeBytes: active.reduce((acc, c) => acc + c.sizeBytes, 0),
+    pinnedCount: pinned.length,
+    pinnedBytes: pinned.reduce((acc, c) => acc + c.sizeBytes, 0),
+    unpinnedCount: unpinned.length,
+    unpinnedBytes: unpinned.reduce((acc, c) => acc + c.sizeBytes, 0),
+    queuedCount: queued.length,
+    queuedBytes: queued.reduce((acc, c) => acc + c.sizeBytes, 0),
+    nextExpiryAt: queued[0]?.queuedDeleteAt ?? null,
+    candidateCount: 0,
+    candidateBytes: 0,
+    candidateSamples: [],
+    expiredPurgedCount: 0,
+    pendingOcrCount: mockCaptures.filter((c) => c.ocrStatus === "pending").length,
+  };
+}
+
+export async function enforceStoragePoliciesNow(): Promise<StorageStatusSummary> {
+  if (isTauriRuntime()) {
+    return invoke<StorageStatusSummary>("enforce_storage_policies_now");
+  }
+  return getStorageStatusPreview();
+}
+
+export async function runOcrBackfillNow(): Promise<number> {
+  if (isTauriRuntime()) {
+    return invoke<number>("run_ocr_backfill_now");
+  }
+  return 0;
+}
+
+export async function setShortcutRecordingMode(
+  recording: boolean
+): Promise<void> {
+  if (isTauriRuntime()) {
+    await invoke<void>("set_shortcut_recording_mode", { recording });
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 2.0.1 & 2.0.2: Hardware Replay Buffer & Dynamic Audio Tracking API
+// ---------------------------------------------------------------------------
+
+export async function getFfmpegStatus(
+  forceRefresh = false
+): Promise<FfmpegStatus> {
+  if (isTauriRuntime()) {
+    return invoke<FfmpegStatus>("get_ffmpeg_status", { forceRefresh });
+  }
+  return {
+    available: true,
+    binaryPath: "ffmpeg",
+    source: "system",
+    version: "ffmpeg version 7.1 (dev preview)",
+    supportsDdagrab: true,
+    availableEncoders: ["h264_nvenc", "h264_amf", "h264_qsv", "libx264"],
+    recommendedEncoder: "h264_nvenc",
+  };
+}
+
+export async function downloadFfmpegEngine(): Promise<FfmpegStatus> {
+  if (isTauriRuntime()) {
+    return invoke<FfmpegStatus>("download_ffmpeg_engine");
+  }
+  return getFfmpegStatus();
+}
+
+export async function getReplayBufferSnapshot(): Promise<ReplayBufferSnapshot> {
+  if (isTauriRuntime()) {
+    return invoke<ReplayBufferSnapshot>("get_replay_buffer_snapshot");
+  }
+  return {
+    runtime: {
+      isRecording: mockSettings.replayEnabled ?? true,
+      activeEncoder: "h264_nvenc",
+      captureMethod: "DXGI Desktop Duplication (ddagrab)",
+      segmentCount: Math.round((mockSettings.replayBufferSecs ?? 60) / 2),
+      ringBytes: 150 * 1024 * 1024,
+      activeTracks: ["Desktop Audio", "Microphone"],
+      lastError: null,
+    },
+    bufferSecs: mockSettings.replayBufferSecs ?? 60,
+    fps: mockSettings.replayFps ?? 60,
+    bitrateMbps: mockSettings.replayBitrateMbps ?? 20,
+    configuredEncoder: mockSettings.replayEncoder ?? "auto",
+    ffmpegAvailable: true,
+    ffmpegSource: "system",
+    availableEncoders: ["h264_nvenc", "h264_amf", "h264_qsv", "libx264"],
+    recommendedEncoder: "h264_nvenc",
+  };
+}
+
+export async function setReplayBufferActive(active: boolean): Promise<boolean> {
+  if (isTauriRuntime()) {
+    return invoke<boolean>("set_replay_buffer_active", { active });
+  }
+  mockSettings = { ...mockSettings, replayEnabled: active };
+  return active;
+}
+
+export async function saveReplayBuffer(): Promise<CaptureRecord> {
+  if (isTauriRuntime()) {
+    return invoke<CaptureRecord>("save_replay_buffer");
+  }
+  ensureMockSeed();
+  const secs = mockSettings.replayBufferSecs ?? 60;
+  const nowIso = new Date().toISOString();
+  const imgUrl = createMockSvgDataUrl(
+    `Replay_${secs}s.mp4`,
+    `Instant ${secs}s Replay Clip (${mockSettings.replayFps ?? 60} FPS)`,
+    "#10b981",
+    1920,
+    1080
+  );
+  const record: CaptureRecord = {
+    id: `replay-${Date.now()}`,
+    mediaType: "video",
+    filePath: imgUrl,
+    thumbPath: imgUrl,
+    width: 1920,
+    height: 1080,
+    sizeBytes: secs * 2_500_000,
+    durationMs: secs * 1000,
+    sourceApp: `Instant Replay (${secs}s)`,
+    ocrText: "",
+    ocrStatus: "done",
+    isPinned: false,
+    groupName: "Replays",
+    lastCopiedAt: null,
+    queuedDeleteAt: null,
+    tags: ["replay", `${secs}s`],
+    createdAt: nowIso,
+  };
+  mockCaptures = [record, ...mockCaptures];
+  return record;
+}
+
+let mockAudioSessions: AudioSessionInfo[] = [
+  {
+    pid: 14020,
+    exeName: "Valorant-Win64-Shipping.exe",
+    displayName: "VALORANT",
+    state: "active",
+    peakLevel: 0.72,
+    isEmittingAudio: true,
+    isMuted: false,
+    isIsolated: false,
+  },
+  {
+    pid: 8824,
+    exeName: "Discord.exe",
+    displayName: "Discord",
+    state: "active",
+    peakLevel: 0.44,
+    isEmittingAudio: true,
+    isMuted: false,
+    isIsolated: true,
+  },
+  {
+    pid: 19400,
+    exeName: "chrome.exe",
+    displayName: "Google Chrome",
+    state: "active",
+    peakLevel: 0.31,
+    isEmittingAudio: true,
+    isMuted: false,
+    isIsolated: false,
+  },
+  {
+    pid: 5112,
+    exeName: "Spotify.exe",
+    displayName: "Spotify",
+    state: "inactive",
+    peakLevel: 0.0,
+    isEmittingAudio: false,
+    isMuted: true,
+    isIsolated: false,
+  },
+];
+
+export async function listActiveAudioSessions(
+  includeIdle = false
+): Promise<AudioSessionInfo[]> {
+  if (isTauriRuntime()) {
+    return invoke<AudioSessionInfo[]>("list_active_audio_sessions", {
+      includeIdle,
+    });
+  }
+  const muted = new Set((mockSettings.audioMutedApps || []).map((s) => s.toLowerCase()));
+  const isolated = new Set((mockSettings.audioIsolatedApps || []).map((s) => s.toLowerCase()));
+  return mockAudioSessions
+    .filter((s) => includeIdle || s.isEmittingAudio || muted.has(s.exeName.toLowerCase()))
+    .map((s) => ({
+      ...s,
+      isMuted: muted.has(s.exeName.toLowerCase()) || s.isMuted,
+      isIsolated: isolated.has(s.exeName.toLowerCase()) || s.isIsolated,
+    }));
+}
+
+export async function listAudioInputDevices(): Promise<AudioInputDevice[]> {
+  if (isTauriRuntime()) {
+    return invoke<AudioInputDevice[]>("list_audio_input_devices");
+  }
+  return [
+    {
+      id: "default-array",
+      name: "Microphone Array (Built-in Laptop Mic)",
+      isDefault: true,
+    },
+    {
+      id: "headset-mic",
+      name: "Headset Microphone (HyperX / Bluetooth)",
+      isDefault: false,
+    },
+  ];
+}
+
+export async function pickFfmpegDialog(): Promise<string | null> {
+  if (isTauriRuntime()) {
+    return invoke<string | null>("pick_ffmpeg_dialog");
+  }
+  return null;
+}
+
+export async function startMicTest(
+  deviceId?: string,
+  sidetone = false
+): Promise<boolean> {
+  if (isTauriRuntime()) {
+    return invoke<boolean>("start_mic_test", {
+      deviceId: deviceId || null,
+      sidetone,
+    });
+  }
+  return true;
+}
+
+export async function stopMicTest(): Promise<boolean> {
+  if (isTauriRuntime()) {
+    return invoke<boolean>("stop_mic_test");
+  }
+  return false;
+}
+
+export async function setMicTestSidetone(enabled: boolean): Promise<boolean> {
+  if (isTauriRuntime()) {
+    return invoke<boolean>("set_mic_test_sidetone", { enabled });
+  }
+  return enabled;
+}
+
+export async function getMicTestLevel(): Promise<number> {
+  if (isTauriRuntime()) {
+    return invoke<number>("get_mic_test_level");
+  }
+  return 0.15 + Math.random() * 0.45;
+}
+
+export async function getLiveAudioPeaks(): Promise<Record<string, number>> {
+  if (isTauriRuntime()) {
+    return invoke<Record<string, number>>("get_live_audio_peaks");
+  }
+  const out: Record<string, number> = {};
+  for (const s of mockAudioSessions) {
+    if (s.isEmittingAudio) {
+      out[s.exeName.toLowerCase()] = Math.max(
+        0.04,
+        Math.min(0.95, s.peakLevel + (Math.random() - 0.5) * 0.25)
+      );
+    }
+  }
+  return out;
+}
+
+export async function setMicTestGain(gain: number): Promise<number> {
+  if (isTauriRuntime()) {
+    return invoke<number>("set_mic_test_gain", { gain });
+  }
+  return gain;
+}
+
+export async function setAudioTrackVolumes(options: {
+  desktopVolume?: number;
+  micVolume?: number;
+  appExeName?: string;
+  appVolume?: number;
+}): Promise<void> {
+  if (isTauriRuntime()) {
+    return invoke<void>("set_audio_track_volumes", {
+      desktopVolume: options.desktopVolume ?? null,
+      micVolume: options.micVolume ?? null,
+      appExeName: options.appExeName ?? null,
+      appVolume: options.appVolume ?? null,
+    });
+  }
+  if (options.desktopVolume !== undefined) {
+    mockSettings = { ...mockSettings, audioDesktopVolume: options.desktopVolume };
+  }
+  if (options.micVolume !== undefined) {
+    mockSettings = { ...mockSettings, audioMicVolume: options.micVolume };
+  }
+  if (options.appExeName && options.appVolume !== undefined) {
+    mockSettings = {
+      ...mockSettings,
+      audioAppVolumes: {
+        ...(mockSettings.audioAppVolumes || {}),
+        [options.appExeName.toLowerCase()]: options.appVolume,
+      },
+    };
+  }
+}
+
+export async function updateAppAudioRule(
+  exeName: string,
+  options: { muted?: boolean; isolated?: boolean }
+): Promise<void> {
+  if (isTauriRuntime()) {
+    return invoke<void>("update_app_audio_rule", {
+      exeName,
+      muted: options.muted ?? null,
+      isolated: options.isolated ?? null,
+    });
+  }
+  const clean = exeName.trim().toLowerCase();
+  let mutedList = [...(mockSettings.audioMutedApps || [])];
+  let isoList = [...(mockSettings.audioIsolatedApps || [])];
+  if (options.muted !== undefined) {
+    mutedList = mutedList.filter((a) => a.toLowerCase() !== clean);
+    if (options.muted) {
+      mutedList.push(exeName);
+      isoList = isoList.filter((a) => a.toLowerCase() !== clean);
+    }
+  }
+  if (options.isolated !== undefined) {
+    isoList = isoList.filter((a) => a.toLowerCase() !== clean);
+    if (options.isolated) {
+      isoList.push(exeName);
+      mutedList = mutedList.filter((a) => a.toLowerCase() !== clean);
+    }
+  }
+  mockSettings = {
+    ...mockSettings,
+    audioMutedApps: mutedList,
+    audioIsolatedApps: isoList,
+  };
+  mockAudioSessions = mockAudioSessions.map((s) =>
+    s.exeName.toLowerCase() === clean
+      ? {
+          ...s,
+          isMuted: options.muted ?? s.isMuted,
+          isIsolated: options.isolated ?? s.isIsolated,
+        }
+      : s
   );
 }
 
@@ -790,14 +1224,19 @@ export async function listClipboardHistory(): Promise<ClipboardItem[]> {
     return invoke<ClipboardItem[]>("list_clipboard_history");
   }
   ensureMockSeed();
+  const hasExplicitCurrent = mockClipboardItems.some((i) => i.isCurrentlyCopied);
   let newestAt = "";
-  for (const item of mockClipboardItems) {
-    if (item.copiedAt > newestAt) newestAt = item.copiedAt;
+  if (!hasExplicitCurrent) {
+    for (const item of mockClipboardItems) {
+      if (item.copiedAt > newestAt) newestAt = item.copiedAt;
+    }
   }
   return [...mockClipboardItems]
     .map((item) => ({
       ...item,
-      isCurrentlyCopied: item.copiedAt === newestAt,
+      isCurrentlyCopied: hasExplicitCurrent
+        ? item.isCurrentlyCopied
+        : item.copiedAt === newestAt,
     }))
     .sort((a, b) => {
       if (a.isPinned !== b.isPinned) return a.isPinned ? -1 : 1;

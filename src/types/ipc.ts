@@ -72,19 +72,6 @@ export interface StorageStatusSummary {
   pendingOcrCount: number;
 }
 
-export interface VisualSearchStatus {
-  enabled: boolean;
-  modelVersion: string;
-  embeddingDim: number;
-  bytesPerImage: number;
-  indexedCount: number;
-  unindexedCount: number;
-  totalEmbeddingBytes: number;
-  modelLoadedInRam: boolean;
-  idleUnloadSeconds: number;
-  secondsUntilUnload: number | null;
-}
-
 export interface UnindexedScanResult {
   folderPath: string;
   count: number;
@@ -118,6 +105,57 @@ export interface CaptureSessionMeta {
   initialAnnotationsJson?: string | null;
 }
 
+export interface FfmpegStatus {
+  available: boolean;
+  binaryPath: string | null;
+  source: "custom" | "managed" | "system" | "missing" | string;
+  version: string | null;
+  supportsDdagrab: boolean;
+  availableEncoders: string[];
+  recommendedEncoder: string;
+  downloading?: boolean;
+  downloadStage?: string | null;
+}
+
+export interface ReplayRuntimeState {
+  isRecording: boolean;
+  activeEncoder: string;
+  captureMethod: string;
+  segmentCount: number;
+  ringBytes: number;
+  activeTracks: string[];
+  lastError: string | null;
+}
+
+export interface ReplayBufferSnapshot {
+  runtime: ReplayRuntimeState;
+  bufferSecs: number;
+  fps: number;
+  bitrateMbps: number;
+  configuredEncoder: string;
+  ffmpegAvailable: boolean;
+  ffmpegSource: string;
+  availableEncoders: string[];
+  recommendedEncoder: string;
+}
+
+export interface AudioSessionInfo {
+  pid: number;
+  exeName: string;
+  displayName: string;
+  state: "active" | "inactive" | string;
+  peakLevel: number;
+  isEmittingAudio: boolean;
+  isMuted: boolean;
+  isIsolated: boolean;
+}
+
+export interface AudioInputDevice {
+  id: string;
+  name: string;
+  isDefault: boolean;
+}
+
 export interface SettingsPayload {
   hotkeyRegionCapture: string;
   hotkeyFullscreenCapture: string;
@@ -130,7 +168,21 @@ export interface SettingsPayload {
   autoCleanupDays: number;
   clipboardMaxItems: number;
   clipboardExcludedApps?: string[];
-  aiVisualSearchEnabled?: boolean;
+  replayEnabled?: boolean;
+  replayBufferSecs?: number;
+  replayFps?: number;
+  replayBitrateMbps?: number;
+  replayEncoder?: string;
+  ffmpegCustomPath?: string;
+  audioRecordDesktop?: boolean;
+  audioRecordMic?: boolean;
+  audioDesktopVolume?: number;
+  audioMicVolume?: number;
+  audioAppVolumes?: Record<string, number>;
+  audioMicDeviceId?: string;
+  audioSingleMix?: boolean;
+  audioMutedApps?: string[];
+  audioIsolatedApps?: string[];
   launchOnStartup: boolean;
   capturesDir: string;
 }

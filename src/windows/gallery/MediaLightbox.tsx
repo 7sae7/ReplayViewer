@@ -8,13 +8,16 @@ import {
   Pin,
   Plus,
   RotateCcw,
-  Sparkles,
   Tag,
   Trash2,
   X,
 } from "lucide-react";
 import type { CaptureRecord } from "../../types/ipc";
-import { formatBytes, formatDeletionCountdown } from "../../lib/dpi";
+import {
+  formatBytes,
+  formatDeletionCountdown,
+  formatDurationMs,
+} from "../../lib/dpi";
 import {
   copyCaptureToClipboard,
   openInFileExplorer,
@@ -28,7 +31,6 @@ interface MediaLightboxProps {
   onDelete: (id: string) => void;
   onAddTag: (captureId: string, tag: string) => Promise<void>;
   onRestoreQueued?: (id: string, alsoPin?: boolean) => void;
-  onFindSimilar?: (capture: CaptureRecord) => void;
 }
 
 export const MediaLightbox: React.FC<MediaLightboxProps> = ({
@@ -38,7 +40,6 @@ export const MediaLightbox: React.FC<MediaLightboxProps> = ({
   onDelete,
   onAddTag,
   onRestoreQueued,
-  onFindSimilar,
 }) => {
   const [newTag, setNewTag] = useState("");
   const [copied, setCopied] = useState(false);
@@ -78,13 +79,23 @@ export const MediaLightbox: React.FC<MediaLightboxProps> = ({
         className="modal-box max-w-6xl p-0 bg-base-100 border border-base-300 shadow-2xl overflow-hidden flex flex-col lg:flex-row max-h-[90vh]"
         onClick={(e) => e.stopPropagation()}
       >
-        {/* Full-Resolution Image Canvas View */}
+        {/* Full-Resolution Image or Native HTML5 Video Player */}
         <div className="flex-1 bg-base-300 flex items-center justify-center p-4 min-h-[380px] overflow-hidden">
-          <img
-            src={resolveMediaSrc(capture.filePath)}
-            alt={capture.sourceApp || "Capture"}
-            className="max-w-full max-h-[78vh] object-contain rounded-lg shadow-lg"
-          />
+          {capture.mediaType === "video" ? (
+            <video
+              src={resolveMediaSrc(capture.filePath)}
+              poster={resolveMediaSrc(capture.thumbPath)}
+              controls
+              autoPlay
+              className="max-w-full max-h-[78vh] rounded-lg shadow-lg bg-black"
+            />
+          ) : (
+            <img
+              src={resolveMediaSrc(capture.filePath)}
+              alt={capture.sourceApp || "Capture"}
+              className="max-w-full max-h-[78vh] object-contain rounded-lg shadow-lg"
+            />
+          )}
         </div>
 
         {/* Right Details & Actions Sidebar */}
@@ -160,6 +171,9 @@ export const MediaLightbox: React.FC<MediaLightboxProps> = ({
                   <span className="text-base-content/50 block">File Size</span>
                   <span className="font-mono text-base-content font-semibold">
                     {formatBytes(capture.sizeBytes)}
+                    {capture.mediaType === "video" && capture.durationMs
+                      ? ` • ${formatDurationMs(capture.durationMs)}`
+                      : ""}
                   </span>
                 </div>
                 <div className="col-span-2 pt-2 border-t border-base-300">

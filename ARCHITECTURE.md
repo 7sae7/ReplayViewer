@@ -45,7 +45,7 @@
 | **Clipboard Watcher (v1.5)** | `arboard` + `clipboard-master` + `blake3` | Event-driven OS clipboard listener and sub-millisecond pixel hash deduplication |
 | **Local Native OCR (v1.5)** | `Windows.Media.Ocr` (WinRT) / macOS `Vision` (`ocrs` fallback) | Zero-bloat (`0 MB` installer & `0 MB` idle RAM) background text extraction indexed into `captures_fts` |
 | **Replay Engine (v2.0)** | `windows-capture` / OS backends + FFmpeg Sidecar | GPU texture capture, WASAPI loopback audio, and hardware-encoded segmented ring buffer |
-| **Semantic Visual AI (v2.0.5)** | Opt-in `ort` / `tract-onnx` (`MobileCLIP` / `CLIP-INT8`) | On-demand 512-d vector embeddings (`1 KB`/img) + 60s lazy RAM unloader + `< 8ms` SIMD visual search |
+| **Pluggable Vision API (v2.0.5)** | Opt-In BYOK `VisionTaggingProvider` Adapter (Gemini / OpenAI / AWS / Local Ollama) | Zero-bloat optional vision auto-tagging over `320px` WebP thumbnails directly into `captures_fts` |
 
 ---
 
@@ -161,26 +161,30 @@ sequenceDiagram
 
 ---
 
-### 4.4 Phase 2.0: Segmented Hardware Replay Buffer (`Alt + C`)
+### 4.4 Phase 2.0: Anti-Cheat Safe Segmented Hardware Replay Buffer & Dynamic Multi-Track Audio (`Alt + C`)
 
 ```mermaid
 flowchart LR
-    GPU["Game / Screen Texture\n+ System Audio (WASAPI)"] --> Encoder["Hardware Encoder\n(NVENC / AMF / QSV)"]
-    Encoder --> Segmenter["2-Second Segment Muxer\n(seg_001.mp4 ... seg_600.mp4)"]
-    Segmenter --> Ring["Rolling Ring Directory\n(Prunes chunks > Buffer Duration)"]
-    Ring -->|"User Presses Alt + C"| Concat["FFmpeg Stream Copy\n(-f concat -c copy)"]
-    Concat --> Output["Saved Clip (.mp4 in < 0.5s)\n+ Thumbnail + SQLite Entry"]
+    GPU["Display Compositor\n(DXGI ddagrab / Zero DLL Injection)"] --> Encoder["Auto GPU Encoder\n(NVENC -> AMF -> QSV -> MF -> x264)"]
+    WASAPI["Dynamic WASAPI Audio Pipes\n(Desktop + Isolated Apps + Mic • 20ms Pacing)"] --> Encoder
+    Encoder --> Segmenter["2-Second MPEG-TS Segmenter\n(seg_000001.ts ... Alt-Tab Continuous)"]
+    Segmenter --> Ring["Rolling Temp Disk Ring\n(O(1) RAM/VRAM • Default 60s = ~150 MB)"]
+    Ring -->|"User Presses Alt + C"| Concat["FFmpeg Lossless Stitch\n(-f concat -c copy +faststart)"]
+    Concat --> Output["Saved MP4 Clip (< 0.5s for 30s-2m)\n+ 320px WebP Thumb + SQLite Entry"]
 ```
 
-* **Why Segmented Chunks Beat a Raw RAM Buffer:**
-  A 20-minute 1080p60 capture at 25 Mbps is ~3.75 GB. Writing 2-second fragmented segments (`.ts` or `.mp4`) into a dedicated temp ring folder keeps **app RAM usage under 50 MB** regardless of whether the buffer is 30 seconds or 20 minutes.
-* **Zero Re-Encoding on Save:** Because segments are already hardware-encoded on the fly, pressing `Alt + C` only concatenates container packets (`-c copy`), finishing almost instantaneously.
-* **MIT-Safe On-Demand FFmpeg Distribution (~5 MB Base Installer):**
-  To keep the base Tauri installer tiny (~5–7 MB) and 100% compliant with the project's **MIT License**, FFmpeg is not statically bundled inside the base installer. In Phase 2.0, ReplayViewer checks the system `PATH` for an existing `ffmpeg` binary, offers a one-click **"Download Replay Engine (Minimal LGPL Build)"** in Settings (`AppData/Local/ReplayViewer/bin/`), and allows power users to point to a custom Full GPL (`libx264`) FFmpeg binary path if desired.
+* **Constant `O(1)` RAM & VRAM Usage & Full-Duration Stitching:**
+  Unlike RAM buffers, ReplayViewer writes rolling 2-second **`.ts` (MPEG-TS)** chunks with CFR `-r` + `-force_key_frames expr:gte(t,n_forced*2)` into `%LOCALAPPDATA%/com.replayviewer.app/replay_ring/` (flushing via graceful `"q\n"` stdin shutdown when structural settings change). System RAM stays `~35–60 MB` and VRAM stays `~80–160 MB` regardless of whether the user chooses **30s**, **1m (default)**, **2m**, **5m**, **10m**, or **20m**, and `save_replay_clip` includes valid trailing in-flight `.ts` packets so clips never truncate 2 seconds early.
+* **100% Anti-Cheat Safe & Immune to Xbox Game Bar's Alt-Tab Reset Bug:**
+  Captures at the OS display compositor level (`ddagrab` DXGI Desktop Duplication with zero DLL/hook injection) and **never clears existing ring segments on focus change**. Switching out to Spotify/Discord or across display mode switches resumes segment numbering (`-segment_start_number`), keeping the entire prior window intact.
+* **Hot-Swappable Multi-Track WASAPI Audio (`audio.rs`) & Zero-Restart Sliders:**
+  Enumerates live audio-emitting applications via `IAudioSessionManager2` + `IAudioMeterInformation` (filtering OS hosts like `svchost.exe`, pinning rows alphabetically, streaming `~14 Hz` perceptual dBFS meters via `get_live_audio_peaks`, and walking `CreateToolhelp32Snapshot` root PIDs for multi-process browsers like `msedge.exe`). Pre-allocates `Desktop Audio`, `Microphone` (with endpoint selector + live WASAPI Microphone Test / `IAudioRenderClient` sidetone), and **4 reusable `ProcessSlot` named pipes** (`48 kHz stereo s16le`, **20ms monotonic silence padding**). Mute (`EXCLUDE_TARGET_PROCESS_TREE`, 1 OS slot reserved for user apps), **`Isolated`** tracks (`Tracks: X/4` dropdown & `Clear Tracks`), and **`0%–200%` track gain sliders** swap in-place via lock-free atomics with **zero FFmpeg restarts**, while `Master Mix` (`0:a:0`) blends `Desktop + Mic` cleanly without comb-filtering and unused slots strip out cleanly on `.mp4` save.
+* **MIT-Safe On-Demand FFmpeg Distribution (`ffmpeg.rs`):**
+  To keep the base installer tiny (`< 6 MB`) and 100% MIT-licensed, ReplayViewer caches probed binaries (`custom_path` -> `%LOCALAPPDATA%/com.replayviewer.app/bin/` -> system `PATH`), offers a native `Browse...` dialog (`pick_ffmpeg_dialog`), and persists **Download / Upgrade Engine** state in `useSettingsStore` + `AppState` across tabs while locking replay buffer toggles until ready.
 
 ---
 
-### 4.5 Phase 1.5.3, 1.5.4 & 2.0.5: Smart Storage 3-Day Grace Buffer, Native OS OCR & Opt-In CLIP Semantic Visual Search
+### 4.5 Phase 1.5.3, 1.5.4 & 2.0.5: Smart Storage 3-Day Grace Buffer, Native OS OCR & Pluggable BYOK Vision Adapter
 
 1. **Automated Storage Quota, 100% Pinned Immunity & 3-Day "Queued Deletion" Grace Period (`v1.5.3`):**
    * **Defaults:** `max_storage_gb = 10` (10 GB cap) and `auto_cleanup_days = 0` (No max retention age / Keep Forever).
@@ -194,11 +198,12 @@ flowchart LR
      * **macOS:** Apple Vision framework (`VNRecognizeTextRequest`).
      * **Linux:** Local `ocrs` / `tesseract` CLI fallback if installed.
    * Tracks `ocr_status` (`'pending' | 'done' | 'failed'`) in SQLite so textless images are never re-scanned infinitely, and indexes extracted text into `captures.ocr_text` and `captures_fts` for **`< 2 ms`** text queries across 10,000+ captures.
-3. **Opt-In Semantic AI Visual Search (`v2.0.5` — Finding `"cat"` in 10,000 Unlabeled Images):**
-   * **On-Demand Model Download (`0 MB` Base Installer Bloat):** Users who want semantic visual search can toggle *"Enable Smart AI Visual Search (~95 MB Download)"* in Settings, which downloads a quantized INT8 `MobileCLIP` / `CLIP-ViT-B32` ONNX model into `AppData/Local/com.replayviewer.app/models/`.
-   * **One-Time Thumbnail Embedding (`1 KB` per Image):** When a capture is saved, the vision encoder processes its `320px` thumbnail once (~40–80 ms) and stores a 512-dimensional quantized vector (`512 bytes–1 KB`) in SQLite (`capture_embeddings` — only `10 MB` for 10,000 images).
-   * **60-Second Lazy RAM Unloader (`0 MB` Idle Bloat):** The ONNX runtime session is automatically dropped from RAM after 60 seconds of inactivity so background tray RAM stays `< 50 MB`.
-   * **Sub-8ms Search Across 10,000+ Images:** Typing a natural-language concept (e.g., `"cat"`, `"sunset"`, `"scoreboard"`, `"red car"`) encodes the query text (~3 ms) and computes SIMD cosine similarity across 10,000 SQLite image vectors in **~2–4 ms** in Rust.
+3. **Architectural Decision Record (ADR) — Scope Discipline & Pluggable BYOK Vision Tagging API (`v2.0.5`):**
+   * **Why ReplayViewer Avoids Bundled Local ML Vision Models or Hand-Rolled Pixel Heuristics:**
+     ReplayViewer's core engineering mandate is a **< 6 MB installer**, **< 50 MB idle RAM**, and zero-stutter capture/replay performance. Hand-rolled color/edge histograms (HSV/HOG) lack true semantic object recognition, whereas bundling embedded neural vision runtimes (`ONNX Runtime` + `CLIP` weights = `100–350 MB` of DLLs/models) introduces severe binary bloat, GPU driver edge cases, and architectural scope creep away from the core capture engine.
+   * **Decoupling Search (`SQLite FTS5`) from Optional Vision Enrichment (`VisionTaggingProvider` BYOK Adapter):**
+     Instead of maintaining a separate vector database, ReplayViewer keeps **100% local Native OS OCR (`v1.5.4`)** as the zero-cost default and exposes an opt-in **BYOK (Bring Your Own Key / Endpoint) Vision Auto-Tagger** (`Google Gemini`, `OpenAI / OpenRouter / Local Ollama`, or `AWS Rekognition`).
+   * **How It Works:** When enabled by a user with their own API key or local endpoint, Rust sends only the tiny `320px` `.webp` thumbnail (`~15–20 KB`, *after* destructive `Pixelate` redactions are flattened) and writes the returned semantic tags directly into `tags` and `captures_fts`—keeping gallery search `< 2 ms` and 100% offline at query time.
 
 ---
 
@@ -334,7 +339,7 @@ To support **Windows, macOS, and Linux** cleanly now—and prepare for **Android
 | :--- | :---: | :--- | :--- | :--- |
 | `trigger_region_capture` | 1.0 | *None* | `CaptureSessionMeta` | Freezes active screen as uncompressed BMP (`< 3ms`) and opens `overlay` (`Alt + S`) |
 | `trigger_fullscreen_capture` | 1.0 | *None* | `CaptureRecord` | Captures fullscreen, copies to clipboard & saves silently without focus loss (`Alt + Shift + S`) |
-| `save_annotated_capture` | 1.0 | `image_bytes, copy_to_clipboard, image_format, source_app` | `CaptureRecord` | Flattens cropped/annotated bitmap, generates WebP thumb, copies to clipboard |
+| `save_annotated_capture` | 1.0 | `image_bytes, copy_to_clipboard, save_to_disk, image_format, source_app` | `CaptureRecord` | Supports `Copy Only` (`Ctrl+C`), `Save Only`, and `Copy & Save` (`Enter`) |
 | `list_captures` | 1.0 | `cursor, limit, filter: GalleryFilter` | `PaginatedCaptures` | B-Tree sorted (`DESC`/`ASC`), FTS5-filtered query returning items, totals, and distinct groups |
 | `toggle_pin_capture` | 1.0 | `id: String, pinned: bool` | `()` | Toggles `is_pinned` status on a capture |
 | `add_tag_to_capture` | 1.0 | `capture_id: String, tag_name: String` | `CaptureRecord` | Adds a single searchable FTS5 tag to a capture |
@@ -350,7 +355,8 @@ To support **Windows, macOS, and Linux** cleanly now—and prepare for **Android
 | `pick_folder_dialog` | 1.0 | `default_path: Option<String>` | `Option<String>` | Opens native OS Folder Picker dialog (for changing working folder or moving items) |
 | `open_in_file_explorer` | 1.0 | `path: String` | `()` | Opens file (highlighted) or folder in Windows Explorer / macOS Finder / Linux `xdg-open` |
 | `seed_benchmark_captures` | 1.0 | `count: u32` | `usize` | Inserts 500+ real WebP-backed benchmark captures in a single SQLite transaction |
-| `get_settings` / `update_settings` | 1.0 | `SettingsPayload` | `SettingsPayload` | Reads/updates hotkeys, working `captures_dir`, image format, and storage limits |
+| `get_settings` / `update_settings` | 1.0 | `SettingsPayload` | `SettingsPayload` | Reads/updates hotkeys (re-registering OS global shortcuts live), working `captures_dir`, image format, and storage limits |
+| `set_shortcut_recording_mode` | 1.0 | `recording: bool` | `()` | Unregisters OS global shortcuts during keybind recording so pressing `Alt+S` records the combo instead of triggering a capture |
 | `toggle_clipboard_drawer` | 1.5.1 | *None* | `bool` | Shows/hides the frameless `Alt + V` clipboard window using persisted `clipboard_always_on_top` |
 | `get_clipboard_always_on_top` / `set_clipboard_always_on_top` | 1.5.1 | `always_on_top: bool` | `bool` | Reads/persists the user's Always-on-Top window pin choice across `Alt + V` openings |
 | `list_clipboard_history` | 1.5.1 | *None* | `Vec<ClipboardItem>` | Returns `Alt + V` items (`ORDER BY is_pinned DESC, copied_at DESC`) with `is_currently_copied` |
@@ -362,8 +368,10 @@ To support **Windows, macOS, and Linux** cleanly now—and prepare for **Android
 | `get_storage_status_preview` | 1.5.3 | `max_storage_gb, auto_cleanup_days` | `StorageStatusSummary` | Dry-run storage breakdown (Pinned vs. Unpinned vs. Queued 3-Day Grace) and candidate preview |
 | `enforce_storage_policies_now` | 1.5.3 | *None* | `StorageStatusSummary` | Queues over-quota/expired unpinned captures for 3-day deletion and purges captures past their 3-day grace window |
 | `run_ocr_backfill_now` | 1.5.4 | *None* | `usize` | Scans pending captures in the active folder using Native OS OCR and indexes text into `captures_fts` |
-| `save_replay_buffer` | 2.0 | *None* | `CaptureRecord` | Concatenates rolling video segments into a saved `.mp4` clip (`Alt + C`) |
-| `trim_video_clip` | 2.0 | `id, start_ms, end_ms, replace_original` | `CaptureRecord` | Lossless/fast FFmpeg trim of a saved video clip |
-| `semantic_visual_search` | 2.0.5 | `query: String, limit: Option<u32>` | `Vec<CaptureRecord>` | Ranks captures via `512-d` INT8 vector cosine similarity + visual concepts in `< 3 ms` |
-| `find_similar_captures` | 2.0.5 | `capture_id: String, limit: Option<u32>` | `Vec<CaptureRecord>` | Ranks visually similar captures to a target image via `512-d` vector cosine similarity |
-| `get_visual_search_status` / `run_visual_indexing_now` / `unload_visual_model_now` | 2.0.5 | *None* | `VisualSearchStatus` / `usize` / `()` | Inspects 512-d index status, runs batch indexing, or immediately drops the lazy AI model from RAM |
+| `save_replay_buffer` | 2.0.1 | *None* | `CaptureRecord` | Concatenates active rolling `.ts` ring segments into a saved `.mp4` clip (`Alt + C`) via `-f concat -c copy`, strips unused `ProcessSlot` streams, generates 320px WebP thumb, and inserts into SQLite |
+| `get_ffmpeg_status` / `download_ffmpeg_engine` / `pick_ffmpeg_dialog` | 2.0.1 | `force_refresh` | `FfmpegStatus` / `Option<String>` | Cached probe (`custom -> managed -> PATH`), persistent background LGPL download/upgrade (`downloading`, `downloadStage`), and native `.exe` picker |
+| `get_replay_buffer_snapshot` / `set_replay_buffer_active` | 2.0.1 | `active: bool` | `ReplayBufferSnapshot` / `bool` | Inspects live ring size, active GPU encoder & tracks, and starts/pauses the rolling buffer (blocked while FFmpeg missing/downloading) |
+| `list_active_audio_sessions` / `get_live_audio_peaks` / `update_app_audio_rule` | 2.0.2 | `include_idle` / `exe_name, muted, isolated` | `Vec<AudioSessionInfo>` / `HashMap<String, f32>` / `()` | Discovers non-system audio apps, streams `~14 Hz` live COM peak meters without SQLite locks, and hot-swaps Mute/Isolated (`4` slot cap) with zero FFmpeg restart |
+| `set_audio_track_volumes` / `list_audio_input_devices` / `start_mic_test` / `stop_mic_test` / `set_mic_test_sidetone` / `set_mic_test_gain` / `get_mic_test_level` | 2.0.2 | `volumes, device_id, sidetone, gain` | `Vec<AudioInputDevice>` / `f32` / `bool` | Lock-free `0%–200%` track gains, WASAPI capture endpoint enumeration, and live Microphone Test peak metering + optional `IAudioRenderClient` sidetone |
+| `trim_video_clip` | 2.0.3 | `id, start_ms, end_ms, replace_original` | `CaptureRecord` | Lossless/fast FFmpeg trim of a saved video clip |
+| `auto_tag_capture_with_byok_vision` | 2.0.5 | `capture_id: String` | `Vec<String>` | Opt-in BYOK vision adapter (Gemini / OpenAI / AWS / Local Ollama) that sends the 320px thumbnail and indexes returned tags into `captures_fts` |

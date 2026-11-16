@@ -125,6 +125,7 @@ pub fn init_db(db_path: &Path) -> AppResult<Connection> {
         "ALTER TABLE clipboard_history ADD COLUMN annotations_json TEXT NOT NULL DEFAULT '[]'",
         [],
     );
+    let _ = conn.execute("DROP TABLE IF EXISTS capture_embeddings", []);
 
     seed_default_settings(&conn)?;
     Ok(conn)
@@ -148,7 +149,22 @@ fn seed_default_settings(conn: &Connection) -> AppResult<()> {
             "clipboard_excluded_apps",
             "[\"1password\",\"bitwarden\",\"keepass\",\"keepassxc\",\"dashlane\",\"lastpass\",\"nordpass\",\"protonpass\",\"enpass\",\"inprivate\",\"incognito\",\"private browsing\",\"tor browser\"]",
         ),
-        ("ai_visual_search_enabled", "true"),
+        // Milestone 2.0.1 & 2.0.2 Defaults: 60s (1 minute) ring buffer + Auto hardware encoder + dynamic audio
+        ("replay_enabled", "true"),
+        ("replay_buffer_secs", "60"),
+        ("replay_fps", "60"),
+        ("replay_bitrate_mbps", "20"),
+        ("replay_encoder", "\"auto\""),
+        ("ffmpeg_custom_path", "\"\""),
+        ("audio_record_desktop", "true"),
+        ("audio_record_mic", "true"),
+        ("audio_desktop_volume", "1.0"),
+        ("audio_mic_volume", "1.0"),
+        ("audio_app_volumes", "{}"),
+        ("audio_mic_device_id", "\"\""),
+        ("audio_single_mix", "false"),
+        ("audio_muted_apps", "[]"),
+        ("audio_isolated_apps", "[]"),
         ("launch_on_startup", "false"),
     ];
 

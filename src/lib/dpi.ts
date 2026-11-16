@@ -102,3 +102,14 @@ export function formatDeletionCountdown(
     compactLabel: `${countdown} • Deletes ${formattedDate}`,
   };
 }
+
+/**
+ * Formats millisecond video durations cleanly (e.g. `60000 -> "01:00"`).
+ */
+export function formatDurationMs(durationMs: number | null | undefined): string {
+  if (!durationMs || durationMs <= 0) return "00:00";
+  const totalSec = Math.round(durationMs / 1000);
+  const mins = Math.floor(totalSec / 60);
+  const secs = totalSec % 60;
+  return `${String(mins).padStart(2, "0")}:${String(secs).padStart(2, "0")}`;
+}

@@ -131,27 +131,15 @@ export const useGalleryStore = create<GalleryState>((set, get) => ({
         sortDir: state.sortDir,
       };
       const result = await listCaptures(null, 5000, filter);
-
-      let displayItems = result.items;
-      if (state.similarToCapture && !state.onlyQueuedDeletion) {
-        displayItems = await findSimilarCaptures(state.similarToCapture.id, 100);
-      } else if (
-        state.visualSearchMode &&
-        state.searchQuery.trim().length > 0 &&
-        !state.onlyQueuedDeletion
-      ) {
-        displayItems = await semanticVisualSearch(state.searchQuery.trim(), 200);
-      }
-
       set((prev) => ({
-        items: displayItems,
+        items: result.items,
         groups: result.groups || [],
         totalCount: result.totalCount,
         totalBytes: result.totalBytes,
         queuedDeletionCount: result.queuedDeletionCount ?? 0,
         queuedDeletionBytes: result.queuedDeletionBytes ?? 0,
         selectedCapture: prev.selectedCapture
-          ? displayItems.find((i) => i.id === prev.selectedCapture?.id) ?? prev.selectedCapture
+          ? result.items.find((i) => i.id === prev.selectedCapture?.id) ?? prev.selectedCapture
           : null,
         isLoading: false,
       }));

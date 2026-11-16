@@ -205,9 +205,9 @@ pub fn spawn_background_ocr_and_storage_check(
             }
         }
 
-        // Coordinate with Milestone 1.5.3 & 2.0.5: after OCR finishes on the new capture,
-        // index its 512-d visual embedding and run the storage quota pass.
-        let _ = crate::services::visual_search::run_visual_indexing_batch(&app, 5);
+        // Coordinate with Milestone 1.5.3: after OCR finishes on the new capture,
+        // run the storage quota pass so any oldest unpinned captures exceeding quota
+        // are moved into the 3-day "Queued Deletion" grace buffer.
         let _ = crate::services::storage_cleanup::enforce_storage_policies_now(&app);
     });
 }

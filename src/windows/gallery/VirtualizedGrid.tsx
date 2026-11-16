@@ -6,16 +6,20 @@ import {
   Clock,
   Copy,
   FileText,
+  Film,
   Folder,
   FolderOpen,
   Maximize2,
   Pin,
   RotateCcw,
-  Sparkles,
   Trash2,
 } from "lucide-react";
 import type { CaptureRecord } from "../../types/ipc";
-import { formatBytes, formatDeletionCountdown } from "../../lib/dpi";
+import {
+  formatBytes,
+  formatDeletionCountdown,
+  formatDurationMs,
+} from "../../lib/dpi";
 import {
   copyCaptureToClipboard,
   openInFileExplorer,
@@ -32,7 +36,6 @@ interface VirtualizedGridProps {
   onTogglePin: (id: string, currentPinned: boolean) => void;
   onDelete: (id: string) => void;
   onRestoreQueued?: (id: string, alsoPin?: boolean) => void;
-  onFindSimilar?: (capture: CaptureRecord) => void;
   onCopied?: () => void;
 }
 
@@ -53,7 +56,6 @@ export const VirtualizedGrid: React.FC<VirtualizedGridProps> = ({
   onTogglePin,
   onDelete,
   onRestoreQueued,
-  onFindSimilar,
   onCopied,
 }) => {
   const parentRef = useRef<HTMLDivElement | null>(null);
@@ -519,7 +521,14 @@ export const VirtualizedGrid: React.FC<VirtualizedGridProps> = ({
                         </div>
                       ) : (
                         <>
-                          {item.lastCopiedAt && (
+                          {item.mediaType === "video" && (
+                            <div className="badge badge-primary badge-xs gap-1 font-mono font-bold absolute bottom-2 left-2 opacity-95 shadow">
+                              <Film className="w-2.5 h-2.5" />
+                              {formatDurationMs(item.durationMs)}
+                            </div>
+                          )}
+
+                          {item.mediaType !== "video" && item.lastCopiedAt && (
                             <div
                               title={`Copied to clipboard at ${new Date(
                                 item.lastCopiedAt

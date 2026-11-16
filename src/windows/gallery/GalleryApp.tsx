@@ -11,6 +11,7 @@ import {
   Columns,
   Copy,
   Database,
+  Film,
   FolderInput,
   FolderOpen,
   FolderPlus,
@@ -20,6 +21,7 @@ import {
   Monitor,
   Palette,
   Pin,
+  Radio,
   RefreshCw,
   RotateCcw,
   Search,
@@ -36,7 +38,9 @@ import {
   isTauriRuntime,
   openInFileExplorer,
   pickFolderDialog,
+  saveReplayBuffer,
   scanUnindexedMedia,
+  setReplayBufferActive,
   toggleClipboardDrawer,
   triggerFullscreenCapture,
   triggerRegionCapture,
@@ -46,6 +50,7 @@ import { useSettingsStore } from "../../stores/useSettingsStore";
 import type {
   DateRangeFilter,
   MediaType,
+  ReplayRuntimeState,
   SortByField,
   UnindexedScanResult,
 } from "../../types/ipc";
@@ -127,7 +132,16 @@ export const GalleryApp: React.FC<GalleryAppProps> = ({
     runBenchmarkSeed,
   } = useGalleryStore();
 
-  const { settings, loadSettings } = useSettingsStore();
+  const {
+    settings,
+    ffmpegStatus,
+    replaySnapshot,
+    isDownloadingFfmpeg,
+    loadSettings,
+    refreshReplayStatus,
+    setReplayRuntime,
+    setDownloadProgress,
+  } = useSettingsStore();
 
   const [activeTab, setActiveTab] = useState<"gallery" | "settings">("gallery");
   const [statusToast, setStatusToast] = useState<string | null>(null);
@@ -143,6 +157,9 @@ export const GalleryApp: React.FC<GalleryAppProps> = ({
   const [unindexedPrompt, setUnindexedPrompt] =
     useState<UnindexedScanResult | null>(null);
   const [isImportingExternal, setIsImportingExternal] = useState(false);
+
+  // Replay Buffer Live Status
+  const [isSavingReplay, setIsSavingReplay] = useState(false);
 
   const [theme, setTheme] = useState<string>(() => {
     return localStorage.getItem("rv_daisy_theme") || "night";
@@ -166,10 +183,13 @@ export const GalleryApp: React.FC<GalleryAppProps> = ({
   useEffect(() => {
     fetchCaptures();
     loadSettings();
+    refreshReplayStatus(false);
 
     let unlistenGallery: (() => void) | undefined;
     let unlistenOcr: (() => void) | undefined;
     let unlistenToast: (() => void) | undefined;
+    let unlistenReplay: (() => void) | undefined;
+    let unlistenDl: (() => void) | undefined;
 
     if (isTauriRuntime()) {
       const win = getCurrentWindow();
@@ -177,7 +197,7 @@ export const GalleryApp: React.FC<GalleryAppProps> = ({
 
       listen("gallery:updated", () => {
         fetchCaptures();
-        showToast("New capture saved to library & copied to clipboard!");
+        showToast("New capture saved to library!");
       }).then((fn) => {
         unlistenGallery = fn;
       });
@@ -186,6 +206,21 @@ export const GalleryApp: React.FC<GalleryAppProps> = ({
         fetchCaptures();
       }).then((fn) => {
         unlistenOcr = fn;
+      });
+
+      listen<ReplayRuntimeState>("replay:status_changed", (event) => {
+        setReplayRuntime(event.payload);
+      }).then((fn) => {
+        unlistenReplay = fn;
+      });
+
+      listen<{ stage: string; message: string }>(
+        "replay:ffmpeg_download_progress",
+        (ev) => {
+          setDownloadProgress(ev.payload.stage, ev.payload.message);
+        }
+      ).then((fn) => {
+        unlistenDl = fn;
       });
 
       listen<string>("shortcut:toast", (event) => {
@@ -198,8 +233,10 @@ export const GalleryApp: React.FC<GalleryAppProps> = ({
       if (unlistenGallery) unlistenGallery();
       if (unlistenOcr) unlistenOcr();
       if (unlistenToast) unlistenToast();
+      if (unlistenReplay) unlistenReplay();
+      if (unlistenDl) unlistenDl();
     };
-  }, [fetchCaptures, loadSettings]);
+  }, [fetchCaptures, loadSettings, refreshReplayStatus, setDownloadProgress, setReplayRuntime]);
 
   // Escape key clears active multi-selection
   useEffect(() => {
@@ -273,6 +310,49 @@ export const GalleryApp: React.FC<GalleryAppProps> = ({
       await toggleClipboardDrawer();
     } else if (onOpenClipboardPreview) {
       onOpenClipboardPreview();
+    }
+  };
+
+  const canToggleReplayBuffer = Boolean(
+    ffmpegStatus?.available &&
+      !isDownloadingFfmpeg &&
+      !(ffmpegStatus.source === "system" && !ffmpegStatus.supportsDdagrab)
+  );
+
+  const handleToggleReplayBuffer = async () => {
+    if (!canToggleReplayBuffer) {
+      setActiveTab("settings");
+      showToast(
+        isDownloadingFfmpeg
+          ? "FFmpeg Engine download/upgrade is in progress — please wait..."
+          : "Download or Upgrade the FFmpeg Engine in Settings before starting Replay Buffer."
+      );
+      return;
+    }
+    const next = !(settings?.replayEnabled ?? replaySnapshot?.runtime.isRecording ?? false);
+    try {
+      await setReplayBufferActive(next);
+      await loadSettings();
+      await new Promise((r) => setTimeout(r, 180));
+      await refreshReplayStatus(false);
+      showToast(next ? "Replay Buffer started!" : "Replay Buffer paused.");
+    } catch (err) {
+      showToast(String(err));
+    }
+  };
+
+  const handleSaveReplayClip = async () => {
+    setIsSavingReplay(true);
+    try {
+      const saved = await saveReplayBuffer();
+      await fetchCaptures();
+      showToast(
+        `Saved ${Math.round((saved.durationMs || 0) / 1000)}s Instant Replay clip!`
+      );
+    } catch (err) {
+      showToast(`Replay Save: ${String(err)}`);
+    } finally {
+      setIsSavingReplay(false);
     }
   };
 
@@ -495,6 +575,54 @@ export const GalleryApp: React.FC<GalleryAppProps> = ({
             <ClipboardCheck className="w-3.5 h-3.5 text-info" />
             Clipboard (Alt+V)
           </button>
+
+          {/* Hardware Replay Buffer Status Toggle & Quick Save Clip */}
+          <div className="join">
+            <button
+              type="button"
+              disabled={isDownloadingFfmpeg}
+              onClick={handleToggleReplayBuffer}
+              title={
+                isDownloadingFfmpeg
+                  ? "FFmpeg Engine downloading/upgrading..."
+                  : !canToggleReplayBuffer
+                  ? "Download or Upgrade FFmpeg Engine in Settings to enable"
+                  : replaySnapshot?.runtime.isRecording
+                  ? `Replay Buffer Active (${replaySnapshot.bufferSecs}s • ${replaySnapshot.runtime.activeEncoder}) — Click to pause`
+                  : "Replay Buffer Paused — Click to start"
+              }
+              className={`btn btn-xs join-item h-7 px-2 gap-1 ${
+                replaySnapshot?.runtime.isRecording
+                  ? "btn-soft btn-error"
+                  : "btn-neutral"
+              }`}
+            >
+              <Radio
+                className={`w-3 h-3 ${
+                  replaySnapshot?.runtime.isRecording
+                    ? "text-error animate-pulse"
+                    : "text-base-content/50"
+                }`}
+              />
+              {isDownloadingFfmpeg
+                ? "Upgrading..."
+                : replaySnapshot?.runtime.isRecording
+                ? `REC ${replaySnapshot.bufferSecs}s`
+                : "Buffer Off"}
+            </button>
+            <button
+              type="button"
+              disabled={isSavingReplay}
+              onClick={handleSaveReplayClip}
+              title={`Save Instant Replay Clip (${settings?.hotkeySaveReplay || "Alt+C"})`}
+              className="btn btn-xs btn-neutral join-item h-7 px-2 gap-1"
+            >
+              <Film className="w-3 h-3 text-warning" />
+              {isSavingReplay
+                ? "Saving..."
+                : `Clip (${settings?.hotkeySaveReplay || "Alt+C"})`}
+            </button>
+          </div>
 
           {/* daisyUI Boxed Tabs */}
           <div role="tablist" className="tabs tabs-box tabs-xs bg-base-300 p-0.5 ml-1">
@@ -784,32 +912,6 @@ export const GalleryApp: React.FC<GalleryAppProps> = ({
               +500 Benchmark
             </button>
           </div>
-        </div>
-      )}
-
-      {/* Visually Similar Captures Filter Banner (Milestone 2.0.5) */}
-      {activeTab === "gallery" && similarToCapture && !onlyQueuedDeletion && (
-        <div className="flex flex-wrap items-center justify-between gap-3 px-6 py-2 bg-accent/15 border-b border-accent/40 text-xs">
-          <div className="flex items-center gap-2">
-            <Sparkles className="w-4 h-4 text-accent shrink-0" />
-            <span>
-              Showing captures visually similar to{" "}
-              <strong className="text-base-content">
-                {similarToCapture.sourceApp || "selected capture"}
-              </strong>{" "}
-              <span className="text-base-content/70 font-mono text-[11px]">
-                (Ranked by 512-d INT8 Vector Cosine Similarity)
-              </span>
-            </span>
-          </div>
-          <button
-            type="button"
-            onClick={clearSimilarFilter}
-            className="btn btn-xs btn-ghost gap-1"
-          >
-            <X className="w-3.5 h-3.5" />
-            Clear Visual Similarity Filter
-          </button>
         </div>
       )}
 
@@ -1195,7 +1297,6 @@ export const GalleryApp: React.FC<GalleryAppProps> = ({
           onTogglePin={togglePin}
           onDelete={(id) => removeCaptures([id])}
           onRestoreQueued={handleRestoreQueued}
-          onFindSimilar={(cap) => findSimilar(cap)}
           onCopied={() => fetchCaptures()}
         />
       ) : (
@@ -1211,7 +1312,6 @@ export const GalleryApp: React.FC<GalleryAppProps> = ({
           onDelete={(id) => removeCaptures([id])}
           onAddTag={addTag}
           onRestoreQueued={handleRestoreQueued}
-          onFindSimilar={(cap) => findSimilar(cap)}
         />
       )}
     </div>

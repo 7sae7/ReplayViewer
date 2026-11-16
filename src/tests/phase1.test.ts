@@ -9,9 +9,11 @@ import {
   clearUnpinnedClipboardHistory,
   getClipboardAlwaysOnTop,
   getSettings,
+  listCaptures,
   listClipboardHistory,
   pasteClipboardItem,
   promoteClipboardToGallery,
+  saveAnnotatedCapture,
   setClipboardAlwaysOnTop,
   togglePinClipboardItem,
 } from "../lib/tauri-client";
@@ -199,5 +201,37 @@ describe("Phase 1.5.1 Visual Clipboard Drawer (Alt + V) Operations", () => {
     const promoted = await promoteClipboardToGallery(remaining[0].id);
     expect(promoted.tags).toContain("clipboard");
     expect(promoted.sourceApp).toBe("Visual Clipboard (Alt + V)");
+  });
+
+  it("differentiates Copy Only (Ctrl+C), Save Only, and Copy & Save (Enter) export modes", async () => {
+    const beforeGallery = await listCaptures(null, 500, { onlyPinned: false });
+    const beforeCount = beforeGallery.totalCount;
+
+    // 1. Copy Only (`saveToDisk: false`) -> copies to clipboard without adding to Gallery
+    const copiedOnly = await saveAnnotatedCapture(
+      new Uint8Array([1, 2, 3, 4]),
+      true,
+      "webp",
+      undefined,
+      { width: 320, height: 180 },
+      { saveToDisk: false }
+    );
+    expect(copiedOnly.id).toContain("copied-only-");
+    expect(copiedOnly.filePath).toBe("");
+    const afterCopyOnly = await listCaptures(null, 500, { onlyPinned: false });
+    expect(afterCopyOnly.totalCount).toBe(beforeCount);
+
+    // 2. Save Only (`copyToClipboard: false, saveToDisk: true`) -> saves to Gallery without setting lastCopiedAt
+    const savedOnly = await saveAnnotatedCapture(
+      new Uint8Array([1, 2, 3, 4]),
+      false,
+      "webp",
+      undefined,
+      { width: 640, height: 360 },
+      { saveToDisk: true }
+    );
+    expect(savedOnly.lastCopiedAt).toBeNull();
+    const afterSaveOnly = await listCaptures(null, 500, { onlyPinned: false });
+    expect(afterSaveOnly.totalCount).toBe(beforeCount + 1);
   });
 });

@@ -1,10 +1,12 @@
-import React, { useEffect, useState } from "react";
+import React, { useCallback, useEffect, useState } from "react";
 import {
   Check,
   Clock,
   Cpu,
+  Download,
   Eye,
   FileText,
+  Film,
   Folder,
   FolderInput,
   FolderOpen,
@@ -14,12 +16,15 @@ import {
   ImagePlus,
   Keyboard,
   Lock,
+  MoreHorizontal,
   Pin,
   Plus,
+  RefreshCw,
   RotateCcw,
   Save,
   ShieldCheck,
   Sparkles,
+  Trash2,
   X,
 } from "lucide-react";
 import { formatBytes, formatDeletionCountdown } from "../../lib/dpi";
@@ -27,31 +32,96 @@ import {
   enforceStoragePoliciesNow,
   getDefaultCapturesDir,
   getStorageStatusPreview,
-  getVisualSearchStatus,
   importExternalMedia,
   migrateCapturesToFolder,
   openInFileExplorer,
+  pickFfmpegDialog,
   pickFolderDialog,
   runOcrBackfillNow,
-  runVisualIndexingNow,
+  saveReplayBuffer,
   scanUnindexedMedia,
-  unloadVisualModelNow,
+  setReplayBufferActive,
+  setShortcutRecordingMode,
 } from "../../lib/tauri-client";
 import { useGalleryStore } from "../../stores/useGalleryStore";
 import { useSettingsStore } from "../../stores/useSettingsStore";
+import { AudioMixerCard } from "./AudioMixerCard";
 import type {
   SettingsPayload,
   StorageStatusSummary,
   UnindexedScanResult,
-  VisualSearchStatus,
 } from "../../types/ipc";
 
+type HotkeyFieldKey =
+  | "hotkeyRegionCapture"
+  | "hotkeyFullscreenCapture"
+  | "hotkeyOpenGallery"
+  | "hotkeyVisualClipboard"
+  | "hotkeySaveReplay";
+
+const HOTKEY_ROWS: {
+  key: HotkeyFieldKey;
+  label: string;
+  desc: string;
+  badge: string;
+  defaultCombo: string;
+}[] = [
+  {
+    key: "hotkeyRegionCapture",
+    label: "Region Screenshot & Annotator",
+    desc: "Freezes active screen before opening the Konva crop & annotation overlay",
+    badge: "v1.0",
+    defaultCombo: "Alt+S",
+  },
+  {
+    key: "hotkeyFullscreenCapture",
+    label: "Instant Fullscreen Capture (Zero Focus Loss)",
+    desc: "Captures full monitor & copies to clipboard silently without Alt-Tabbing Exclusive Fullscreen games",
+    badge: "v1.0",
+    defaultCombo: "Alt+Shift+S",
+  },
+  {
+    key: "hotkeyOpenGallery",
+    label: "Open Virtualized Gallery",
+    desc: "Opens/focuses the main SQLite + FTS5 media library window from background tray",
+    badge: "v1.0",
+    defaultCombo: "Alt+G",
+  },
+  {
+    key: "hotkeyVisualClipboard",
+    label: "Visual Image Clipboard Drawer",
+    desc: "Opens the Windows+V style image ring buffer with blake3 deduplication",
+    badge: "v1.5",
+    defaultCombo: "Alt+V",
+  },
+  {
+    key: "hotkeySaveReplay",
+    label: "Save Rolling Replay Clip (Alt + C)",
+    desc: "Stitches hardware-encoded 30s–20m segments via FFmpeg stream copy (avoids NVIDIA Alt+R conflict)",
+    badge: "v2.0",
+    defaultCombo: "Alt+C",
+  },
+];
+
 export const SettingsPanel: React.FC = () => {
-  const { settings, isSaving, loadSettings, saveSettings } = useSettingsStore();
+  const {
+    settings,
+    isSaving,
+    ffmpegStatus,
+    replaySnapshot,
+    isDownloadingFfmpeg,
+    downloadStageMsg,
+    loadSettings,
+    saveSettings,
+    refreshReplayStatus,
+    startFfmpegDownload,
+  } = useSettingsStore();
   const { fetchCaptures } = useGalleryStore();
 
   const [form, setForm] = useState<SettingsPayload | null>(null);
-  const [recordingField, setRecordingField] = useState<keyof SettingsPayload | null>(null);
+  const [recordingField, setRecordingField] = useState<HotkeyFieldKey | null>(
+    null
+  );
   const [savedBanner, setSavedBanner] = useState(false);
   const [statusMessage, setStatusMessage] = useState<string | null>(null);
 
@@ -73,16 +143,18 @@ export const SettingsPanel: React.FC = () => {
   const [isRunningPolicy, setIsRunningPolicy] = useState(false);
   const [isRunningOcr, setIsRunningOcr] = useState(false);
 
-  // Phase 2.0.4 & 2.0.5: Excluded Apps & Smart AI Visual Search Status
+  // Phase 2.0.4: Excluded Apps Blocklist Input
   const [newExcludedApp, setNewExcludedApp] = useState("");
-  const [visualStatus, setVisualStatus] = useState<VisualSearchStatus | null>(
-    null
-  );
-  const [isIndexingVisual, setIsIndexingVisual] = useState(false);
 
+  // Phase 2.0.1 & 2.0.2: Replay Buffer & FFmpeg Engine State (Global Store — persists across tabs)
   useEffect(() => {
     loadSettings();
-  }, [loadSettings]);
+    refreshReplayStatus(false);
+
+    return () => {
+      setShortcutRecordingMode(false).catch(() => {});
+    };
+  }, [loadSettings, refreshReplayStatus]);
 
   useEffect(() => {
     if (settings) {
@@ -95,37 +167,95 @@ export const SettingsPanel: React.FC = () => {
     getStorageStatusPreview(form.maxStorageGb, form.autoCleanupDays)
       .then(setStorageStatus)
       .catch(() => {});
-    getVisualSearchStatus()
-      .then(setVisualStatus)
-      .catch(() => {});
   }, [form?.maxStorageGb, form?.autoCleanupDays]);
 
-  const handleKeyDownRecorder = (
-    e: React.KeyboardEvent,
-    field: keyof SettingsPayload
-  ) => {
-    if (recordingField !== field || !form) return;
-    e.preventDefault();
-    e.stopPropagation();
-
-    if (e.key === "Escape") {
-      setRecordingField(null);
-      return;
-    }
-
-    const mods: string[] = [];
-    if (e.ctrlKey || e.metaKey) mods.push("Ctrl");
-    if (e.altKey) mods.push("Alt");
-    if (e.shiftKey) mods.push("Shift");
-
-    const ignoreKeys = ["Control", "Alt", "Shift", "Meta"];
-    if (ignoreKeys.includes(e.key)) return;
-
-    const mainKey = e.key.length === 1 ? e.key.toUpperCase() : e.key;
-    const combo = [...mods, mainKey].join("+");
-    setForm({ ...form, [field]: combo });
-    setRecordingField(null);
+  const startRecordingKeybind = async (field: HotkeyFieldKey) => {
+    await setShortcutRecordingMode(true);
+    setRecordingField(field);
   };
+
+  const stopRecordingKeybind = useCallback(async () => {
+    setRecordingField(null);
+    await setShortcutRecordingMode(false);
+  }, []);
+
+  // Applies a new keybind (or Default / Remove), automatically unbinds any conflicting action,
+  // and immediately persists + binds the updated shortcuts in the OS.
+  const applyHotkeyUpdate = useCallback(
+    async (field: HotkeyFieldKey, rawCombo: string, actionNote?: string) => {
+      if (!form) return;
+      const combo = rawCombo.trim();
+      const nextForm: SettingsPayload = { ...form, [field]: combo };
+      const overwrittenLabels: string[] = [];
+
+      if (combo !== "") {
+        for (const row of HOTKEY_ROWS) {
+          if (
+            row.key !== field &&
+            String(nextForm[row.key] || "")
+              .trim()
+              .toLowerCase() === combo.toLowerCase()
+          ) {
+            nextForm[row.key] = "";
+            overwrittenLabels.push(row.label);
+          }
+        }
+      }
+
+      setForm(nextForm);
+      setRecordingField(null);
+      await saveSettings(nextForm);
+      await setShortcutRecordingMode(false);
+
+      const targetLabel =
+        HOTKEY_ROWS.find((r) => r.key === field)?.label || field;
+      if (overwrittenLabels.length > 0) {
+        setStatusMessage(
+          `Bound "${combo}" to "${targetLabel}" and removed duplicate keybind from ${overwrittenLabels
+            .map((l) => `"${l}"`)
+            .join(", ")}.`
+        );
+      } else if (actionNote) {
+        setStatusMessage(actionNote);
+      } else if (combo === "") {
+        setStatusMessage(`Removed keybind for "${targetLabel}".`);
+      } else {
+        setStatusMessage(`Bound "${combo}" to "${targetLabel}" and activated shortcut.`);
+      }
+    },
+    [form, saveSettings]
+  );
+
+  // Window-level keydown listener while recording a keybind so OS/browser focus never drops Alt+S
+  useEffect(() => {
+    if (!recordingField || !form) return;
+
+    const onWindowKeyDown = (e: KeyboardEvent) => {
+      e.preventDefault();
+      e.stopPropagation();
+
+      if (e.key === "Escape") {
+        stopRecordingKeybind();
+        return;
+      }
+
+      const ignoreKeys = ["Control", "Alt", "Shift", "Meta"];
+      if (ignoreKeys.includes(e.key)) return;
+
+      const mods: string[] = [];
+      if (e.ctrlKey || e.metaKey) mods.push("Ctrl");
+      if (e.altKey) mods.push("Alt");
+      if (e.shiftKey) mods.push("Shift");
+
+      let mainKey = e.key.length === 1 ? e.key.toUpperCase() : e.key;
+      if (mainKey === " ") mainKey = "Space";
+      const combo = [...mods, mainKey].join("+");
+      applyHotkeyUpdate(recordingField, combo);
+    };
+
+    window.addEventListener("keydown", onWindowKeyDown, true);
+    return () => window.removeEventListener("keydown", onWindowKeyDown, true);
+  }, [applyHotkeyUpdate, form, recordingField, stopRecordingKeybind]);
 
   if (!form) {
     return (
@@ -279,68 +409,47 @@ export const SettingsPanel: React.FC = () => {
     });
   };
 
-  const handleRunVisualIndexing = async () => {
-    setIsIndexingVisual(true);
-    try {
-      const count = await runVisualIndexingNow();
-      const status = await getVisualSearchStatus();
-      setVisualStatus(status);
+  const canEnableReplayBuffer = Boolean(
+    ffmpegStatus?.available &&
+      !isDownloadingFfmpeg &&
+      !(ffmpegStatus.source === "system" && !ffmpegStatus.supportsDdagrab)
+  );
+
+  const handleDownloadFfmpeg = async () => {
+    const res = await startFfmpegDownload();
+    if (res.error) {
+      setStatusMessage(`FFmpeg Download Error: ${res.error}`);
+    } else if (res.status) {
       setStatusMessage(
-        count > 0
-          ? `Smart AI Visual Search indexed ${count} capture(s) into 512-d INT8 vectors (${status.indexedCount} total indexed)!`
-          : `All ${status.indexedCount} active captures are already indexed with 512-d visual embeddings.`
+        `FFmpeg Replay Engine installed! Detected encoder: ${res.status.recommendedEncoder}`
       );
-    } finally {
-      setIsIndexingVisual(false);
     }
   };
 
-  const handleUnloadVisualModel = async () => {
-    await unloadVisualModelNow();
-    const status = await getVisualSearchStatus();
-    setVisualStatus(status);
-    setStatusMessage(
-      "Unloaded Smart AI Visual Search model from RAM (0 MB background overhead)."
-    );
+  const handleToggleReplayRecording = async () => {
+    if (!canEnableReplayBuffer) {
+      setStatusMessage(
+        isDownloadingFfmpeg
+          ? "Wait until the FFmpeg Engine download/upgrade finishes before enabling Replay Buffer."
+          : "Download or Upgrade the FFmpeg Engine first before toggling Hardware Replay Buffer on."
+      );
+      return;
+    }
+    const next = !(form.replayEnabled ?? true);
+    try {
+      await setReplayBufferActive(next);
+      setForm({ ...form, replayEnabled: next });
+      setTimeout(() => {
+        refreshReplayStatus(false).catch(() => {});
+      }, 250);
+    } catch (err) {
+      setStatusMessage(String(err));
+    }
   };
 
-  const hotkeyRows: {
-    key: keyof SettingsPayload;
-    label: string;
-    desc: string;
-    badge: string;
-  }[] = [
-    {
-      key: "hotkeyRegionCapture",
-      label: "Region Screenshot & Annotator",
-      desc: "Freezes active screen before opening the Konva crop & annotation overlay",
-      badge: "v1.0",
-    },
-    {
-      key: "hotkeyFullscreenCapture",
-      label: "Instant Fullscreen Capture (Zero Focus Loss)",
-      desc: "Captures full monitor & copies to clipboard silently without Alt-Tabbing Exclusive Fullscreen games",
-      badge: "v1.0",
-    },
-    {
-      key: "hotkeyOpenGallery",
-      label: "Open Virtualized Gallery",
-      desc: "Opens/focuses the main SQLite + FTS5 media library window from background tray",
-      badge: "v1.0",
-    },
-    {
-      key: "hotkeyVisualClipboard",
-      label: "Visual Image Clipboard Drawer",
-      desc: "Opens the Windows+V style image ring buffer with blake3 deduplication",
-      badge: "v1.5",
-    },
-    {
-      key: "hotkeySaveReplay",
-      label: "Save Rolling Replay Clip (Alt + C)",
-      desc: "Stitches hardware-encoded 30s–20m segments via FFmpeg stream copy (avoids NVIDIA Alt+R conflict)",
-      badge: "v2.0",
-    },
-  ];
+  const estimatedRingMb = Math.round(
+    (((form.replayBitrateMbps ?? 20) * (form.replayBufferSecs ?? 60)) / 8)
+  );
 
   return (
     <>
@@ -393,8 +502,10 @@ export const SettingsPanel: React.FC = () => {
             </h3>
 
             <div className="divide-y divide-base-300">
-              {hotkeyRows.map((row) => {
+              {HOTKEY_ROWS.map((row) => {
                 const isRec = recordingField === row.key;
+                const currentCombo = String(form[row.key] || "").trim();
+                const isUnbound = currentCombo === "";
                 return (
                   <div
                     key={row.key}
@@ -408,24 +519,96 @@ export const SettingsPanel: React.FC = () => {
                         <span className="badge badge-soft badge-primary badge-xs font-mono">
                           {row.badge}
                         </span>
+                        {currentCombo === row.defaultCombo && (
+                          <span className="badge badge-ghost badge-xs font-mono opacity-75">
+                            Default
+                          </span>
+                        )}
                       </div>
                       <p className="text-[11px] text-base-content/60 mt-0.5">
                         {row.desc}
                       </p>
                     </div>
 
-                    <button
-                      type="button"
-                      onClick={() => setRecordingField(row.key)}
-                      onKeyDown={(e) => handleKeyDownRecorder(e, row.key)}
-                      className={`btn btn-sm min-w-[140px] font-mono text-xs ${
-                        isRec
-                          ? "btn-primary animate-pulse"
-                          : "btn-outline border-base-300 bg-base-100"
-                      }`}
-                    >
-                      {isRec ? "Press keys..." : String(form[row.key])}
-                    </button>
+                    <div className="flex items-center gap-1.5 shrink-0">
+                      <button
+                        type="button"
+                        onClick={() =>
+                          isRec
+                            ? stopRecordingKeybind()
+                            : startRecordingKeybind(row.key)
+                        }
+                        className={`btn btn-sm min-w-[155px] font-mono text-xs ${
+                          isRec
+                            ? "btn-primary animate-pulse"
+                            : isUnbound
+                            ? "btn-outline border-dashed border-base-300 bg-base-100 text-base-content/45 italic"
+                            : "btn-outline border-base-300 bg-base-100"
+                        }`}
+                      >
+                        {isRec
+                          ? "Press keys... (Esc)"
+                          : isUnbound
+                          ? "Unbound (None)"
+                          : currentCombo}
+                      </button>
+
+                      {/* Meatballs Dropdown Menu (Reset to Default / Remove Keybind) */}
+                      <div className="dropdown dropdown-end">
+                        <button
+                          type="button"
+                          tabIndex={0}
+                          title="Keybind Options (Default / Remove)"
+                          className="btn btn-sm btn-ghost btn-square border border-base-300 bg-base-100"
+                        >
+                          <MoreHorizontal className="w-4 h-4" />
+                        </button>
+                        <ul
+                          tabIndex={0}
+                          className="dropdown-content menu bg-base-100 rounded-box z-30 w-52 p-1.5 shadow-xl border border-base-300 text-xs"
+                        >
+                          <li>
+                            <button
+                              type="button"
+                              onClick={(e) => {
+                                (e.currentTarget as HTMLElement).blur();
+                                applyHotkeyUpdate(
+                                  row.key,
+                                  row.defaultCombo,
+                                  `Reset "${row.label}" to default (${row.defaultCombo}).`
+                                );
+                              }}
+                              className="flex items-center justify-between gap-2 py-2"
+                            >
+                              <span className="flex items-center gap-2 font-medium">
+                                <RotateCcw className="w-3.5 h-3.5 text-primary" />
+                                Default
+                              </span>
+                              <span className="badge badge-ghost badge-xs font-mono">
+                                {row.defaultCombo}
+                              </span>
+                            </button>
+                          </li>
+                          <li>
+                            <button
+                              type="button"
+                              onClick={(e) => {
+                                (e.currentTarget as HTMLElement).blur();
+                                applyHotkeyUpdate(
+                                  row.key,
+                                  "",
+                                  `Removed keybind for "${row.label}".`
+                                );
+                              }}
+                              className="flex items-center gap-2 py-2 text-error hover:bg-error/10"
+                            >
+                              <Trash2 className="w-3.5 h-3.5" />
+                              Remove Keybind
+                            </button>
+                          </li>
+                        </ul>
+                      </div>
+                    </div>
                   </div>
                 );
               })}
@@ -689,166 +872,351 @@ export const SettingsPanel: React.FC = () => {
           </div>
         </div>
 
-        {/* Phase 2.0.4 & 2.0.5: Clipboard Privacy Blocklist & Smart AI Visual Search */}
+        {/* Phase 2.0.1 & 2.0.2: Hardware Replay Buffer & Dynamic Multi-Track Audio Router */}
         <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-          {/* Milestone 2.0.4: Password Manager & Excluded Apps Clipboard Privacy */}
+          {/* Milestone 2.0.1: Segmented GPU Replay Buffer */}
           <div className="card bg-base-200 border border-base-300 shadow-sm">
             <div className="card-body p-5 space-y-3.5 text-xs">
-              <div className="flex items-center justify-between">
+              <div className="flex items-center justify-between gap-2">
                 <h3 className="card-title text-sm flex items-center gap-2">
-                  <Lock className="w-4 h-4 text-success" />
-                  Clipboard Privacy &amp; Excluded Apps (v2.0.4)
+                  <Film className="w-4 h-4 text-primary" />
+                  Hardware Replay Buffer (v2.0.1)
                 </h3>
-                <span className="badge badge-soft badge-success badge-xs font-mono">
-                  OS Flags Active
-                </span>
-              </div>
-
-              <p className="text-[11px] text-base-content/70 leading-relaxed">
-                Automatically respects Windows privacy formats (
-                <code className="font-mono text-[10px]">
-                  ExcludeClipboardContentFromMonitorProcessing
-                </code>{" "}
-                &amp;{" "}
-                <code className="font-mono text-[10px]">
-                  CanIncludeInClipboardHistory
-                </code>
-                ) and skips any copy when the active window title or process matches your blocklist below:
-              </p>
-
-              <div className="flex flex-wrap gap-1.5 p-2.5 rounded-lg bg-base-100 border border-base-300 max-h-28 overflow-y-auto">
-                {(form.clipboardExcludedApps || []).map((rule) => (
+                <div className="flex items-center gap-2">
                   <span
-                    key={rule}
-                    className="badge badge-soft badge-neutral badge-sm gap-1 font-mono text-[11px]"
+                    className={`badge badge-xs font-mono ${
+                      replaySnapshot?.runtime.isRecording
+                        ? "badge-error"
+                        : replaySnapshot?.runtime.lastError
+                        ? "badge-error"
+                        : !ffmpegStatus?.available
+                        ? "badge-warning"
+                        : form.replayEnabled
+                        ? "badge-info"
+                        : "badge-ghost"
+                    }`}
                   >
-                    {rule}
-                    <button
-                      type="button"
-                      onClick={() => handleRemoveExcludedApp(rule)}
-                      title={`Remove "${rule}" from blocklist`}
-                      className="hover:text-error"
-                    >
-                      <X className="w-3 h-3" />
-                    </button>
+                    {replaySnapshot?.runtime.isRecording
+                      ? `REC • ${replaySnapshot.runtime.activeEncoder}`
+                      : isDownloadingFfmpeg
+                      ? "Downloading..."
+                      : replaySnapshot?.runtime.lastError
+                      ? "Error"
+                      : !ffmpegStatus?.available
+                      ? "FFmpeg Missing"
+                      : !canEnableReplayBuffer
+                      ? "Upgrade Required"
+                      : form.replayEnabled
+                      ? "Starting..."
+                      : "Paused"}
                   </span>
-                ))}
-              </div>
-
-              <div className="join w-full">
-                <input
-                  type="text"
-                  value={newExcludedApp}
-                  onChange={(e) => setNewExcludedApp(e.target.value)}
-                  onKeyDown={(e) => {
-                    if (e.key === "Enter") {
-                      e.preventDefault();
-                      handleAddExcludedApp();
+                  <input
+                    type="checkbox"
+                    disabled={!canEnableReplayBuffer}
+                    checked={Boolean((form.replayEnabled ?? true) && canEnableReplayBuffer)}
+                    onChange={handleToggleReplayRecording}
+                    title={
+                      isDownloadingFfmpeg
+                        ? "Wait until FFmpeg Engine download/upgrade completes"
+                        : !canEnableReplayBuffer
+                        ? "Download or Upgrade FFmpeg Engine before enabling Replay Buffer"
+                        : "Auto-start Replay Buffer (Prevents forgetting to toggle before gaming)"
                     }
-                  }}
-                  placeholder="Add app .exe or window keyword (e.g. signal, bank, keepass)..."
-                  className="input input-xs input-bordered join-item flex-1 bg-base-100 font-mono text-[11px] h-7"
-                />
-                <button
-                  type="button"
-                  onClick={handleAddExcludedApp}
-                  className="btn btn-xs btn-primary join-item h-7 gap-1"
-                >
-                  <Plus className="w-3 h-3" />
-                  Add Rule
-                </button>
-              </div>
-              <p className="text-[10px] text-base-content/55">
-                Tip: You can also pause/resume clipboard history anytime from the System Tray menu or the{" "}
-                <kbd className="kbd kbd-xs">Alt+V</kbd> drawer header.
-              </p>
-            </div>
-          </div>
-
-          {/* Milestone 2.0.5: Smart AI Visual Search & 60s Lazy RAM Unloader */}
-          <div className="card bg-base-200 border border-base-300 shadow-sm">
-            <div className="card-body p-5 space-y-3.5 text-xs">
-              <div className="flex items-center justify-between">
-                <h3 className="card-title text-sm flex items-center gap-2">
-                  <Sparkles className="w-4 h-4 text-accent" />
-                  Smart AI Visual Search (v2.0.5)
-                </h3>
-                <input
-                  type="checkbox"
-                  checked={form.aiVisualSearchEnabled ?? true}
-                  onChange={(e) =>
-                    setForm({
-                      ...form,
-                      aiVisualSearchEnabled: e.target.checked,
-                    })
-                  }
-                  className="toggle toggle-accent toggle-sm"
-                />
+                    className="toggle toggle-primary toggle-sm disabled:opacity-40"
+                  />
+                </div>
               </div>
 
-              <p className="text-[11px] text-base-content/70 leading-relaxed">
-                Encodes each capture&apos;s thumbnail into a compact{" "}
-                <strong>512-dimensional quantized INT8 vector (512 B/image)</strong>{" "}
-                for <code>&lt; 3 ms</code> cosine similarity search (e.g.{" "}
-                <em>&ldquo;cat&rdquo;</em>, <em>&ldquo;sunset&rdquo;</em>,{" "}
-                <em>&ldquo;dark code&rdquo;</em>, <em>&ldquo;purple neon&rdquo;</em>) and{" "}
-                <strong>Find Visually Similar</strong>.
-              </p>
-
-              {visualStatus && (
-                <div className="p-2.5 rounded-lg bg-base-100 border border-base-300 space-y-2 font-mono text-[11px]">
-                  <div className="flex items-center justify-between">
-                    <span className="text-base-content/70">Indexed Vectors:</span>
-                    <span className="font-bold text-accent">
-                      {visualStatus.indexedCount} indexed ({formatBytes(visualStatus.totalEmbeddingBytes)})
-                      {visualStatus.unindexedCount > 0 &&
-                        ` • ${visualStatus.unindexedCount} pending`}
+              {/* FFmpeg Engine Resolver / One-Click Downloader */}
+              <div className="p-3 rounded-lg bg-base-100 border border-base-300 space-y-2.5">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div className="min-w-0 flex-1">
+                    <span className="font-semibold block">
+                      FFmpeg Sidecar ({ffmpegStatus?.source || "checking"})
+                    </span>
+                    <span className="text-[10px] text-base-content/65 font-mono block">
+                      {ffmpegStatus?.available
+                        ? `${ffmpegStatus.recommendedEncoder} • ${
+                            ffmpegStatus.supportsDdagrab
+                              ? "ddagrab GPU (Zero-Copy, Anti-Cheat Safe)"
+                              : "Legacy build (gdigrab fallback — upgrade for ddagrab)"
+                          }`
+                        : "Not detected — Download managed LGPL build (~45 MB) or browse for ffmpeg.exe"}
                     </span>
                   </div>
-                  <div className="flex items-center justify-between">
-                    <span className="text-base-content/70">
-                      60s Lazy RAM Unloader:
-                    </span>
-                    <span
-                      className={
-                        visualStatus.modelLoadedInRam
-                          ? "text-warning"
-                          : "text-success font-semibold"
-                      }
-                    >
-                      {visualStatus.modelLoadedInRam
-                        ? `Active in RAM (unloads in ${
-                            visualStatus.secondsUntilUnload ?? 60
-                          }s)`
-                        : "0 MB Idle RAM (Unloaded)"}
-                    </span>
-                  </div>
-
-                  <div className="flex items-center gap-2 pt-1.5 border-t border-base-300 font-sans">
+                  <div className="flex items-center gap-1.5 shrink-0">
                     <button
                       type="button"
-                      disabled={isIndexingVisual}
-                      onClick={handleRunVisualIndexing}
-                      className="btn btn-xs btn-soft btn-accent flex-1 gap-1"
+                      onClick={() => refreshReplayStatus(true)}
+                      title="Re-check PATH / custom FFmpeg binary"
+                      className="btn btn-xs btn-ghost btn-square"
                     >
-                      <Sparkles className="w-3 h-3" />
-                      {isIndexingVisual
-                        ? "Indexing 512-d..."
-                        : `Index Visual Embeddings (${visualStatus.unindexedCount})`}
+                      <RefreshCw className="w-3 h-3" />
                     </button>
-                    {visualStatus.modelLoadedInRam && (
+                    {(!ffmpegStatus?.available ||
+                      (ffmpegStatus?.source !== "managed" &&
+                        !ffmpegStatus?.supportsDdagrab)) && (
                       <button
                         type="button"
-                        onClick={handleUnloadVisualModel}
-                        className="btn btn-xs btn-outline border-base-300 gap-1"
+                        disabled={isDownloadingFfmpeg}
+                        onClick={handleDownloadFfmpeg}
+                        className="btn btn-xs btn-primary gap-1"
                       >
-                        Unload RAM Now
+                        <Download className="w-3 h-3" />
+                        {isDownloadingFfmpeg
+                          ? "Downloading..."
+                          : ffmpegStatus?.available
+                          ? "Upgrade Engine"
+                          : "Download Engine"}
+                      </button>
+                    )}
+                    {canEnableReplayBuffer && (
+                      <button
+                        type="button"
+                        onClick={async () => {
+                          const saved = await saveReplayBuffer();
+                          await fetchCaptures();
+                          setStatusMessage(
+                            `Saved ${Math.round((saved.durationMs || 0) / 1000)}s Instant Replay clip!`
+                          );
+                        }}
+                        className="btn btn-xs btn-soft btn-success gap-1"
+                      >
+                        <Film className="w-3 h-3" />
+                        Save Clip Now
                       </button>
                     )}
                   </div>
                 </div>
-              )}
+
+                <div className="space-y-1">
+                  <label className="text-[10px] font-medium text-base-content/75 block">
+                    Custom ffmpeg.exe Override Path
+                  </label>
+                  <div className="flex items-center gap-1.5">
+                    <input
+                      type="text"
+                      value={form.ffmpegCustomPath ?? ""}
+                      onChange={(e) =>
+                        setForm({ ...form, ffmpegCustomPath: e.target.value })
+                      }
+                      placeholder="C:\ffmpeg\bin\ffmpeg.exe"
+                      className="input input-xs input-bordered flex-1 bg-base-200 font-mono text-[10px]"
+                    />
+                    <button
+                      type="button"
+                      onClick={async () => {
+                        const chosen = await pickFfmpegDialog();
+                        if (chosen) {
+                          setForm({ ...form, ffmpegCustomPath: chosen });
+                        }
+                      }}
+                      className="btn btn-xs btn-outline border-base-300 gap-1 shrink-0"
+                    >
+                      <FolderOpen className="w-3 h-3" />
+                      Browse...
+                    </button>
+                  </div>
+                  <p className="text-[10px] text-base-content/55 leading-relaxed">
+                    Leave empty to use ReplayViewer&apos;s one-click managed LGPL engine or system PATH.
+                    {ffmpegStatus?.binaryPath && (
+                      <span className="block font-mono text-base-content/70 break-all mt-0.5">
+                        Active binary: {ffmpegStatus.binaryPath}
+                      </span>
+                    )}
+                  </p>
+                </div>
+                {downloadStageMsg && isDownloadingFfmpeg && (
+                  <p className="text-[10px] font-mono text-primary animate-pulse">
+                    {downloadStageMsg}
+                  </p>
+                )}
+              </div>
+
+              {/* Rolling Buffer Window Presets (30s .. 20m) */}
+              <div>
+                <div className="flex justify-between mb-1">
+                  <span className="text-base-content/80 font-medium">
+                    Rolling Buffer Window (Default: 1m / 60s)
+                  </span>
+                  <span className="font-mono text-[11px] text-primary">
+                    ~{estimatedRingMb} MB temp SSD ring
+                  </span>
+                </div>
+                <div className="join w-full">
+                  {[
+                    { secs: 30, label: "30s" },
+                    { secs: 60, label: "1m" },
+                    { secs: 120, label: "2m" },
+                    { secs: 300, label: "5m" },
+                    { secs: 600, label: "10m" },
+                    { secs: 1200, label: "20m" },
+                  ].map((opt) => (
+                    <button
+                      key={opt.secs}
+                      type="button"
+                      onClick={() =>
+                        setForm({ ...form, replayBufferSecs: opt.secs })
+                      }
+                      className={`btn btn-xs join-item flex-1 font-mono ${
+                        (form.replayBufferSecs ?? 60) === opt.secs
+                          ? "btn-primary"
+                          : "btn-ghost bg-base-100"
+                      }`}
+                    >
+                      {opt.label}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              <div className="grid grid-cols-3 gap-2 pt-1">
+                <div>
+                  <span className="text-[11px] text-base-content/70 block mb-1">
+                    GPU Encoder
+                  </span>
+                  <select
+                    value={form.replayEncoder ?? "auto"}
+                    onChange={(e) =>
+                      setForm({ ...form, replayEncoder: e.target.value })
+                    }
+                    className="select select-xs select-bordered w-full bg-base-100 font-mono text-[11px]"
+                  >
+                    <option value="auto">
+                      Auto ({ffmpegStatus?.recommendedEncoder || "GPU"})
+                    </option>
+                    {(ffmpegStatus?.availableEncoders || []).map((enc) => (
+                      <option key={enc} value={enc}>
+                        {enc}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+
+                <div>
+                  <span className="text-[11px] text-base-content/70 block mb-1">
+                    Framerate
+                  </span>
+                  <select
+                    value={form.replayFps ?? 60}
+                    onChange={(e) =>
+                      setForm({ ...form, replayFps: Number(e.target.value) })
+                    }
+                    className="select select-xs select-bordered w-full bg-base-100 font-mono text-[11px]"
+                  >
+                    <option value={30}>30 FPS</option>
+                    <option value={60}>60 FPS</option>
+                    <option value={120}>120 FPS</option>
+                  </select>
+                </div>
+
+                <div>
+                  <span className="text-[11px] text-base-content/70 block mb-1">
+                    Bitrate ({form.replayBitrateMbps ?? 20} Mbps)
+                  </span>
+                  <input
+                    type="range"
+                    min={8}
+                    max={50}
+                    step={2}
+                    value={form.replayBitrateMbps ?? 20}
+                    onChange={(e) =>
+                      setForm({
+                        ...form,
+                        replayBitrateMbps: Number(e.target.value),
+                      })
+                    }
+                    className="range range-primary range-xs w-full mt-1.5"
+                  />
+                </div>
+              </div>
+
+              <p className="text-[10px] text-base-content/55">
+                Alt-Tabbing or focusing other windows never resets the 2-second <code>.ts</code> ring.
+                {replaySnapshot?.runtime.lastError && (
+                  <span className="block text-error font-mono mt-1">
+                    {replaySnapshot.runtime.lastError}
+                  </span>
+                )}
+              </p>
             </div>
+          </div>
+
+          {/* Milestone 2.0.2: Dynamic Multi-Track Audio Mixer (Isolated Component, Zero Form Lag) */}
+          <AudioMixerCard form={form} onFormChange={setForm} />
+        </div>
+
+        {/* Phase 2.0.4: Password Manager & Excluded Apps Clipboard Privacy */}
+        <div className="card bg-base-200 border border-base-300 shadow-sm">
+          <div className="card-body p-5 space-y-3.5 text-xs">
+            <div className="flex items-center justify-between">
+              <h3 className="card-title text-sm flex items-center gap-2">
+                <Lock className="w-4 h-4 text-success" />
+                Clipboard Privacy &amp; Excluded Apps (v2.0.4)
+              </h3>
+              <span className="badge badge-soft badge-success badge-xs font-mono">
+                OS Flags Active
+              </span>
+            </div>
+
+            <p className="text-[11px] text-base-content/70 leading-relaxed">
+              Automatically respects Windows privacy formats (
+              <code className="font-mono text-[10px]">
+                ExcludeClipboardContentFromMonitorProcessing
+              </code>{" "}
+              &amp;{" "}
+              <code className="font-mono text-[10px]">
+                CanIncludeInClipboardHistory
+              </code>
+              ) and skips any copy when the active window title or process matches your blocklist below:
+            </p>
+
+            <div className="flex flex-wrap gap-1.5 p-2.5 rounded-lg bg-base-100 border border-base-300 max-h-28 overflow-y-auto">
+              {(form.clipboardExcludedApps || []).map((rule) => (
+                <span
+                  key={rule}
+                  className="badge badge-soft badge-neutral badge-sm gap-1 font-mono text-[11px]"
+                >
+                  {rule}
+                  <button
+                    type="button"
+                    onClick={() => handleRemoveExcludedApp(rule)}
+                    title={`Remove "${rule}" from blocklist`}
+                    className="hover:text-error"
+                  >
+                    <X className="w-3 h-3" />
+                  </button>
+                </span>
+              ))}
+            </div>
+
+            <div className="join w-full">
+              <input
+                type="text"
+                value={newExcludedApp}
+                onChange={(e) => setNewExcludedApp(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") {
+                    e.preventDefault();
+                    handleAddExcludedApp();
+                  }
+                }}
+                placeholder="Add app .exe or window keyword (e.g. signal, bank, keepass)..."
+                className="input input-xs input-bordered join-item flex-1 bg-base-100 font-mono text-[11px] h-7"
+              />
+              <button
+                type="button"
+                onClick={handleAddExcludedApp}
+                className="btn btn-xs btn-primary join-item h-7 gap-1"
+              >
+                <Plus className="w-3 h-3" />
+                Add Rule
+              </button>
+            </div>
+            <p className="text-[10px] text-base-content/55">
+              Tip: You can also pause/resume clipboard history anytime from the System Tray menu or the{" "}
+              <kbd className="kbd kbd-xs">Alt+V</kbd> drawer header.
+            </p>
           </div>
         </div>
 
