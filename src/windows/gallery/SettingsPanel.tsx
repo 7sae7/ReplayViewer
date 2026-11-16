@@ -13,23 +13,29 @@ import {
   HardDrive,
   ImagePlus,
   Keyboard,
+  Lock,
   Pin,
+  Plus,
   RotateCcw,
   Save,
   ShieldCheck,
   Sparkles,
+  X,
 } from "lucide-react";
 import { formatBytes, formatDeletionCountdown } from "../../lib/dpi";
 import {
   enforceStoragePoliciesNow,
   getDefaultCapturesDir,
   getStorageStatusPreview,
+  getVisualSearchStatus,
   importExternalMedia,
   migrateCapturesToFolder,
   openInFileExplorer,
   pickFolderDialog,
   runOcrBackfillNow,
+  runVisualIndexingNow,
   scanUnindexedMedia,
+  unloadVisualModelNow,
 } from "../../lib/tauri-client";
 import { useGalleryStore } from "../../stores/useGalleryStore";
 import { useSettingsStore } from "../../stores/useSettingsStore";
@@ -37,6 +43,7 @@ import type {
   SettingsPayload,
   StorageStatusSummary,
   UnindexedScanResult,
+  VisualSearchStatus,
 } from "../../types/ipc";
 
 export const SettingsPanel: React.FC = () => {
@@ -66,6 +73,13 @@ export const SettingsPanel: React.FC = () => {
   const [isRunningPolicy, setIsRunningPolicy] = useState(false);
   const [isRunningOcr, setIsRunningOcr] = useState(false);
 
+  // Phase 2.0.4 & 2.0.5: Excluded Apps & Smart AI Visual Search Status
+  const [newExcludedApp, setNewExcludedApp] = useState("");
+  const [visualStatus, setVisualStatus] = useState<VisualSearchStatus | null>(
+    null
+  );
+  const [isIndexingVisual, setIsIndexingVisual] = useState(false);
+
   useEffect(() => {
     loadSettings();
   }, [loadSettings]);
@@ -80,6 +94,9 @@ export const SettingsPanel: React.FC = () => {
     if (!form) return;
     getStorageStatusPreview(form.maxStorageGb, form.autoCleanupDays)
       .then(setStorageStatus)
+      .catch(() => {});
+    getVisualSearchStatus()
+      .then(setVisualStatus)
       .catch(() => {});
   }, [form?.maxStorageGb, form?.autoCleanupDays]);
 
@@ -239,6 +256,52 @@ export const SettingsPanel: React.FC = () => {
     } finally {
       setIsRunningOcr(false);
     }
+  };
+
+  const handleAddExcludedApp = () => {
+    const clean = newExcludedApp.trim().toLowerCase();
+    if (!clean) return;
+    const current = form.clipboardExcludedApps || [];
+    if (!current.includes(clean)) {
+      setForm({
+        ...form,
+        clipboardExcludedApps: [...current, clean],
+      });
+    }
+    setNewExcludedApp("");
+  };
+
+  const handleRemoveExcludedApp = (target: string) => {
+    const current = form.clipboardExcludedApps || [];
+    setForm({
+      ...form,
+      clipboardExcludedApps: current.filter((a) => a !== target),
+    });
+  };
+
+  const handleRunVisualIndexing = async () => {
+    setIsIndexingVisual(true);
+    try {
+      const count = await runVisualIndexingNow();
+      const status = await getVisualSearchStatus();
+      setVisualStatus(status);
+      setStatusMessage(
+        count > 0
+          ? `Smart AI Visual Search indexed ${count} capture(s) into 512-d INT8 vectors (${status.indexedCount} total indexed)!`
+          : `All ${status.indexedCount} active captures are already indexed with 512-d visual embeddings.`
+      );
+    } finally {
+      setIsIndexingVisual(false);
+    }
+  };
+
+  const handleUnloadVisualModel = async () => {
+    await unloadVisualModelNow();
+    const status = await getVisualSearchStatus();
+    setVisualStatus(status);
+    setStatusMessage(
+      "Unloaded Smart AI Visual Search model from RAM (0 MB background overhead)."
+    );
   };
 
   const hotkeyRows: {
@@ -622,6 +685,169 @@ export const SettingsPanel: React.FC = () => {
                   />
                 </div>
               </div>
+            </div>
+          </div>
+        </div>
+
+        {/* Phase 2.0.4 & 2.0.5: Clipboard Privacy Blocklist & Smart AI Visual Search */}
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+          {/* Milestone 2.0.4: Password Manager & Excluded Apps Clipboard Privacy */}
+          <div className="card bg-base-200 border border-base-300 shadow-sm">
+            <div className="card-body p-5 space-y-3.5 text-xs">
+              <div className="flex items-center justify-between">
+                <h3 className="card-title text-sm flex items-center gap-2">
+                  <Lock className="w-4 h-4 text-success" />
+                  Clipboard Privacy &amp; Excluded Apps (v2.0.4)
+                </h3>
+                <span className="badge badge-soft badge-success badge-xs font-mono">
+                  OS Flags Active
+                </span>
+              </div>
+
+              <p className="text-[11px] text-base-content/70 leading-relaxed">
+                Automatically respects Windows privacy formats (
+                <code className="font-mono text-[10px]">
+                  ExcludeClipboardContentFromMonitorProcessing
+                </code>{" "}
+                &amp;{" "}
+                <code className="font-mono text-[10px]">
+                  CanIncludeInClipboardHistory
+                </code>
+                ) and skips any copy when the active window title or process matches your blocklist below:
+              </p>
+
+              <div className="flex flex-wrap gap-1.5 p-2.5 rounded-lg bg-base-100 border border-base-300 max-h-28 overflow-y-auto">
+                {(form.clipboardExcludedApps || []).map((rule) => (
+                  <span
+                    key={rule}
+                    className="badge badge-soft badge-neutral badge-sm gap-1 font-mono text-[11px]"
+                  >
+                    {rule}
+                    <button
+                      type="button"
+                      onClick={() => handleRemoveExcludedApp(rule)}
+                      title={`Remove "${rule}" from blocklist`}
+                      className="hover:text-error"
+                    >
+                      <X className="w-3 h-3" />
+                    </button>
+                  </span>
+                ))}
+              </div>
+
+              <div className="join w-full">
+                <input
+                  type="text"
+                  value={newExcludedApp}
+                  onChange={(e) => setNewExcludedApp(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") {
+                      e.preventDefault();
+                      handleAddExcludedApp();
+                    }
+                  }}
+                  placeholder="Add app .exe or window keyword (e.g. signal, bank, keepass)..."
+                  className="input input-xs input-bordered join-item flex-1 bg-base-100 font-mono text-[11px] h-7"
+                />
+                <button
+                  type="button"
+                  onClick={handleAddExcludedApp}
+                  className="btn btn-xs btn-primary join-item h-7 gap-1"
+                >
+                  <Plus className="w-3 h-3" />
+                  Add Rule
+                </button>
+              </div>
+              <p className="text-[10px] text-base-content/55">
+                Tip: You can also pause/resume clipboard history anytime from the System Tray menu or the{" "}
+                <kbd className="kbd kbd-xs">Alt+V</kbd> drawer header.
+              </p>
+            </div>
+          </div>
+
+          {/* Milestone 2.0.5: Smart AI Visual Search & 60s Lazy RAM Unloader */}
+          <div className="card bg-base-200 border border-base-300 shadow-sm">
+            <div className="card-body p-5 space-y-3.5 text-xs">
+              <div className="flex items-center justify-between">
+                <h3 className="card-title text-sm flex items-center gap-2">
+                  <Sparkles className="w-4 h-4 text-accent" />
+                  Smart AI Visual Search (v2.0.5)
+                </h3>
+                <input
+                  type="checkbox"
+                  checked={form.aiVisualSearchEnabled ?? true}
+                  onChange={(e) =>
+                    setForm({
+                      ...form,
+                      aiVisualSearchEnabled: e.target.checked,
+                    })
+                  }
+                  className="toggle toggle-accent toggle-sm"
+                />
+              </div>
+
+              <p className="text-[11px] text-base-content/70 leading-relaxed">
+                Encodes each capture&apos;s thumbnail into a compact{" "}
+                <strong>512-dimensional quantized INT8 vector (512 B/image)</strong>{" "}
+                for <code>&lt; 3 ms</code> cosine similarity search (e.g.{" "}
+                <em>&ldquo;cat&rdquo;</em>, <em>&ldquo;sunset&rdquo;</em>,{" "}
+                <em>&ldquo;dark code&rdquo;</em>, <em>&ldquo;purple neon&rdquo;</em>) and{" "}
+                <strong>Find Visually Similar</strong>.
+              </p>
+
+              {visualStatus && (
+                <div className="p-2.5 rounded-lg bg-base-100 border border-base-300 space-y-2 font-mono text-[11px]">
+                  <div className="flex items-center justify-between">
+                    <span className="text-base-content/70">Indexed Vectors:</span>
+                    <span className="font-bold text-accent">
+                      {visualStatus.indexedCount} indexed ({formatBytes(visualStatus.totalEmbeddingBytes)})
+                      {visualStatus.unindexedCount > 0 &&
+                        ` • ${visualStatus.unindexedCount} pending`}
+                    </span>
+                  </div>
+                  <div className="flex items-center justify-between">
+                    <span className="text-base-content/70">
+                      60s Lazy RAM Unloader:
+                    </span>
+                    <span
+                      className={
+                        visualStatus.modelLoadedInRam
+                          ? "text-warning"
+                          : "text-success font-semibold"
+                      }
+                    >
+                      {visualStatus.modelLoadedInRam
+                        ? `Active in RAM (unloads in ${
+                            visualStatus.secondsUntilUnload ?? 60
+                          }s)`
+                        : "0 MB Idle RAM (Unloaded)"}
+                    </span>
+                  </div>
+
+                  <div className="flex items-center gap-2 pt-1.5 border-t border-base-300 font-sans">
+                    <button
+                      type="button"
+                      disabled={isIndexingVisual}
+                      onClick={handleRunVisualIndexing}
+                      className="btn btn-xs btn-soft btn-accent flex-1 gap-1"
+                    >
+                      <Sparkles className="w-3 h-3" />
+                      {isIndexingVisual
+                        ? "Indexing 512-d..."
+                        : `Index Visual Embeddings (${visualStatus.unindexedCount})`}
+                    </button>
+                    {visualStatus.modelLoadedInRam && (
+                      <button
+                        type="button"
+                        onClick={handleUnloadVisualModel}
+                        className="btn btn-xs btn-outline border-base-300 gap-1"
+                      >
+                        Unload RAM Now
+                      </button>
+                    )}
+                  </div>
+                </div>
+              )}
             </div>
           </div>
         </div>

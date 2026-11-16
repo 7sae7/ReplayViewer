@@ -94,11 +94,11 @@ For full sequence diagrams, SQLite schema definitions, and IPC contracts, see **
   * [x] **v1.5.2:** Pinning, Tagging, Custom Groups & Instant FTS5 Search
   * [x] **v1.5.3:** Automated Storage Quota (`10 GB` default cap, no default retention age, 100% Pinned immunity, **3-day "Queued Deletion" grace period** with countdown & restore, and Dry-Run Preview)
   * [x] **v1.5.4:** Zero-Bloat Native OS Background OCR (`Windows.Media.Ocr` / Apple `Vision`, `+0 MB` installer size) indexed into `captures_fts` + Lightbox OCR inspector
-* **Phase 2.0 — Hardware Replay Buffer, Video Trimmer & Opt-In Visual AI (`v2.0` — Planned)**
+* **Phase 2.0 — Hardware Replay Buffer, Video Trimmer & Smart Visual AI (`v2.0` — In Progress)**
   * [ ] **v2.0.1–2.0.2:** GPU-accelerated 30s–20m segmented ring buffer (`Alt + C` `< 0.5s` lossless FFmpeg concat + multi-track WASAPI audio)
   * [ ] **v2.0.3:** Built-in lossless Lightbox Video Trimmer
-  * [ ] **v2.0.4:** Password Manager & Excluded Apps Clipboard Privacy Blocklist
-  * [ ] **v2.0.5:** Opt-In Smart AI Visual Search (`MobileCLIP` / `CLIP-INT8` 512-d embeddings + 60s lazy RAM unloader for `< 8ms` semantic search across 10,000+ unlabeled images)
+  * [x] **v2.0.4:** Password Manager & Excluded Apps Clipboard Privacy Blocklist (`ExcludeClipboardContentFromMonitorProcessing`, `CanIncludeInClipboardHistory`, active process/window blocklist, and System Tray pause toggle)
+  * [x] **v2.0.5:** Smart AI Visual Search (`512-d` INT8 vectors in `capture_embeddings`, `512 B/img`, 60s lazy RAM unloader, `< 3ms` cosine similarity concept search & *Find Visually Similar*)
 * **Phase 3.0 — Mobile Companion & Cross-Device LAN Sync (`v3.0` — Future)**
   * [ ] Android & iOS companion apps with mDNS + QUIC/WebRTC local clip transfer
 

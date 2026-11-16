@@ -21,8 +21,34 @@ pub struct SettingsPayload {
     pub max_storage_gb: u32,
     pub auto_cleanup_days: u32,
     pub clipboard_max_items: u32,
+    #[serde(default)]
+    pub clipboard_excluded_apps: Vec<String>,
+    #[serde(default = "default_true")]
+    pub ai_visual_search_enabled: bool,
     pub launch_on_startup: bool,
     pub captures_dir: String,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+pub fn default_excluded_apps() -> Vec<String> {
+    vec![
+        "1password".to_string(),
+        "bitwarden".to_string(),
+        "keepass".to_string(),
+        "keepassxc".to_string(),
+        "dashlane".to_string(),
+        "lastpass".to_string(),
+        "nordpass".to_string(),
+        "protonpass".to_string(),
+        "enpass".to_string(),
+        "inprivate".to_string(),
+        "incognito".to_string(),
+        "private browsing".to_string(),
+        "tor browser".to_string(),
+    ]
 }
 
 #[tauri::command]
@@ -61,6 +87,11 @@ pub fn get_settings(state: State<'_, AppState>) -> AppResult<SettingsPayload> {
             .unwrap_or(default)
     };
 
+    let excluded_apps: Vec<String> = map
+        .get("clipboard_excluded_apps")
+        .and_then(|v| serde_json::from_str::<Vec<String>>(v).ok())
+        .unwrap_or_else(default_excluded_apps);
+
     let raw_replay_key = get_str("hotkey_save_replay", "Alt+C");
     let replay_key = if raw_replay_key == "Alt+R" {
         "Alt+C".to_string()
@@ -85,6 +116,8 @@ pub fn get_settings(state: State<'_, AppState>) -> AppResult<SettingsPayload> {
         max_storage_gb: get_u32("max_storage_gb", 10),
         auto_cleanup_days: get_u32("auto_cleanup_days", 0),
         clipboard_max_items: get_u32("clipboard_max_items", 10),
+        clipboard_excluded_apps: excluded_apps,
+        ai_visual_search_enabled: get_bool("ai_visual_search_enabled", true),
         launch_on_startup: get_bool("launch_on_startup", false),
         captures_dir: get_str("captures_dir", &current_dir),
     })
@@ -117,7 +150,7 @@ pub fn update_settings(
             .lock()
             .map_err(|_| AppError::General("Failed to lock database".to_string()))?;
 
-        let pairs: [(&str, String); 12] = [
+        let pairs: [(&str, String); 14] = [
             ("hotkey_region_capture", serde_json::to_string(&payload.hotkey_region_capture)?),
             ("hotkey_fullscreen_capture", serde_json::to_string(&payload.hotkey_fullscreen_capture)?),
             ("hotkey_open_gallery", serde_json::to_string(&payload.hotkey_open_gallery)?),
@@ -128,6 +161,8 @@ pub fn update_settings(
             ("max_storage_gb", serde_json::to_string(&payload.max_storage_gb)?),
             ("auto_cleanup_days", serde_json::to_string(&payload.auto_cleanup_days)?),
             ("clipboard_max_items", serde_json::to_string(&payload.clipboard_max_items)?),
+            ("clipboard_excluded_apps", serde_json::to_string(&payload.clipboard_excluded_apps)?),
+            ("ai_visual_search_enabled", serde_json::to_string(&payload.ai_visual_search_enabled)?),
             ("launch_on_startup", serde_json::to_string(&payload.launch_on_startup)?),
             ("captures_dir", serde_json::to_string(&payload.captures_dir)?),
         ];

@@ -181,9 +181,10 @@ pub fn run() {
             // Phase 1.5.1: Spawn background OS clipboard image watcher
             services::clipboard::spawn_clipboard_watcher(app.handle().clone());
 
-            // Phase 1.5.3 & 1.5.4: Enforce 3-day storage grace quota & backfill pending native OS OCR
+            // Phase 1.5.3, 1.5.4 & 2.0.5: Enforce 3-day storage grace quota, backfill OCR & index 512-d visual embeddings
             let _ = services::storage_cleanup::enforce_storage_policies_now(app.handle());
             let _ = services::ocr::run_ocr_backfill_batch(app.handle(), 50);
+            let _ = services::visual_search::run_visual_indexing_batch(app.handle(), 25);
 
             // Register Global Shortcuts (Alt+S, Alt+Shift+S, Alt+G, Alt+V, Alt+C)
             let alt_s = Shortcut::new(Some(Modifiers::ALT), Code::KeyS);
@@ -219,6 +220,13 @@ pub fn run() {
                 true,
                 None::<&str>,
             )?;
+            let toggle_pause_clipboard_i = MenuItem::with_id(
+                app,
+                "toggle_pause_clipboard",
+                "Pause / Resume Clipboard History",
+                true,
+                None::<&str>,
+            )?;
             let open_gallery_i = MenuItem::with_id(
                 app,
                 "open_gallery",
@@ -234,6 +242,7 @@ pub fn run() {
                     &capture_region_i,
                     &capture_full_i,
                     &open_clipboard_i,
+                    &toggle_pause_clipboard_i,
                     &open_gallery_i,
                     &quit_i,
                 ],
@@ -253,6 +262,25 @@ pub fn run() {
                     }
                     "open_clipboard" => {
                         let _ = clipboard_cmds::toggle_clipboard_drawer(app.clone());
+                    }
+                    "toggle_pause_clipboard" => {
+                        let state: tauri::State<'_, AppState> = app.state();
+                        let prev = state
+                            .clipboard_paused
+                            .load(std::sync::atomic::Ordering::Relaxed);
+                        let next = !prev;
+                        state
+                            .clipboard_paused
+                            .store(next, std::sync::atomic::Ordering::Relaxed);
+                        let _ = app.emit("clipboard:paused_changed", next);
+                        let _ = app.emit(
+                            "shortcut:toast",
+                            if next {
+                                "Clipboard History Paused (Sensitive copies ignored)"
+                            } else {
+                                "Clipboard History Resumed"
+                            },
+                        );
                     }
                     "open_gallery" => {
                         if let Some(win) = app.get_webview_window("main") {
@@ -327,6 +355,11 @@ pub fn run() {
             gallery_cmds::get_storage_status_preview,
             gallery_cmds::enforce_storage_policies_now,
             gallery_cmds::run_ocr_backfill_now,
+            gallery_cmds::semantic_visual_search,
+            gallery_cmds::find_similar_captures,
+            gallery_cmds::get_visual_search_status,
+            gallery_cmds::run_visual_indexing_now,
+            gallery_cmds::unload_visual_model_now,
             gallery_cmds::get_latest_capture_meta,
             gallery_cmds::add_tag_to_capture,
             settings_cmds::get_settings,
