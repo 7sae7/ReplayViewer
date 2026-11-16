@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager};
 use uuid::Uuid;
 
-use crate::db::captures_repo::{insert_capture, CaptureRecord};
+use crate::db::captures_repo::{delete_captures, get_capture_by_id, insert_capture, CaptureRecord};
 use crate::error::{AppError, AppResult};
 use crate::services::audio::{
     build_audio_track_plan, spawn_named_pipe_audio_worker, AudioPipeTrack, LiveAudioGains,
@@ -25,6 +25,35 @@ use crate::state::{AppState, ReplayRuntimeState};
 use std::os::windows::process::CommandExt;
 #[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VideoAudioTrack {
+    /// 0-based audio stream index (`0:a:{stream_index}`)
+    pub stream_index: usize,
+    pub title: String,
+    pub channels: u32,
+    pub codec: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VideoProbeInfo {
+    pub duration_ms: u64,
+    pub size_bytes: u64,
+    pub width: u32,
+    pub height: u32,
+    pub audio_tracks: Vec<VideoAudioTrack>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VideoAudioTrackPreview {
+    pub stream_index: usize,
+    pub title: String,
+    pub audio_path: String,
+    pub peaks: Vec<f32>,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -956,6 +985,729 @@ pub fn save_replay_clip(app: &AppHandle) -> AppResult<CaptureRecord> {
     Ok(record)
 }
 
+/// Generates a 320px WebP thumbnail and probes video `(width, height, duration_ms)` via FFmpeg/FFprobe.
+fn generate_video_thumbnail_and_probe(
+    bin_str: &str,
+    temp_png_thumb: &Path,
+    mp4_path: &Path,
+    thumb_path: &Path,
+) -> (u32, u32, Option<u64>) {
+    let _ = new_hidden_command(bin_str)
+        .args([
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-i",
+            &mp4_path.to_string_lossy(),
+            "-frames:v",
+            "1",
+            "-vf",
+            "scale=320:-2",
+            &temp_png_thumb.to_string_lossy(),
+        ])
+        .output();
+
+    if temp_png_thumb.exists() {
+        if let Ok(decoded) = image::open(temp_png_thumb) {
+            let thumb = decoded.resize(320, 320, FilterType::Triangle);
+            let _ = thumb.save_with_format(thumb_path, ImageFormat::WebP);
+        }
+        let _ = fs::remove_file(temp_png_thumb);
+    }
+
+    let info = probe_video_file_info(bin_str, mp4_path);
+    let dur = if info.duration_ms > 0 {
+        Some(info.duration_ms)
+    } else {
+        None
+    };
+    (info.width, info.height, dur)
+}
+
+/// Probes video dimensions, duration, size, and every discrete audio stream (`ffprobe` JSON with `ffmpeg -i` fallback).
+pub fn probe_video_file_info(bin_str: &str, video_path: &Path) -> VideoProbeInfo {
+    let size_bytes = fs::metadata(video_path).map(|m| m.len()).unwrap_or(0);
+    let mut width = 1920u32;
+    let mut height = 1080u32;
+    let mut duration_ms = 0u64;
+    let mut audio_tracks: Vec<VideoAudioTrack> = Vec::new();
+
+    let ffprobe_bin = bin_str.replace("ffmpeg", "ffprobe");
+    if let Ok(out) = new_hidden_command(&ffprobe_bin)
+        .args([
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration:stream=index,codec_type,codec_name,channels,width,height:stream_tags=title",
+            "-of",
+            "json",
+            &video_path.to_string_lossy(),
+        ])
+        .output()
+    {
+        if out.status.success() {
+            if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&out.stdout) {
+                if let Some(secs) = json
+                    .get("format")
+                    .and_then(|f| f.get("duration"))
+                    .and_then(|d| d.as_str())
+                    .and_then(|s| s.parse::<f64>().ok())
+                {
+                    if secs > 0.0 {
+                        duration_ms = (secs * 1000.0).round() as u64;
+                    }
+                }
+                if let Some(streams) = json.get("streams").and_then(|s| s.as_array()) {
+                    let mut audio_ordinal = 0usize;
+                    for st in streams {
+                        let ctype = st.get("codec_type").and_then(|v| v.as_str()).unwrap_or("");
+                        if ctype == "video" {
+                            if let Some(w) = st.get("width").and_then(|v| v.as_u64()) {
+                                width = w as u32;
+                            }
+                            if let Some(h) = st.get("height").and_then(|v| v.as_u64()) {
+                                height = h as u32;
+                            }
+                        } else if ctype == "audio" {
+                            let codec = st
+                                .get("codec_name")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("aac")
+                                .to_string();
+                            let channels = st.get("channels").and_then(|v| v.as_u64()).unwrap_or(2) as u32;
+                            let title = st
+                                .get("tags")
+                                .and_then(|t| t.get("title"))
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.trim().to_string())
+                                .filter(|s| !s.is_empty())
+                                .unwrap_or_else(|| format!("Track {}", audio_ordinal + 1));
+                            audio_tracks.push(VideoAudioTrack {
+                                stream_index: audio_ordinal,
+                                title,
+                                channels,
+                                codec,
+                            });
+                            audio_ordinal += 1;
+                        }
+                    }
+                }
+                return VideoProbeInfo {
+                    duration_ms,
+                    size_bytes,
+                    width,
+                    height,
+                    audio_tracks,
+                };
+            }
+        }
+    }
+
+    // Fallback: parse `ffmpeg -hide_banner -i <video>` stderr if ffprobe binary is absent
+    if let Ok(out) = new_hidden_command(bin_str)
+        .args(["-hide_banner", "-i", &video_path.to_string_lossy()])
+        .output()
+    {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let mut in_audio_stream = false;
+        for line in stderr.lines() {
+            let trimmed = line.trim();
+            if let Some(dur_part) = trimmed.strip_prefix("Duration:") {
+                if let Some(hms) = dur_part.split(',').next() {
+                    let parts: Vec<&str> = hms.trim().split(':').collect();
+                    if parts.len() == 3 {
+                        if let (Ok(h), Ok(m), Ok(s)) = (
+                            parts[0].parse::<f64>(),
+                            parts[1].parse::<f64>(),
+                            parts[2].parse::<f64>(),
+                        ) {
+                            duration_ms = ((h * 3600.0 + m * 60.0 + s) * 1000.0).round() as u64;
+                        }
+                    }
+                }
+            }
+            if trimmed.starts_with("Stream #") && trimmed.contains("Audio:") {
+                in_audio_stream = true;
+                let idx = audio_tracks.len();
+                audio_tracks.push(VideoAudioTrack {
+                    stream_index: idx,
+                    title: format!("Audio Track {}", idx + 1),
+                    channels: if trimmed.contains("mono") { 1 } else { 2 },
+                    codec: "aac".to_string(),
+                });
+            } else if in_audio_stream && trimmed.starts_with("title") {
+                if let Some((_, val)) = trimmed.split_once(':') {
+                    if let Some(last) = audio_tracks.last_mut() {
+                        let t = val.trim();
+                        if !t.is_empty() {
+                            last.title = t.to_string();
+                        }
+                    }
+                }
+            } else if trimmed.starts_with("Stream #") {
+                in_audio_stream = false;
+            }
+        }
+    }
+
+    VideoProbeInfo {
+        duration_ms,
+        size_bytes,
+        width,
+        height,
+        audio_tracks,
+    }
+}
+
+/// Builds FFmpeg CLI arguments for Milestone 2.0.3 video trimming:
+/// - Lossless `-c copy` by default
+/// - Lossless video + mixed custom audio tracks when `mix_selected_audio == true`
+/// - Bitrate-capped GPU/CPU re-encode when `target_max_mb` is set (Discord 10/25/50 MB presets)
+pub fn build_trim_ffmpeg_args(
+    src_path: &str,
+    out_path: &str,
+    start_ms: u64,
+    end_ms: u64,
+    selected_audio_indices: &[usize],
+    mix_selected_audio: bool,
+    target_max_mb: Option<u32>,
+    encoder: &str,
+) -> Vec<String> {
+    let start_sec = (start_ms as f64) / 1000.0;
+    let dur_sec = ((end_ms.saturating_sub(start_ms)) as f64) / 1000.0;
+
+    let mut args = vec![
+        "-y".to_string(),
+        "-hide_banner".to_string(),
+        "-loglevel".to_string(),
+        "error".to_string(),
+        "-ss".to_string(),
+        format!("{:.3}", start_sec),
+        "-i".to_string(),
+        src_path.to_string(),
+        "-t".to_string(),
+        format!("{:.3}", dur_sec),
+    ];
+
+    let need_reencode_video = target_max_mb.is_some();
+    let need_mix_audio =
+        selected_audio_indices.len() > 1 && (mix_selected_audio || need_reencode_video);
+
+    if need_mix_audio {
+        let inputs: String = selected_audio_indices
+            .iter()
+            .map(|idx| format!("[0:a:{}]", idx))
+            .collect();
+        let cnt = selected_audio_indices.len();
+        args.extend([
+            "-filter_complex".to_string(),
+            format!(
+                "{}amix=inputs={}:duration=longest:dropout_transition=0,volume={}[aout]",
+                inputs, cnt, cnt
+            ),
+            "-map".to_string(),
+            "0:v:0".to_string(),
+            "-map".to_string(),
+            "[aout]".to_string(),
+        ]);
+    } else {
+        args.extend(["-map".to_string(), "0:v:0".to_string()]);
+        for idx in selected_audio_indices {
+            args.extend(["-map".to_string(), format!("0:a:{}?", idx)]);
+        }
+    }
+
+    if let Some(max_mb) = target_max_mb {
+        let target_bits = (max_mb.max(2) as f64) * 8_000_000.0 * 0.90;
+        let audio_kbps: u32 = if selected_audio_indices.is_empty() {
+            0
+        } else if dur_sec > 45.0 {
+            64
+        } else {
+            96
+        };
+        let total_kbps = (target_bits / dur_sec.max(0.5)) / 1000.0;
+        let video_kbps = (total_kbps - (audio_kbps as f64)).clamp(180.0, 24_000.0).round() as u32;
+        let maxrate_kbps = ((video_kbps as f64) * 1.15).round() as u32;
+        let bufsize_kbps = video_kbps * 2;
+
+        args.extend([
+            "-pix_fmt".to_string(),
+            "yuv420p".to_string(),
+            "-c:v".to_string(),
+            encoder.to_string(),
+            "-b:v".to_string(),
+            format!("{}k", video_kbps),
+            "-maxrate".to_string(),
+            format!("{}k", maxrate_kbps),
+            "-bufsize".to_string(),
+            format!("{}k", bufsize_kbps),
+        ]);
+        if !selected_audio_indices.is_empty() {
+            args.extend([
+                "-c:a".to_string(),
+                "aac".to_string(),
+                "-b:a".to_string(),
+                format!("{}k", audio_kbps),
+            ]);
+        }
+    } else {
+        args.extend(["-c:v".to_string(), "copy".to_string()]);
+        if !selected_audio_indices.is_empty() {
+            if need_mix_audio {
+                args.extend(["-c:a".to_string(), "aac".to_string(), "-b:a".to_string(), "192k".to_string()]);
+            } else {
+                args.extend(["-c:a".to_string(), "copy".to_string()]);
+            }
+        }
+    }
+
+    args.extend(["-movflags".to_string(), "+faststart".to_string(), out_path.to_string()]);
+    args
+}
+
+/// Probes embedded audio tracks & duration of a saved Gallery video capture (`v2.0.3`).
+pub fn probe_capture_video_info(app: &AppHandle, capture_id: &str) -> AppResult<VideoProbeInfo> {
+    let state: tauri::State<'_, AppState> = app.state();
+    let cfg = crate::commands::settings_cmds::get_settings(state.clone())?;
+    let ff = get_cached_or_probe_ffmpeg(&state, &cfg.ffmpeg_custom_path, false);
+    let bin_str = ff.binary_path.ok_or_else(|| {
+        AppError::General("FFmpeg is required to inspect video audio tracks.".to_string())
+    })?;
+
+    let rec = {
+        let conn = state
+            .db
+            .lock()
+            .map_err(|_| AppError::General("Failed to lock database".to_string()))?;
+        get_capture_by_id(&conn, capture_id)?
+    }
+    .ok_or_else(|| AppError::General("Video capture not found.".to_string()))?;
+
+    let path = PathBuf::from(&rec.file_path);
+    if !path.exists() {
+        return Err(AppError::General("Video file is missing from disk.".to_string()));
+    }
+
+    let mut info = probe_video_file_info(&bin_str, &path);
+    if info.duration_ms == 0 {
+        info.duration_ms = rec.duration_ms.unwrap_or(0);
+    }
+    Ok(info)
+}
+
+/// Milestone 2.0.3: Trims a video clip with optional audio track selection/mixdown,
+/// optional Discord target file size compression, and optional original file replacement.
+pub fn trim_video_clip(
+    app: &AppHandle,
+    id: String,
+    start_ms: u64,
+    end_ms: u64,
+    selected_audio_indices: Option<Vec<usize>>,
+    mix_selected_audio: bool,
+    target_max_mb: Option<u32>,
+    replace_original: bool,
+) -> AppResult<CaptureRecord> {
+    if end_ms <= start_ms.saturating_add(200) {
+        return Err(AppError::General(
+            "Selected trim range must be at least 0.2 seconds.".to_string(),
+        ));
+    }
+
+    let state: tauri::State<'_, AppState> = app.state();
+    let cfg = crate::commands::settings_cmds::get_settings(state.clone())?;
+    let ff = get_cached_or_probe_ffmpeg(&state, &cfg.ffmpeg_custom_path, false);
+    let bin_str = ff.binary_path.ok_or_else(|| {
+        AppError::General("FFmpeg is not available. Download FFmpeg Engine in Settings first.".to_string())
+    })?;
+
+    let src_rec = {
+        let conn = state
+            .db
+            .lock()
+            .map_err(|_| AppError::General("Failed to lock database".to_string()))?;
+        get_capture_by_id(&conn, &id)?
+    }
+    .ok_or_else(|| AppError::General("Source video capture not found.".to_string()))?;
+
+    let src_path = PathBuf::from(&src_rec.file_path);
+    if !src_path.exists() {
+        return Err(AppError::General("Source video file no longer exists on disk.".to_string()));
+    }
+
+    let audio_indices = match selected_audio_indices {
+        Some(list) => list,
+        None => {
+            let probe = probe_video_file_info(&bin_str, &src_path);
+            if probe.audio_tracks.is_empty() {
+                Vec::new()
+            } else {
+                vec![0]
+            }
+        }
+    };
+
+    let captures_dir = state
+        .captures_dir
+        .read()
+        .map_err(|_| AppError::General("Failed to lock captures_dir".to_string()))?
+        .clone();
+    let thumbs_dir = state
+        .thumbs_dir
+        .read()
+        .map_err(|_| AppError::General("Failed to lock thumbs_dir".to_string()))?
+        .clone();
+    fs::create_dir_all(&captures_dir)?;
+    fs::create_dir_all(&thumbs_dir)?;
+
+    let new_id = Uuid::new_v4().to_string();
+    let stamp = Utc::now().format("%Y%m%d_%H%M%S");
+    let out_path = captures_dir.join(format!("Trim_{}_{}.mp4", stamp, &new_id[..6]));
+    let thumb_path = thumbs_dir.join(format!("{}_thumb.webp", new_id));
+    let temp_png_thumb = state.replay_ring_dir.join(format!("thumb_{}.png", new_id));
+
+    let primary_encoder = if target_max_mb.is_some() {
+        ff.recommended_encoder.as_str()
+    } else {
+        "copy"
+    };
+
+    let trim_args = build_trim_ffmpeg_args(
+        &src_path.to_string_lossy(),
+        &out_path.to_string_lossy(),
+        start_ms,
+        end_ms,
+        &audio_indices,
+        mix_selected_audio,
+        target_max_mb,
+        primary_encoder,
+    );
+
+    let mut out = new_hidden_command(&bin_str).args(&trim_args).output()?;
+    // If GPU target-size re-encode failed (e.g., strict driver constraints), retry cleanly with software fallback
+    if (!out.status.success() || !out_path.exists()) && target_max_mb.is_some() && primary_encoder != "libx264" {
+        let fallback_enc = select_best_encoder("libx264", &ff.available_encoders, None);
+        let fallback_args = build_trim_ffmpeg_args(
+            &src_path.to_string_lossy(),
+            &out_path.to_string_lossy(),
+            start_ms,
+            end_ms,
+            &audio_indices,
+            mix_selected_audio,
+            target_max_mb,
+            &fallback_enc,
+        );
+        out = new_hidden_command(&bin_str).args(&fallback_args).output()?;
+    }
+
+    if !out.status.success() || !out_path.exists() {
+        let _ = fs::remove_file(&out_path);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        return Err(AppError::General(format!(
+            "Failed to trim video clip: {}",
+            stderr.trim()
+        )));
+    }
+
+    let (width, height, probed_duration_ms) =
+        generate_video_thumbnail_and_probe(&bin_str, &temp_png_thumb, &out_path, &thumb_path);
+    let size_bytes = fs::metadata(&out_path)?.len();
+    let duration_ms = probed_duration_ms.unwrap_or_else(|| end_ms.saturating_sub(start_ms));
+
+    let mut new_tags = src_rec.tags.clone();
+    if !new_tags.iter().any(|t| t == "trimmed") {
+        new_tags.push("trimmed".to_string());
+    }
+
+    let trimmed_record = CaptureRecord {
+        id: new_id,
+        media_type: "video".to_string(),
+        file_path: out_path.to_string_lossy().to_string(),
+        thumb_path: thumb_path.to_string_lossy().to_string(),
+        width,
+        height,
+        size_bytes,
+        duration_ms: Some(duration_ms),
+        source_app: Some(format!("Trimmed Highlight ({}s)", duration_ms / 1000)),
+        ocr_text: String::new(),
+        ocr_status: "done".to_string(),
+        is_pinned: if replace_original { src_rec.is_pinned } else { false },
+        group_name: src_rec.group_name.clone(),
+        last_copied_at: None,
+        queued_delete_at: None,
+        tags: new_tags,
+        created_at: Utc::now().to_rfc3339(),
+    };
+
+    {
+        let conn = state
+            .db
+            .lock()
+            .map_err(|_| AppError::General("Failed to lock database".to_string()))?;
+        insert_capture(&conn, &trimmed_record)?;
+        if replace_original {
+            let _ = delete_captures(&conn, &[id.clone()]);
+            cleanup_video_track_previews(Some(&id));
+        }
+    }
+
+    let _ = crate::services::storage_cleanup::enforce_storage_policies_now(app);
+    let _ = app.emit("gallery:updated", &trimmed_record);
+    let _ = app.emit(
+        "shortcut:toast",
+        format!(
+            "Saved {}s trimmed clip ({:.1} MB){}",
+            duration_ms / 1000,
+            size_bytes as f64 / (1024.0 * 1024.0),
+            if replace_original { " — original deleted" } else { "" }
+        ),
+    );
+
+    Ok(trimmed_record)
+}
+
+fn preview_root_dir() -> PathBuf {
+    std::env::temp_dir().join("replayviewer_track_preview")
+}
+
+/// Computes `bucket_count` normalized amplitude peaks (`0.0..=1.0`) from a mono `s16le` PCM file.
+pub fn compute_pcm_waveform_peaks(pcm_bytes: &[u8], bucket_count: usize) -> Vec<f32> {
+    let buckets = bucket_count.clamp(32, 320);
+    let sample_count = pcm_bytes.len() / 2;
+    if sample_count == 0 {
+        return vec![0.0; buckets];
+    }
+
+    let mut out = Vec::with_capacity(buckets);
+    for b in 0..buckets {
+        let start = (b * sample_count) / buckets;
+        let end = (((b + 1) * sample_count) / buckets).max(start + 1).min(sample_count);
+        let mut max_abs: f32 = 0.0;
+        for s in start..end {
+            let lo = pcm_bytes[s * 2];
+            let hi = pcm_bytes[s * 2 + 1];
+            let val = i16::from_le_bytes([lo, hi]);
+            let norm = (val as i32).abs() as f32 / 32768.0;
+            if norm > max_abs {
+                max_abs = norm;
+            }
+        }
+        // Mild perceptual lift so quiet voice/game ambience remains visible next to loud peaks
+        let curved = if max_abs > 0.0 {
+            max_abs.clamp(0.0, 1.0).powf(0.65)
+        } else {
+            0.0
+        };
+        out.push((curved * 1000.0).round() / 1000.0);
+    }
+    out
+}
+
+/// Builds single-pass FFmpeg arguments that demux each audio stream to `.m4a` and mono 2 kHz `s16le` `.pcm`
+/// for instant track auditioning and waveform generation.
+pub fn build_preview_demux_ffmpeg_args(
+    src_path: &str,
+    targets: &[(usize, PathBuf, PathBuf)],
+    transcode_aac: bool,
+) -> Vec<String> {
+    let mut args = vec![
+        "-y".to_string(),
+        "-hide_banner".to_string(),
+        "-loglevel".to_string(),
+        "error".to_string(),
+        "-i".to_string(),
+        src_path.to_string(),
+    ];
+
+    for (stream_idx, m4a_path, pcm_path) in targets {
+        args.extend([
+            "-map".to_string(),
+            format!("0:a:{}?", stream_idx),
+            "-vn".to_string(),
+        ]);
+        if transcode_aac {
+            args.extend(["-c:a".to_string(), "aac".to_string(), "-b:a".to_string(), "160k".to_string()]);
+        } else {
+            args.extend(["-c:a".to_string(), "copy".to_string()]);
+        }
+        args.extend([
+            "-movflags".to_string(),
+            "+faststart".to_string(),
+            m4a_path.to_string_lossy().to_string(),
+            "-map".to_string(),
+            format!("0:a:{}?", stream_idx),
+            "-vn".to_string(),
+            "-ac".to_string(),
+            "1".to_string(),
+            "-ar".to_string(),
+            "2000".to_string(),
+            "-f".to_string(),
+            "s16le".to_string(),
+            pcm_path.to_string_lossy().to_string(),
+        ]);
+    }
+    args
+}
+
+fn cleanup_stale_preview_dirs(keep_id: Option<&str>) {
+    let root = preview_root_dir();
+    let Ok(entries) = fs::read_dir(&root) else {
+        return;
+    };
+    let now = std::time::SystemTime::now();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        if let Some(keep) = keep_id {
+            if path.file_name().and_then(|n| n.to_str()) == Some(keep) {
+                continue;
+            }
+        }
+        let is_old = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|m| now.duration_since(m).ok())
+            .map(|age| age > Duration::from_secs(7200))
+            .unwrap_or(false);
+        if is_old {
+            let _ = fs::remove_dir_all(&path);
+        }
+    }
+}
+
+/// Removes temporary demuxed track preview files for one capture (or all previews when `id` is `None`).
+pub fn cleanup_video_track_previews(id: Option<&str>) {
+    let root = preview_root_dir();
+    if let Some(capture_id) = id {
+        let dir = root.join(capture_id);
+        if dir.exists() {
+            let _ = fs::remove_dir_all(dir);
+        }
+    } else if root.exists() {
+        let _ = fs::remove_dir_all(root);
+    }
+}
+
+/// Extracts per-track `.m4a` streams and downsampled waveform peaks in a single FFmpeg pass
+/// for lazy Lightbox Solo/Mute auditioning (`v2.0.3`).
+pub fn prepare_video_track_previews(
+    app: &AppHandle,
+    capture_id: &str,
+    bucket_count: usize,
+) -> AppResult<Vec<VideoAudioTrackPreview>> {
+    cleanup_stale_preview_dirs(Some(capture_id));
+
+    let state: tauri::State<'_, AppState> = app.state();
+    let cfg = crate::commands::settings_cmds::get_settings(state.clone())?;
+    let ff = get_cached_or_probe_ffmpeg(&state, &cfg.ffmpeg_custom_path, false);
+    let bin_str = ff.binary_path.ok_or_else(|| {
+        AppError::General("FFmpeg is required to generate audio track waveforms.".to_string())
+    })?;
+
+    let rec = {
+        let conn = state
+            .db
+            .lock()
+            .map_err(|_| AppError::General("Failed to lock database".to_string()))?;
+        get_capture_by_id(&conn, capture_id)?
+    }
+    .ok_or_else(|| AppError::General("Video capture not found.".to_string()))?;
+
+    let src_path = PathBuf::from(&rec.file_path);
+    if !src_path.exists() {
+        return Err(AppError::General("Video file is missing from disk.".to_string()));
+    }
+
+    let probe = probe_video_file_info(&bin_str, &src_path);
+    if probe.audio_tracks.is_empty() {
+        return Ok(vec![]);
+    }
+
+    let preview_dir = preview_root_dir().join(capture_id);
+    fs::create_dir_all(&preview_dir)?;
+    let peaks_cache_path = preview_dir.join("peaks_cache.json");
+
+    // Reuse cached previews when user toggles the Trimmer panel on/off inside the same session
+    if peaks_cache_path.exists() {
+        if let Ok(json_str) = fs::read_to_string(&peaks_cache_path) {
+            if let Ok(cached) = serde_json::from_str::<Vec<VideoAudioTrackPreview>>(&json_str) {
+                let all_present = cached.len() == probe.audio_tracks.len()
+                    && cached.iter().all(|p| Path::new(&p.audio_path).exists());
+                if all_present {
+                    return Ok(cached);
+                }
+            }
+        }
+    }
+
+    let src_str = src_path.to_string_lossy().to_string();
+    let targets: Vec<(usize, PathBuf, PathBuf)> = probe
+        .audio_tracks
+        .iter()
+        .map(|t| {
+            (
+                t.stream_index,
+                preview_dir.join(format!("track_{}.m4a", t.stream_index)),
+                preview_dir.join(format!("track_{}.pcm", t.stream_index)),
+            )
+        })
+        .collect();
+
+    let run_demux = |transcode_aac: bool| -> std::io::Result<std::process::Output> {
+        let args = build_preview_demux_ffmpeg_args(&src_str, &targets, transcode_aac);
+        let mut cmd = Command::new(&bin_str);
+        cmd.args(&args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+        #[cfg(target_os = "windows")]
+        cmd.creation_flags(CREATE_NO_WINDOW);
+        cmd.output()
+    };
+
+    let mut output = run_demux(false)?;
+    let needs_fallback = !output.status.success()
+        || targets
+            .iter()
+            .any(|(_, m4a, _)| !m4a.exists() || fs::metadata(m4a).map(|m| m.len() == 0).unwrap_or(true));
+    if needs_fallback {
+        output = run_demux(true)?;
+    }
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(AppError::General(format!(
+            "FFmpeg track preview extraction failed: {}",
+            stderr.trim()
+        )));
+    }
+
+    let buckets = bucket_count.clamp(32, 320);
+    let mut previews = Vec::with_capacity(probe.audio_tracks.len());
+    for (track, (_, m4a_path, pcm_path)) in probe.audio_tracks.iter().zip(targets.iter()) {
+        let peaks = match fs::read(pcm_path) {
+            Ok(bytes) => compute_pcm_waveform_peaks(&bytes, buckets),
+            Err(_) => vec![0.0; buckets],
+        };
+        let _ = fs::remove_file(pcm_path);
+        previews.push(VideoAudioTrackPreview {
+            stream_index: track.stream_index,
+            title: track.title.clone(),
+            audio_path: m4a_path.to_string_lossy().to_string(),
+            peaks,
+        });
+    }
+
+    if let Ok(json_str) = serde_json::to_string(&previews) {
+        let _ = fs::write(&peaks_cache_path, json_str);
+    }
+
+    Ok(previews)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1001,5 +1753,81 @@ mod tests {
         let single = build_audio_mapping_args(&tracks, true);
         assert!(single.contains(&"title=Master Mix".to_string()));
         assert!(!single.contains(&"title=Microphone".to_string()));
+    }
+
+    #[test]
+    fn test_trim_ffmpeg_args_lossless_mix_and_target_mb() {
+        // 1. Lossless multi-track copy (keep streams 1 and 3 cleanly)
+        let lossless = build_trim_ffmpeg_args(
+            "in.mp4",
+            "out.mp4",
+            12_500,
+            27_500,
+            &[1, 3],
+            false,
+            None,
+            "copy",
+        );
+        assert!(lossless.windows(2).any(|w| w == ["-ss", "12.500"]));
+        assert!(lossless.windows(2).any(|w| w == ["-t", "15.000"]));
+        assert!(lossless.windows(2).any(|w| w == ["-c:v", "copy"]));
+        assert!(lossless.windows(2).any(|w| w == ["-c:a", "copy"]));
+        assert!(lossless.contains(&"0:a:1?".to_string()));
+        assert!(lossless.contains(&"0:a:3?".to_string()));
+
+        // 2. Lossless video + custom audio mixdown into 1 Discord-ready AAC stream
+        let custom_mix = build_trim_ffmpeg_args(
+            "in.mp4",
+            "out.mp4",
+            0,
+            10_000,
+            &[1, 2],
+            true,
+            None,
+            "copy",
+        );
+        assert!(custom_mix.windows(2).any(|w| w == ["-c:v", "copy"]));
+        assert!(custom_mix.windows(2).any(|w| w == ["-c:a", "aac"]));
+        assert!(custom_mix.iter().any(|a| a.contains("[0:a:1][0:a:2]amix=inputs=2")));
+
+        // 3. Target Discord 10 MB re-encode
+        let discord_10 = build_trim_ffmpeg_args(
+            "in.mp4",
+            "out.mp4",
+            5_000,
+            25_000,
+            &[0],
+            true,
+            Some(10),
+            "h264_nvenc",
+        );
+        assert!(discord_10.windows(2).any(|w| w == ["-c:v", "h264_nvenc"]));
+        assert!(discord_10.windows(2).any(|w| w == ["-c:a", "aac"]));
+        assert!(discord_10.contains(&"-b:v".to_string()));
+    }
+
+    #[test]
+    fn test_preview_demux_ffmpeg_args_and_pcm_peaks() {
+        let targets = vec![
+            (0usize, PathBuf::from("t0.m4a"), PathBuf::from("t0.pcm")),
+            (1usize, PathBuf::from("t1.m4a"), PathBuf::from("t1.pcm")),
+        ];
+        let copy_args = build_preview_demux_ffmpeg_args("clip.mp4", &targets, false);
+        assert!(copy_args.contains(&"0:a:0?".to_string()));
+        assert!(copy_args.contains(&"0:a:1?".to_string()));
+        assert!(copy_args.windows(2).any(|w| w == ["-c:a", "copy"]));
+        assert!(copy_args.windows(2).any(|w| w == ["-f", "s16le"]));
+
+        // 4 samples: silent, 50% positive, silence, full negative
+        let samples: [i16; 4] = [0, 16384, 0, -32768];
+        let mut bytes = Vec::with_capacity(8);
+        for s in samples {
+            bytes.extend_from_slice(&s.to_le_bytes());
+        }
+        let peaks = compute_pcm_waveform_peaks(&bytes, 32);
+        assert_eq!(peaks.len(), 32);
+        assert!(peaks.iter().any(|&p| (p - 1.0).abs() < 0.01));
+        assert!(peaks.iter().any(|&p| p > 0.5 && p < 0.9));
+        assert!(peaks[0] == 0.0);
     }
 }

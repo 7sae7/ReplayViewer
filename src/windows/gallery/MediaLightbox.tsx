@@ -1,4 +1,4 @@
-import React, { useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import {
   Check,
   Clock,
@@ -8,17 +8,20 @@ import {
   Pin,
   Plus,
   RotateCcw,
+  Scissors,
   Tag,
   Trash2,
   X,
 } from "lucide-react";
 import type { CaptureRecord } from "../../types/ipc";
+import { VideoTrimmerPanel } from "./VideoTrimmerPanel";
 import {
   formatBytes,
   formatDeletionCountdown,
   formatDurationMs,
 } from "../../lib/dpi";
 import {
+  cleanupVideoTrackPreviews,
   copyCaptureToClipboard,
   openInFileExplorer,
   resolveMediaSrc,
@@ -31,6 +34,7 @@ interface MediaLightboxProps {
   onDelete: (id: string) => void;
   onAddTag: (captureId: string, tag: string) => Promise<void>;
   onRestoreQueued?: (id: string, alsoPin?: boolean) => void;
+  onVideoTrimmed?: (trimmed: CaptureRecord, replacedId?: string) => void;
 }
 
 export const MediaLightbox: React.FC<MediaLightboxProps> = ({
@@ -40,10 +44,28 @@ export const MediaLightbox: React.FC<MediaLightboxProps> = ({
   onDelete,
   onAddTag,
   onRestoreQueued,
+  onVideoTrimmed,
 }) => {
   const [newTag, setNewTag] = useState("");
   const [copied, setCopied] = useState(false);
   const [copiedOcr, setCopiedOcr] = useState(false);
+  const [showTrimmer, setShowTrimmer] = useState(false);
+  const [currentTimeMs, setCurrentTimeMs] = useState(0);
+  const [videoDurationMs, setVideoDurationMs] = useState(capture.durationMs ?? 0);
+  const [isPlaying, setIsPlaying] = useState(false);
+  const videoRef = useRef<HTMLVideoElement | null>(null);
+
+  useEffect(() => {
+    setCurrentTimeMs(0);
+    setVideoDurationMs(capture.durationMs ?? 0);
+    setIsPlaying(false);
+    const prevId = capture.id;
+    return () => {
+      if (capture.mediaType === "video") {
+        cleanupVideoTrackPreviews(prevId).catch(() => undefined);
+      }
+    };
+  }, [capture.id, capture.durationMs, capture.mediaType]);
 
   const handleAddTag = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -80,15 +102,45 @@ export const MediaLightbox: React.FC<MediaLightboxProps> = ({
         onClick={(e) => e.stopPropagation()}
       >
         {/* Full-Resolution Image or Native HTML5 Video Player */}
-        <div className="flex-1 bg-base-300 flex items-center justify-center p-4 min-h-[380px] overflow-hidden">
+        <div className="flex-1 bg-base-300 flex flex-col items-center justify-center p-4 min-h-[380px] overflow-y-auto">
           {capture.mediaType === "video" ? (
-            <video
-              src={resolveMediaSrc(capture.filePath)}
-              poster={resolveMediaSrc(capture.thumbPath)}
-              controls
-              autoPlay
-              className="max-w-full max-h-[78vh] rounded-lg shadow-lg bg-black"
-            />
+            <>
+              <video
+                key={capture.id}
+                ref={videoRef}
+                src={resolveMediaSrc(capture.filePath)}
+                poster={resolveMediaSrc(capture.thumbPath)}
+                controls
+                autoPlay
+                onLoadedMetadata={(e) => {
+                  const dur = e.currentTarget.duration;
+                  if (Number.isFinite(dur) && dur > 0) {
+                    setVideoDurationMs(Math.round(dur * 1000));
+                  }
+                }}
+                onTimeUpdate={(e) => {
+                  setCurrentTimeMs(Math.round(e.currentTarget.currentTime * 1000));
+                }}
+                onPlay={() => setIsPlaying(true)}
+                onPause={() => setIsPlaying(false)}
+                className={`max-w-full rounded-lg shadow-lg bg-black ${
+                  showTrimmer ? "max-h-[54vh]" : "max-h-[74vh]"
+                }`}
+              />
+              {showTrimmer && (
+                <VideoTrimmerPanel
+                  capture={capture}
+                  videoRef={videoRef}
+                  currentTimeMs={currentTimeMs}
+                  durationMs={videoDurationMs}
+                  isPlaying={isPlaying}
+                  onTrimmed={(trimmed, replacedId) => {
+                    setShowTrimmer(false);
+                    onVideoTrimmed?.(trimmed, replacedId);
+                  }}
+                />
+              )}
+            </>
           ) : (
             <img
               src={resolveMediaSrc(capture.filePath)}
@@ -277,16 +329,29 @@ export const MediaLightbox: React.FC<MediaLightboxProps> = ({
 
           {/* Bottom Actions */}
           <div className="flex flex-col gap-2 pt-4 border-t border-base-300 mt-4">
-            <button
-              type="button"
-              onClick={handleCopy}
-              className={`btn btn-sm w-full gap-2 ${
-                copied ? "btn-success" : "btn-primary"
-              }`}
-            >
-              <Copy className="w-4 h-4" />
-              {copied ? "Copied to Clipboard!" : "Copy Image to Clipboard"}
-            </button>
+            {capture.mediaType === "video" ? (
+              <button
+                type="button"
+                onClick={() => setShowTrimmer((v) => !v)}
+                className={`btn btn-sm w-full gap-2 ${
+                  showTrimmer ? "btn-primary" : "btn-outline btn-primary"
+                }`}
+              >
+                <Scissors className="w-4 h-4" />
+                {showTrimmer ? "Hide Video Trimmer" : "Trim & Audio Export"}
+              </button>
+            ) : (
+              <button
+                type="button"
+                onClick={handleCopy}
+                className={`btn btn-sm w-full gap-2 ${
+                  copied ? "btn-success" : "btn-primary"
+                }`}
+              >
+                <Copy className="w-4 h-4" />
+                {copied ? "Copied to Clipboard!" : "Copy Image to Clipboard"}
+              </button>
+            )}
 
             <button
               type="button"
@@ -296,17 +361,6 @@ export const MediaLightbox: React.FC<MediaLightboxProps> = ({
               <FolderOpen className="w-4 h-4 text-secondary" />
               Open in File Explorer / Finder
             </button>
-
-            {!capture.queuedDeleteAt && onFindSimilar && (
-              <button
-                type="button"
-                onClick={() => onFindSimilar(capture)}
-                className="btn btn-sm btn-soft btn-accent w-full gap-2"
-              >
-                <Sparkles className="w-4 h-4" />
-                Find Visually Similar (512-d AI)
-              </button>
-            )}
 
             <div className="grid grid-cols-2 gap-2">
               <button

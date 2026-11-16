@@ -191,6 +191,46 @@ pub fn insert_capture(conn: &Connection, record: &CaptureRecord) -> AppResult<()
     Ok(())
 }
 
+/// Fetches a single capture record + its FTS5 tags by ID (`v2.0.3`).
+pub fn get_capture_by_id(conn: &Connection, capture_id: &str) -> AppResult<Option<CaptureRecord>> {
+    let mut stmt = conn.prepare(
+        r#"
+        SELECT c.id, c.media_type, c.file_path, c.thumb_path, c.width, c.height,
+               c.size_bytes, c.duration_ms, c.source_app, c.ocr_text,
+               COALESCE(c.ocr_status, 'pending'), c.is_pinned,
+               c.group_name, c.last_copied_at, c.queued_delete_at, c.created_at
+        FROM captures c
+        WHERE c.id = ?1
+        LIMIT 1
+        "#,
+    )?;
+    let mut rows = stmt.query(params![capture_id])?;
+    let Some(row) = rows.next()? else {
+        return Ok(None);
+    };
+    let id: String = row.get(0)?;
+    let tags = get_tags_for_capture(conn, &id)?;
+    Ok(Some(CaptureRecord {
+        id,
+        media_type: row.get(1)?,
+        file_path: row.get(2)?,
+        thumb_path: row.get(3)?,
+        width: row.get::<_, i64>(4)? as u32,
+        height: row.get::<_, i64>(5)? as u32,
+        size_bytes: row.get::<_, i64>(6)? as u64,
+        duration_ms: row.get::<_, Option<i64>>(7)?.map(|d| d as u64),
+        source_app: row.get(8)?,
+        ocr_text: row.get(9)?,
+        ocr_status: row.get(10)?,
+        is_pinned: row.get::<_, i64>(11)? != 0,
+        group_name: row.get::<_, Option<String>>(12)?.unwrap_or_default(),
+        last_copied_at: row.get(13)?,
+        queued_delete_at: row.get(14)?,
+        tags,
+        created_at: row.get(15)?,
+    }))
+}
+
 pub fn list_captures(
     conn: &Connection,
     cursor: Option<String>,

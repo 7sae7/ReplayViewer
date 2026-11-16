@@ -88,8 +88,6 @@ export const GalleryApp: React.FC<GalleryAppProps> = ({
     queuedDeletionCount,
     queuedDeletionBytes,
     searchQuery,
-    visualSearchMode,
-    similarToCapture,
     mediaTypeFilter,
     onlyPinned,
     onlyRecentClipboard,
@@ -104,9 +102,6 @@ export const GalleryApp: React.FC<GalleryAppProps> = ({
     lastReconciledCount,
     fetchCaptures,
     setSearchQuery,
-    setVisualSearchMode,
-    findSimilar,
-    clearSimilarFilter,
     setMediaTypeFilter,
     setOnlyPinned,
     setOnlyRecentClipboard,
@@ -494,28 +489,16 @@ export const GalleryApp: React.FC<GalleryAppProps> = ({
           </div>
         </div>
 
-        {/* Instant FTS5 + Smart AI 512-d Visual Search Input */}
+        {/* Instant FTS5 Search Input */}
         {activeTab === "gallery" && (
           <div className="flex-1 max-w-lg min-w-[220px] mx-auto flex items-center gap-1.5">
-            <label
-              className={`input input-xs input-bordered flex items-center gap-2 w-full bg-base-100 h-8 ${
-                visualSearchMode ? "border-accent ring-1 ring-accent/40" : ""
-              }`}
-            >
-              {visualSearchMode ? (
-                <Sparkles className="w-3.5 h-3.5 text-accent shrink-0" />
-              ) : (
-                <Search className="w-3.5 h-3.5 opacity-60 shrink-0" />
-              )}
+            <label className="input input-xs input-bordered flex items-center gap-2 w-full bg-base-100 h-8">
+              <Search className="w-3.5 h-3.5 opacity-60 shrink-0" />
               <input
                 type="text"
                 value={searchQuery}
                 onChange={(e) => setSearchQuery(e.target.value)}
-                placeholder={
-                  visualSearchMode
-                    ? "Smart AI Visual Search (e.g. cat, sunset, dark code, purple neon, chart)..."
-                    : "Instant FTS5 search by app, #tag, group, or OCR text..."
-                }
+                placeholder="Instant FTS5 search by app, #tag, group, or OCR text..."
                 className="grow text-xs"
               />
               {searchQuery && (
@@ -528,19 +511,6 @@ export const GalleryApp: React.FC<GalleryAppProps> = ({
                 </button>
               )}
             </label>
-            <button
-              type="button"
-              onClick={() => setVisualSearchMode(!visualSearchMode)}
-              title="Toggle Smart AI Visual Search (512-d vector cosine similarity across colors, edges, and visual concepts)"
-              className={`btn btn-xs h-8 px-2.5 gap-1 shrink-0 ${
-                visualSearchMode
-                  ? "btn-accent font-bold shadow-sm"
-                  : "btn-outline border-base-300 bg-base-100"
-              }`}
-            >
-              <Sparkles className="w-3.5 h-3.5" />
-              AI Visual
-            </button>
           </div>
         )}
 
@@ -1312,6 +1282,15 @@ export const GalleryApp: React.FC<GalleryAppProps> = ({
           onDelete={(id) => removeCaptures([id])}
           onAddTag={addTag}
           onRestoreQueued={handleRestoreQueued}
+          onVideoTrimmed={async (trimmed, replacedId) => {
+            await fetchCaptures();
+            setSelectedCapture(trimmed);
+            showToast(
+              replacedId
+                ? `Trimmed clip replaced original (${Math.round((trimmed.durationMs ?? 0) / 1000)}s).`
+                : `Saved trimmed clip (${Math.round((trimmed.durationMs ?? 0) / 1000)}s).`
+            );
+          }}
         />
       )}
     </div>

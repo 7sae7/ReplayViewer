@@ -12,10 +12,14 @@ import {
   listCaptures,
   listClipboardHistory,
   pasteClipboardItem,
+  prepareVideoTrackPreviews,
+  probeVideoAudioTracks,
   promoteClipboardToGallery,
   saveAnnotatedCapture,
   setClipboardAlwaysOnTop,
   togglePinClipboardItem,
+  trimVideoClip,
+  cleanupVideoTrackPreviews,
 } from "../lib/tauri-client";
 import { useEditorStore } from "../stores/useEditorStore";
 import type { ArrowAnnotation, PixelateAnnotation } from "../types/ipc";
@@ -233,5 +237,54 @@ describe("Phase 1.5.1 Visual Clipboard Drawer (Alt + V) Operations", () => {
     expect(savedOnly.lastCopiedAt).toBeNull();
     const afterSaveOnly = await listCaptures(null, 500, { onlyPinned: false });
     expect(afterSaveOnly.totalCount).toBe(beforeCount + 1);
+  });
+
+  it("probes video audio tracks and trims non-destructively or replaces original", async () => {
+    const before = await listCaptures(null, 500, { onlyPinned: false });
+    const target = before.items[0];
+    expect(target).toBeDefined();
+
+    const probe = await probeVideoAudioTracks(target.id);
+    expect(probe.audioTracks.length).toBeGreaterThanOrEqual(1);
+
+    const previews = await prepareVideoTrackPreviews(target.id, 64);
+    expect(previews.length).toBe(probe.audioTracks.length);
+    expect(previews[0].peaks.length).toBe(64);
+    await cleanupVideoTrackPreviews(target.id);
+
+    // 1. Non-destructive trim with 10 MB Discord target adds a new capture
+    const keptCopy = await trimVideoClip({
+      id: target.id,
+      startMs: 1000,
+      endMs: 6000,
+      selectedAudioIndices: [0, 3],
+      mixSelectedAudio: true,
+      targetMaxMb: 10,
+      replaceOriginal: false,
+    });
+    expect(keptCopy.id).not.toBe(target.id);
+    expect(keptCopy.durationMs).toBe(5000);
+    expect(keptCopy.sizeBytes).toBeLessThanOrEqual(10 * 1024 * 1024);
+
+    const afterKeep = await listCaptures(null, 500, { onlyPinned: false });
+    expect(afterKeep.totalCount).toBe(before.totalCount + 1);
+    expect(afterKeep.items.some((c) => c.id === target.id)).toBe(true);
+
+    // 2. Replace Original removes the source capture ID from Gallery
+    const replaced = await trimVideoClip({
+      id: keptCopy.id,
+      startMs: 500,
+      endMs: 3500,
+      selectedAudioIndices: [0],
+      mixSelectedAudio: false,
+      targetMaxMb: null,
+      replaceOriginal: true,
+    });
+    expect(replaced.durationMs).toBe(3000);
+
+    const afterReplace = await listCaptures(null, 500, { onlyPinned: false });
+    expect(afterReplace.totalCount).toBe(before.totalCount + 1);
+    expect(afterReplace.items.some((c) => c.id === keptCopy.id)).toBe(false);
+    expect(afterReplace.items.some((c) => c.id === replaced.id)).toBe(true);
   });
 });

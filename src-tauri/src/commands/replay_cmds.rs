@@ -8,7 +8,9 @@ use crate::services::ffmpeg::{
     download_minimal_ffmpeg_to_dir, get_cached_or_probe_ffmpeg, FfmpegStatus,
 };
 use crate::services::replay::{
-    save_replay_clip, FfmpegReplayBufferProvider, ReplayBufferProvider, ReplayBufferSnapshot,
+    cleanup_video_track_previews, prepare_video_track_previews, probe_capture_video_info,
+    save_replay_clip, trim_video_clip, FfmpegReplayBufferProvider, ReplayBufferProvider,
+    ReplayBufferSnapshot, VideoAudioTrackPreview, VideoProbeInfo,
 };
 use crate::state::{AppState, ReplayRuntimeState};
 
@@ -156,6 +158,62 @@ pub async fn save_replay_buffer(app: AppHandle) -> AppResult<CaptureRecord> {
     tauri::async_runtime::spawn_blocking(move || FfmpegReplayBufferProvider.save_clip(&app))
         .await
         .map_err(|e| AppError::General(e.to_string()))?
+}
+
+#[tauri::command]
+pub async fn probe_video_audio_tracks(
+    app: AppHandle,
+    id: String,
+) -> AppResult<VideoProbeInfo> {
+    tauri::async_runtime::spawn_blocking(move || probe_capture_video_info(&app, &id))
+        .await
+        .map_err(|e| AppError::General(e.to_string()))?
+}
+
+#[tauri::command]
+pub async fn prepare_video_track_previews_cmd(
+    app: AppHandle,
+    id: String,
+    buckets: Option<usize>,
+) -> AppResult<Vec<VideoAudioTrackPreview>> {
+    let bucket_count = buckets.unwrap_or(180);
+    tauri::async_runtime::spawn_blocking(move || {
+        prepare_video_track_previews(&app, &id, bucket_count)
+    })
+    .await
+    .map_err(|e| AppError::General(e.to_string()))?
+}
+
+#[tauri::command]
+pub fn cleanup_video_track_previews_cmd(id: Option<String>) {
+    cleanup_video_track_previews(id.as_deref());
+}
+
+#[tauri::command]
+pub async fn trim_video_clip_cmd(
+    app: AppHandle,
+    id: String,
+    start_ms: u64,
+    end_ms: u64,
+    selected_audio_indices: Option<Vec<usize>>,
+    mix_selected_audio: Option<bool>,
+    target_max_mb: Option<u32>,
+    replace_original: Option<bool>,
+) -> AppResult<CaptureRecord> {
+    tauri::async_runtime::spawn_blocking(move || {
+        trim_video_clip(
+            &app,
+            id,
+            start_ms,
+            end_ms,
+            selected_audio_indices,
+            mix_selected_audio.unwrap_or(false),
+            target_max_mb,
+            replace_original.unwrap_or(false),
+        )
+    })
+    .await
+    .map_err(|e| AppError::General(e.to_string()))?
 }
 
 #[tauri::command]

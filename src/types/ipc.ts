@@ -156,6 +156,28 @@ export interface AudioInputDevice {
   isDefault: boolean;
 }
 
+export interface VideoAudioTrack {
+  streamIndex: number;
+  title: string;
+  channels: number;
+  codec: string;
+}
+
+export interface VideoProbeInfo {
+  durationMs: number;
+  sizeBytes: number;
+  width: number;
+  height: number;
+  audioTracks: VideoAudioTrack[];
+}
+
+export interface VideoAudioTrackPreview {
+  streamIndex: number;
+  title: string;
+  audioPath: string;
+  peaks: number[];
+}
+
 export interface SettingsPayload {
   hotkeyRegionCapture: string;
   hotkeyFullscreenCapture: string;
