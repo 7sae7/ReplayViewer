@@ -30,7 +30,9 @@ interface VideoTrimmerPanelProps {
   currentTimeMs: number;
   durationMs: number;
   isPlaying: boolean;
+  onTrimmingChange?: (trimming: boolean) => void;
   onTrimmed: (trimmed: CaptureRecord, replacedId?: string) => void;
+  onOpenClip?: (clip: CaptureRecord) => void;
 }
 
 const MIN_SPAN_MS = 500;
@@ -58,7 +60,9 @@ export const VideoTrimmerPanel: React.FC<VideoTrimmerPanelProps> = ({
   currentTimeMs,
   durationMs,
   isPlaying,
+  onTrimmingChange,
   onTrimmed,
+  onOpenClip,
 }) => {
   const trackBarRef = useRef<HTMLDivElement>(null);
   const audioRefs = useRef<Record<number, HTMLAudioElement | null>>({});
@@ -93,15 +97,31 @@ export const VideoTrimmerPanel: React.FC<VideoTrimmerPanelProps> = ({
   const [targetMaxMb, setTargetMaxMb] = useState<number | null>(null);
   const [replaceOriginal, setReplaceOriginal] = useState(false);
   const [trimming, setTrimming] = useState(false);
+  const [trimElapsedMs, setTrimElapsedMs] = useState(0);
+  const [lastSavedClip, setLastSavedClip] = useState<CaptureRecord | null>(null);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [draggingHandle, setDraggingHandle] = useState<"start" | "end" | null>(null);
   const [loopSelection, setLoopSelection] = useState(false);
+
+  // Elapsed export timer so long size-capped re-encodes give continuous feedback
+  useEffect(() => {
+    if (!trimming) {
+      setTrimElapsedMs(0);
+      return;
+    }
+    const startedAt = Date.now();
+    const timer = window.setInterval(() => {
+      setTrimElapsedMs(Date.now() - startedAt);
+    }, 100);
+    return () => window.clearInterval(timer);
+  }, [trimming]);
 
   // Probe embedded tracks once per capture
   useEffect(() => {
     let cancelled = false;
     setErrorMsg(null);
     setProbeError(null);
+    setLastSavedClip(null);
     setProbing(true);
     setSoloTrackIdx(null);
     setCustomAuditionTracks(null);
@@ -511,7 +531,9 @@ export const VideoTrimmerPanel: React.FC<VideoTrimmerPanelProps> = ({
 
   const handleTrimSubmit = async () => {
     setTrimming(true);
+    onTrimmingChange?.(true);
     setErrorMsg(null);
+    setLastSavedClip(null);
     try {
       const trimmed = await trimVideoClip({
         id: capture.id,
@@ -522,11 +544,15 @@ export const VideoTrimmerPanel: React.FC<VideoTrimmerPanelProps> = ({
         targetMaxMb,
         replaceOriginal,
       });
+      if (!replaceOriginal) {
+        setLastSavedClip(trimmed);
+      }
       onTrimmed(trimmed, replaceOriginal ? capture.id : undefined);
     } catch (err) {
       setErrorMsg(err instanceof Error ? err.message : String(err));
     } finally {
       setTrimming(false);
+      onTrimmingChange?.(false);
     }
   };
 
@@ -976,7 +1002,7 @@ export const VideoTrimmerPanel: React.FC<VideoTrimmerPanelProps> = ({
             {trimming ? (
               <>
                 <span className="loading loading-spinner loading-xs" />
-                Exporting...
+                Trimming ({(trimElapsedMs / 1000).toFixed(1)}s)...
               </>
             ) : (
               <>
@@ -987,6 +1013,46 @@ export const VideoTrimmerPanel: React.FC<VideoTrimmerPanelProps> = ({
           </button>
         </div>
       </div>
+
+      {trimming && (
+        <div className="rounded-lg bg-info/10 border border-info/30 p-2.5 space-y-1.5 text-xs">
+          <div className="flex items-center justify-between gap-2">
+            <div className="flex items-center gap-2 font-medium text-info">
+              <span className="loading loading-spinner loading-xs" />
+              <span>
+                {targetMaxMb
+                  ? `Trimming & compressing highlight to <= ${targetMaxMb} MB (${exportTracks.length} audio stream${exportTracks.length === 1 ? "" : "s"})...`
+                  : `Running lossless keyframe trim (${exportTracks.length} audio stream${exportTracks.length === 1 ? "" : "s"})...`}
+              </span>
+            </div>
+            <span className="font-mono opacity-80">
+              {(trimElapsedMs / 1000).toFixed(1)}s
+            </span>
+          </div>
+          <progress className="progress progress-info w-full h-1.5" />
+        </div>
+      )}
+
+      {!trimming && lastSavedClip && (
+        <div className="alert alert-success py-2 px-3 text-xs flex items-center justify-between gap-2">
+          <div className="flex items-center gap-2">
+            <Check className="w-4 h-4 shrink-0" />
+            <span>
+              Saved trimmed highlight ({formatPreciseMs(lastSavedClip.durationMs ?? selectedSpanMs)} •{" "}
+              {formatBytes(lastSavedClip.sizeBytes)}) to your Gallery.
+            </span>
+          </div>
+          {onOpenClip && (
+            <button
+              type="button"
+              onClick={() => onOpenClip(lastSavedClip)}
+              className="btn btn-xs btn-ghost border border-current/30 shrink-0"
+            >
+              Open Trimmed Clip
+            </button>
+          )}
+        </div>
+      )}
 
       {(errorMsg || failedEntries.length > 0) && (
         <div className="alert alert-error py-2 px-3 text-xs flex items-center justify-between gap-2">

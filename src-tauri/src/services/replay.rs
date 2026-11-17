@@ -650,7 +650,7 @@ pub fn build_audio_mapping_args(audio_tracks: &[AudioPipeTrack], single_mix: boo
             args.extend([
                 "-filter_complex".to_string(),
                 format!(
-                    "{}amix=inputs={}:duration=longest:dropout_transition=0,volume={}[aout]",
+                    "{}amix=inputs={}:duration=longest:dropout_transition=0,volume={},alimiter=limit=0.95:attack=5:release=50[aout]",
                     inputs, mix_cnt, mix_cnt
                 ),
                 "-map".to_string(),
@@ -678,7 +678,7 @@ pub fn build_audio_mapping_args(audio_tracks: &[AudioPipeTrack], single_mix: boo
         }
         let mix_cnt = base_indices.len();
         filter_parts.push(format!(
-            "{}amix=inputs={}:duration=longest:dropout_transition=0,volume={}[master]",
+            "{}amix=inputs={}:duration=longest:dropout_transition=0,volume={},alimiter=limit=0.95:attack=5:release=50[master]",
             mix_inputs, mix_cnt, mix_cnt
         ));
 
@@ -1189,6 +1189,50 @@ pub fn probe_video_file_info(bin_str: &str, video_path: &Path) -> VideoProbeInfo
     }
 }
 
+/// Computes target `(video_kbps, audio_kbps, copy_unmixed_audio)` for `Discord 10/25/50 MB` exports
+/// so audio preserves original `-c:a copy` or crisp `128–192 kbps` AAC instead of robotic `64–96 kbps`,
+/// while accounting for `audio_stream_count` discrete tracks when multi-track export is kept unmixed.
+pub fn compute_trim_bitrates_kbps(
+    max_mb: u32,
+    dur_sec: f64,
+    audio_stream_count: usize,
+    need_mix_audio: bool,
+) -> (u32, u32, bool) {
+    let target_bits = (max_mb.max(2) as f64) * 8_000_000.0 * 0.90;
+    let total_kbps = (target_bits / dur_sec.max(0.5)) / 1000.0;
+
+    if audio_stream_count == 0 {
+        let video_kbps = total_kbps.clamp(180.0, 24_000.0).round() as u32;
+        return (video_kbps, 0, false);
+    }
+
+    let streams = audio_stream_count as f64;
+    let per_stream_copy_cost = 192.0 * streams;
+
+    // Preserve un-re-encoded source AAC tracks whenever copy cost stays <= 20% of total budget
+    if !need_mix_audio && total_kbps >= per_stream_copy_cost * 5.0 {
+        let video_kbps = (total_kbps - per_stream_copy_cost)
+            .clamp(180.0, 24_000.0)
+            .round() as u32;
+        return (video_kbps, 192, true);
+    }
+
+    let audio_kbps: u32 = if total_kbps >= 2_400.0 * streams {
+        192
+    } else if total_kbps >= 1_200.0 * streams {
+        160
+    } else if total_kbps >= 650.0 * streams {
+        128
+    } else {
+        96
+    };
+
+    let video_kbps = (total_kbps - (audio_kbps as f64) * streams)
+        .clamp(180.0, 24_000.0)
+        .round() as u32;
+    (video_kbps, audio_kbps, false)
+}
+
 /// Builds FFmpeg CLI arguments for Milestone 2.0.3 video trimming:
 /// - Lossless `-c copy` by default
 /// - Lossless video + mixed custom audio tracks when `mix_selected_audio == true`
@@ -1219,9 +1263,9 @@ pub fn build_trim_ffmpeg_args(
         format!("{:.3}", dur_sec),
     ];
 
-    let need_reencode_video = target_max_mb.is_some();
-    let need_mix_audio =
-        selected_audio_indices.len() > 1 && (mix_selected_audio || need_reencode_video);
+    // Respect `mix_selected_audio` strictly even on size-capped presets so selecting 2+ tracks
+    // keeps N discrete audio streams unless the user explicitly chooses to mix into 1 stream.
+    let need_mix_audio = selected_audio_indices.len() > 1 && mix_selected_audio;
 
     if need_mix_audio {
         let inputs: String = selected_audio_indices
@@ -1232,7 +1276,7 @@ pub fn build_trim_ffmpeg_args(
         args.extend([
             "-filter_complex".to_string(),
             format!(
-                "{}amix=inputs={}:duration=longest:dropout_transition=0,volume={}[aout]",
+                "{}amix=inputs={}:duration=longest:dropout_transition=0,volume={},alimiter=limit=0.95:attack=5:release=50[aout]",
                 inputs, cnt, cnt
             ),
             "-map".to_string(),
@@ -1248,16 +1292,19 @@ pub fn build_trim_ffmpeg_args(
     }
 
     if let Some(max_mb) = target_max_mb {
-        let target_bits = (max_mb.max(2) as f64) * 8_000_000.0 * 0.90;
-        let audio_kbps: u32 = if selected_audio_indices.is_empty() {
+        let output_audio_streams = if selected_audio_indices.is_empty() {
             0
-        } else if dur_sec > 45.0 {
-            64
+        } else if need_mix_audio {
+            1
         } else {
-            96
+            selected_audio_indices.len()
         };
-        let total_kbps = (target_bits / dur_sec.max(0.5)) / 1000.0;
-        let video_kbps = (total_kbps - (audio_kbps as f64)).clamp(180.0, 24_000.0).round() as u32;
+        let (video_kbps, audio_kbps, copy_unmixed_audio) = compute_trim_bitrates_kbps(
+            max_mb,
+            dur_sec,
+            output_audio_streams,
+            need_mix_audio,
+        );
         let maxrate_kbps = ((video_kbps as f64) * 1.15).round() as u32;
         let bufsize_kbps = video_kbps * 2;
 
@@ -1274,18 +1321,31 @@ pub fn build_trim_ffmpeg_args(
             format!("{}k", bufsize_kbps),
         ]);
         if !selected_audio_indices.is_empty() {
-            args.extend([
-                "-c:a".to_string(),
-                "aac".to_string(),
-                "-b:a".to_string(),
-                format!("{}k", audio_kbps),
-            ]);
+            if copy_unmixed_audio {
+                args.extend(["-c:a".to_string(), "copy".to_string()]);
+            } else {
+                args.extend([
+                    "-c:a".to_string(),
+                    "aac".to_string(),
+                    "-ar".to_string(),
+                    "48000".to_string(),
+                    "-b:a".to_string(),
+                    format!("{}k", audio_kbps),
+                ]);
+            }
         }
     } else {
         args.extend(["-c:v".to_string(), "copy".to_string()]);
         if !selected_audio_indices.is_empty() {
             if need_mix_audio {
-                args.extend(["-c:a".to_string(), "aac".to_string(), "-b:a".to_string(), "192k".to_string()]);
+                args.extend([
+                    "-c:a".to_string(),
+                    "aac".to_string(),
+                    "-ar".to_string(),
+                    "48000".to_string(),
+                    "-b:a".to_string(),
+                    "192k".to_string(),
+                ]);
             } else {
                 args.extend(["-c:a".to_string(), "copy".to_string()]);
             }
@@ -1832,20 +1892,61 @@ mod tests {
         assert!(custom_mix.windows(2).any(|w| w == ["-c:a", "aac"]));
         assert!(custom_mix.iter().any(|a| a.contains("[0:a:1][0:a:2]amix=inputs=2")));
 
-        // 3. Target Discord 10 MB re-encode
-        let discord_10 = build_trim_ffmpeg_args(
+        // 3. Single-track Discord 10 MB re-encode (20s clip -> plenty of budget -> preserves -c:a copy)
+        let discord_10_single = build_trim_ffmpeg_args(
             "in.mp4",
             "out.mp4",
             5_000,
             25_000,
             &[0],
+            false,
+            Some(10),
+            "h264_nvenc",
+        );
+        assert!(discord_10_single.windows(2).any(|w| w == ["-c:v", "h264_nvenc"]));
+        assert!(discord_10_single.windows(2).any(|w| w == ["-c:a", "copy"]));
+        assert!(discord_10_single.contains(&"-b:v".to_string()));
+
+        // 4. Multi-track Discord 10 MB mixdown (20s clip -> full 192k AAC + alimiter)
+        let discord_10_mixed = build_trim_ffmpeg_args(
+            "in.mp4",
+            "out.mp4",
+            0,
+            20_000,
+            &[1, 3],
             true,
             Some(10),
             "h264_nvenc",
         );
-        assert!(discord_10.windows(2).any(|w| w == ["-c:v", "h264_nvenc"]));
-        assert!(discord_10.windows(2).any(|w| w == ["-c:a", "aac"]));
-        assert!(discord_10.contains(&"-b:v".to_string()));
+        assert!(discord_10_mixed.windows(2).any(|w| w == ["-c:a", "aac"]));
+        assert!(discord_10_mixed.windows(2).any(|w| w == ["-b:a", "192k"]));
+        assert!(discord_10_mixed.iter().any(|a| a.contains("alimiter=limit=0.95")));
+
+        // 5. Multi-track Discord 10 MB WITHOUT mixdown keeps BOTH discrete audio streams!
+        let discord_10_unmixed = build_trim_ffmpeg_args(
+            "in.mp4",
+            "out.mp4",
+            0,
+            20_000,
+            &[1, 3],
+            false,
+            Some(10),
+            "h264_nvenc",
+        );
+        assert!(discord_10_unmixed.contains(&"0:a:1?".to_string()));
+        assert!(discord_10_unmixed.contains(&"0:a:3?".to_string()));
+        assert!(!discord_10_unmixed.iter().any(|a| a.contains("amix")));
+        assert!(discord_10_unmixed.windows(2).any(|w| w == ["-c:a", "copy"]));
+
+        // 6. Long 90s clip into 10 MB scales gently (128k, never robotic 64k)
+        let (_v_long, a_long, copy_long) = compute_trim_bitrates_kbps(10, 90.0, 1, false);
+        assert!(!copy_long);
+        assert_eq!(a_long, 128);
+
+        // 7. 50 MB clip at 120s preserves high bitrate (192k)
+        let (_v_50, a_50, copy_50) = compute_trim_bitrates_kbps(50, 120.0, 1, true);
+        assert!(!copy_50);
+        assert_eq!(a_50, 192);
     }
 
     #[test]

@@ -1286,13 +1286,16 @@ export const GalleryApp: React.FC<GalleryAppProps> = ({
           onRestoreQueued={handleRestoreQueued}
           onVideoTrimmed={async (trimmed, replacedId) => {
             await fetchCaptures();
-            setSelectedCapture(trimmed);
+            if (replacedId) {
+              setSelectedCapture(trimmed);
+            }
             showToast(
               replacedId
                 ? `Trimmed clip replaced original (${Math.round((trimmed.durationMs ?? 0) / 1000)}s).`
-                : `Saved trimmed clip (${Math.round((trimmed.durationMs ?? 0) / 1000)}s).`
+                : `Saved trimmed clip (${Math.round((trimmed.durationMs ?? 0) / 1000)}s) to Gallery.`
             );
           }}
+          onOpenClip={(clip) => setSelectedCapture(clip)}
         />
       )}
       </div>

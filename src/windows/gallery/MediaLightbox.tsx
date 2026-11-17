@@ -35,6 +35,7 @@ interface MediaLightboxProps {
   onAddTag: (captureId: string, tag: string) => Promise<void>;
   onRestoreQueued?: (id: string, alsoPin?: boolean) => void;
   onVideoTrimmed?: (trimmed: CaptureRecord, replacedId?: string) => void;
+  onOpenClip?: (clip: CaptureRecord) => void;
 }
 
 export const MediaLightbox: React.FC<MediaLightboxProps> = ({
@@ -45,11 +46,14 @@ export const MediaLightbox: React.FC<MediaLightboxProps> = ({
   onAddTag,
   onRestoreQueued,
   onVideoTrimmed,
+  onOpenClip,
 }) => {
   const [newTag, setNewTag] = useState("");
   const [copied, setCopied] = useState(false);
   const [copiedOcr, setCopiedOcr] = useState(false);
   const [showTrimmer, setShowTrimmer] = useState(false);
+  const [isTrimming, setIsTrimming] = useState(false);
+  const [suppressAutoPlay, setSuppressAutoPlay] = useState(false);
   const [currentTimeMs, setCurrentTimeMs] = useState(0);
   const [videoDurationMs, setVideoDurationMs] = useState(capture.durationMs ?? 0);
   const [isPlaying, setIsPlaying] = useState(false);
@@ -58,13 +62,13 @@ export const MediaLightbox: React.FC<MediaLightboxProps> = ({
 
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
-      if (e.key === "Escape") {
+      if (e.key === "Escape" && !isTrimming) {
         onClose();
       }
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [onClose]);
+  }, [onClose, isTrimming]);
 
   useEffect(() => {
     setCurrentTimeMs(0);
@@ -114,8 +118,8 @@ export const MediaLightbox: React.FC<MediaLightboxProps> = ({
         backdropMouseDownRef.current = e.target === e.currentTarget;
       }}
       onClick={(e) => {
-        // Ignore drags that began inside the Lightbox and released over the backdrop
-        if (backdropMouseDownRef.current && e.target === e.currentTarget) {
+        // Ignore drags that began inside the Lightbox or while a video trim export is running
+        if (!isTrimming && backdropMouseDownRef.current && e.target === e.currentTarget) {
           onClose();
         }
         backdropMouseDownRef.current = false;
@@ -137,7 +141,7 @@ export const MediaLightbox: React.FC<MediaLightboxProps> = ({
                 src={resolveMediaSrc(capture.filePath)}
                 poster={resolveMediaSrc(capture.thumbPath)}
                 controls
-                autoPlay
+                autoPlay={!suppressAutoPlay}
                 onLoadedMetadata={(e) => {
                   const dur = e.currentTarget.duration;
                   if (Number.isFinite(dur) && dur > 0) {
@@ -160,9 +164,18 @@ export const MediaLightbox: React.FC<MediaLightboxProps> = ({
                   currentTimeMs={currentTimeMs}
                   durationMs={videoDurationMs}
                   isPlaying={isPlaying}
+                  onTrimmingChange={setIsTrimming}
                   onTrimmed={(trimmed, replacedId) => {
-                    setShowTrimmer(false);
+                    if (replacedId) {
+                      setSuppressAutoPlay(true);
+                      setShowTrimmer(false);
+                    }
                     onVideoTrimmed?.(trimmed, replacedId);
+                  }}
+                  onOpenClip={(clip) => {
+                    setSuppressAutoPlay(false);
+                    setShowTrimmer(false);
+                    onOpenClip?.(clip);
                   }}
                 />
               )}
@@ -191,6 +204,8 @@ export const MediaLightbox: React.FC<MediaLightboxProps> = ({
               </div>
               <button
                 type="button"
+                disabled={isTrimming}
+                title={isTrimming ? "Wait for video trim export to finish" : "Close Lightbox"}
                 onClick={onClose}
                 className="btn btn-sm btn-circle btn-ghost"
               >
